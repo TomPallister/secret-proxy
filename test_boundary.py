@@ -10,7 +10,7 @@ import unittest
 
 def public_text_files():
     root = Path(__file__).parent
-    patterns = ('*.py', '*.md', 'secret-proxy', 'examples/**/*.json', 'tests/**/*.py', 'docs/**/*.md')
+    patterns = ('*.py', '*.md', '*.sh', 'release-signers', 'secret-proxy', 'examples/**/*.json', 'tests/**/*.py', 'docs/**/*.md')
     return sorted({path for pattern in patterns for path in root.glob(pattern)})
 
 

@@ -1,6 +1,6 @@
-# Operating a testing deployment
+# Daily operations and recovery
 
-Use the installed daily CLI described in the README. The proxy is foreground,
+For the first installation, follow [setup](setup.md). After that, use the installed CLI. The proxy is foreground,
 not a persistent service. Closing a terminal is not a reliable stop command.
 Do not put tokens in shell profiles, shell history, command arguments or a
 launcher configuration. Bootstrap metadata is not a service-account token.
@@ -15,12 +15,12 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    This is liveness, not proof that every upstream integration works.
 4. Use clients through their existing, explicitly selected adapters, or
    `secret-proxy run -- /absolute/path/to/client`. Host programs must support
-   the supplied proxy and trust settings; see the README's Go/macOS caveat.
+   the supplied proxy and trust settings; see [client compatibility](clients.md).
 5. `secret-proxy stop` stops only the selected instance and waits for the old
    foreground controllers to finish. It preserves volumes, trust, capability,
    policy and client auth. A new start requires browser login again.
 
-## Evidence of real OAuth refresh
+## Optional authentication diagnostics
 
 `secret-proxy auth-status` reads `/chatgpt/status` over authenticated TLS and
 checks the response against the current boot nonce. The output contains only:
@@ -37,15 +37,11 @@ Status does not fetch a secret, perform a token exchange, move the clock, force
 refresh or keep an idle login alive. Login resets these counters; a process
 restart resets all in-memory state. `loggedIn` is not an upstream liveness probe.
 
-To accept natural refresh, record a status baseline, allow the real deadline to
-arrive, make a normal model call and read status again. Require the same boot
-nonce, an increased `refreshCount`, and `lastRefreshAt >= lastRefreshDueAt`, plus
-a successful model response and unchanged sealed client auth. Check that no
-intervening browser login occurred. Repeat after the next deadline to observe
-another rotating refresh token. A login, synthetic-clock test or new process is
-**not** proof of automatic refresh. Do not expose or dump process memory to
-inspect tokens. Some providers issue long-lived access tokens; report the test
-as pending rather than simulating time passage.
+You do not need to wait for token expiry or run a refresh acceptance exercise to
+use this development tool. If authentication breaks during normal use, check
+`auth-status` and retry a deliberate browser login. The fields above are useful
+for diagnosis, not a release checklist. Never dump tokens or process memory to
+investigate a failure.
 
 ## Upgrade without changing the trust boundary
 
@@ -88,7 +84,7 @@ Do this only after normal consumers are accepted and the operator authorises it:
    rollback entry point. Do not delete the sole copy of private policy, auth
    backups or history needed for recovery.
 5. Keep the retired services stopped rather than irreversibly deleting rollback
-   material while natural-refresh or other acceptance remains pending.
+   material while you are still validating normal use.
 
-Archiving is not proof of deletion or proof of natural refresh. Machine removal,
+Archiving keeps a recovery copy; it does not delete the underlying data. Machine removal,
 volume deletion and wider host cleanup are separate, destructive operations.
