@@ -186,7 +186,10 @@ After installing a release that contains the daily CLI, create a **private**
 `~/.config/secret-proxy/cli.json` from [`examples/cli.json`](examples/cli.json).
 Choose the instance already registered by the installer, the desktop-side
 bootstrap metadata file, and the absolute path to desktop-integrated `op`.
-Use mode 0600. Never put a service-account token in this file.
+Use mode 0600. Never put a service-account token in this file. Keep `cli.json`,
+launchers and operation history **outside** the installer's private policy
+directory: that directory accepts only its explicitly allowlisted policy files.
+The example uses a separate `config/` subdirectory for bootstrap/policy metadata.
 
 Link the installed launcher as your own user (do not overwrite an unrelated
 existing command). Use the exact verified release revision you installed:

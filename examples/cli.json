@@ -1,5 +1,5 @@
 {
   "instance": "candidate",
-  "bootstrap": "/Users/example/.config/secret-proxy/bootstrap.json",
+  "bootstrap": "/Users/example/.config/secret-proxy/config/bootstrap.json",
   "op": "/opt/homebrew/bin/op"
 }
