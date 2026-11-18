@@ -102,6 +102,10 @@ def main():
             ('basic-password', {'username': 'fixture'})]]
         (root / 'manifest.json').write_text(json.dumps({'schemaVersion': 3, 'account': {'vault': 'Fixture'},
             'secrets': {'API_KEY': {'placements': placements},
+                        'CHATGPT_ACCESS_TOKEN': {'runtimeOnly': True, 'placements': [
+                            {'kind': 'header', 'hosts': ['chatgpt.com'], 'name': 'authorization',
+                             'template': 'Bearer {secret}', 'methods': ['POST'],
+                             'paths': ['/backend-api/codex/responses']}]},
                         'GIT_SIGNING_SSH_KEY': {'internalOnly': True, 'valueField': 'sshPrivateKey'}}}))
         fixture = root / 'fixture_entry.py'
         fixture.write_text('''import json
@@ -155,6 +159,18 @@ from entry import load, requestheaders, request, responseheaders
                     finally:
                         connection.close()
 
+                sentinel = 'secret' + 'ref.invalid'
+                code, body = request('GET', '/chatgpt/status', host=sentinel, target_port=443)
+                assert code == 200
+                assert json.loads(body) == {'instance': env['SECRET_PROXY_INSTANCE_ID'], 'loggedIn': False,
+                    'expiresAt': None, 'refreshCount': 0, 'lastRefreshAt': None, 'lastRefreshDueAt': None}
+                unauthenticated = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                try:
+                    unauthenticated.request('GET', 'http://' + sentinel + '/chatgpt/status')
+                    assert unauthenticated.getresponse().status == 407
+                finally:
+                    unauthenticated.close()
+                assert not observed  # Neither status request contacted an upstream.
                 assert request('GET', '/check?key=' + REF + 'API_KEY', {'X-Api-Key': REF + 'API_KEY'}) == (200, b'ok')
                 basic = 'Basic ' + base64.b64encode(('fixture:' + REF + 'API_KEY').encode()).decode()
                 assert request('POST', '/check', {'Authorization': basic,
@@ -210,7 +226,7 @@ from entry import load, requestheaders, request, responseheaders
                 server.server_close()
         output = (root / 'runtime.log').read_text()
         assert values['API_KEY'] not in output and values['GIT_SIGNING_SSH_KEY'] not in output
-        print('PASS: real TLS/H1/H2; header/query/form/basic injection; path refusal before upstream; generated-key signing; no vault or external network')
+        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; generated-key signing; no vault or external network')
 
 
 if __name__ == '__main__':

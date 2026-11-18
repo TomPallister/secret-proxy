@@ -10,7 +10,7 @@ import unittest
 
 def public_text_files():
     root = Path(__file__).parent
-    patterns = ('*.py', '*.md', 'examples/**/*.json', 'tests/**/*.py', 'docs/**/*.md')
+    patterns = ('*.py', '*.md', 'secret-proxy', 'examples/**/*.json', 'tests/**/*.py', 'docs/**/*.md')
     return sorted({path for pattern in patterns for path in root.glob(pattern)})
 
 
@@ -30,7 +30,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_no_private_runtime_configuration_at_repository_root(self):
         root = Path(__file__).parent
-        for name in ('manifest.json', 'aws-okta.json', 'bootstrap.json', 'client.json', 'proxy-token', 'auth.json', 'corporate-ca.pem'):
+        for name in ('manifest.json', 'aws-okta.json', 'bootstrap.json', 'client.json', 'proxy-token', 'auth.json', 'cli.json', 'corporate-ca.pem'):
             self.assertFalse((root / name).exists(), f'{name} belongs outside this repository')
 
     def test_image_does_not_copy_host_configuration_or_host_launchers(self):

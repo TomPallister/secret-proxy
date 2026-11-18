@@ -10,19 +10,18 @@ authenticated routing, preserved sealed login and workspace, read-only AWS/GitHu
 Git signing, Bedrock and Codex model calls, compaction, and restart/relogin.
 Host routing rollback was also exercised. Consumer adapters live outside this
 engine. VPN attachment is tested with disposable namespaces, not a live tunnel.
-Nothing is published; final clean-history and risk review plus operator approval
-are required before distribution. First-party source uses Apache-2.0.
-See [the preliminary licensing review](docs/licensing-review.md). The first
-release is intended to be source-only; prebuilt image redistribution is not
-cleared, particularly for the bundled 1Password CLI.
+[v0.1.0](https://github.com/TomPallister/secret-proxy/releases/tag/v0.1.0) is a
+published **source-only testing preview**, licensed under Apache-2.0. Its upgraded
+runtime has also passed the host and development-container checks above.
+Prebuilt image redistribution is not cleared, particularly for the bundled
+1Password CLI; see [the licensing review](docs/licensing-review.md).
 
-**Publication still needs dependency-risk review.** The updated Python lock has
-zero known advisory matches, with a documented/tested Tornado compatibility
-override. The refreshed image still has Debian and bundled-tool matches that
-have not been waived. See [the audit and remaining gate](docs/dependency-audit.md).
-These dependency changes have passed isolated tests, not a live deployment;
-the earlier live acceptance described above used the previous build. Both live
-proxies and rollback state remain unchanged.
+**Known dependency findings remain.** The reviewed Python lock had zero known
+advisory matches, with a documented/tested Tornado compatibility override. Debian
+and bundled-tool findings are documented and accepted for this preview's testing
+scope, not generally production-cleared. The official saml2aws binary is retained.
+See [the audit](docs/dependency-audit.md). New source changes still require review,
+scanning and explicit release/deployment approval.
 
 ## Licence
 
@@ -181,6 +180,48 @@ An existing machine must already share secagent's private `.config` directory.
 The controller refuses to recreate a machine if that mount is missing. For a
 fresh machine it creates only the required private config mount.
 
+## Daily commands
+
+After installing a release that contains the daily CLI, create a **private**
+`~/.config/secret-proxy/cli.json` from [`examples/cli.json`](examples/cli.json).
+Choose the instance already registered by the installer, the desktop-side
+bootstrap metadata file, and the absolute path to desktop-integrated `op`.
+Use mode 0600. Never put a service-account token in this file.
+
+Link the installed launcher as your own user (do not overwrite an unrelated
+existing command). Use the exact verified release revision you installed:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+ln -s "/opt/secret-proxy/releases/$REV/secret-proxy" "$HOME/.local/bin/secret-proxy"
+secret-proxy status
+secret-proxy start       # foreground; sudo / Touch ID; no implicit restart
+# In another terminal after readiness:
+secret-proxy login       # hidden browser callback; sealed auth only
+secret-proxy auth-status # credential-free, read-only refresh evidence
+secret-proxy run -- /absolute/path/to/client
+secret-proxy stop        # only this instance; waits for controller cleanup
+```
+
+The launcher is pinned to an immutable installed **CLI** revision, while the
+selected engine remains `/opt/secret-proxy/current`. It therefore remains usable
+if the engine is rolled back to an older version without the CLI. `auth-status`
+requires a runtime that supports it; older runtimes fail that command rather than
+fabricating evidence. `status`, `start`, `stop`, `login` and `run` use the existing
+host/client contract. `--config /absolute/path/to/cli.json` selects another
+explicit metadata file. Neither status command starts a service or resolves a
+vault secret. `start` leaves an authenticated, ready instance unchanged.
+
+Keep the start terminal attached. To restart explicitly, use `stop`, then
+`start`, and repeat browser `login`: real access/refresh tokens never persist.
+Starting an unhealthy instance does **not** implicitly remove it. Stop it
+explicitly first. No command silently downloads, installs or selects an upgrade.
+Normal clients retain their existing bindings; a new login uses the agent
+directory in the installed client configuration, not an implicit global profile.
+
+See [operations, refresh evidence and reversible retirement](docs/operations.md)
+for upgrade/rollback and cleanup ordering.
+
 ## Optional externally managed VPN
 
 Without `network.json` the candidate uses direct egress. To attach to an already
@@ -313,10 +354,10 @@ uv run --locked python tests/smoke_pi.py --help
   The accepted deployment uses direct egress; no VPN was silently started.
 - Container rollback remains documented rather than live-rehearsed. Keep the
   old engine, configuration, CA and token available during normal-use validation.
-- Resolve or explicitly accept the remaining image/dependency findings, and
-  coordinate real-provider acceptance before deploying the upgraded candidate.
-- Retain the selected Apache-2.0 licence, scan the exact publication history and obtain
-  explicit publication approval. Source-only publication does not clear images
+- Known native/OS findings remain documented testing-preview risks. Re-audit
+  dependencies and coordinate acceptance before each subsequent upgrade.
+- Retain the selected Apache-2.0 licence, scan each exact release history and obtain
+  explicit publication approval for new releases. Source-only publication does not clear images
   for redistribution; see the separate licensing gates.
 
 Personal-machine migration is separate, not a prerequisite.

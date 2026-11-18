@@ -55,6 +55,9 @@ class ChatGPTCredentials:
         self._refresh = None
         self._expires = 0.0
         self._account = None
+        self._refresh_count = 0
+        self._last_refresh_at = None
+        self._last_refresh_due_at = None
 
     @staticmethod
     def _post(fields: dict) -> dict:
@@ -110,6 +113,8 @@ class ChatGPTCredentials:
                 "code": code[0], "code_verifier": pending[1], "redirect_uri": REDIRECT_URI,
             })
             self._update(response)
+            self._refresh_count = 0
+            self._last_refresh_at = self._last_refresh_due_at = None
             return self._sealed_credential()
 
     def _update(self, response: dict) -> None:
@@ -129,6 +134,15 @@ class ChatGPTCredentials:
                 "refresh": sealedjwt.MARKER + CANONICAL, "accountId": self._account,
                 "expires": 4102444800000}
 
+    def status(self) -> dict:
+        """Read-only lifecycle evidence: no tokens, claims, identities or network I/O."""
+        with self._lock:
+            return {'loggedIn': bool(self._access and self._refresh),
+                    'expiresAt': int(self._expires) if self._access and self._refresh else None,
+                    'refreshCount': self._refresh_count,
+                    'lastRefreshAt': self._last_refresh_at,
+                    'lastRefreshDueAt': self._last_refresh_due_at}
+
     def get_token(self) -> str:
         with self._lock:
             if not self._refresh:
@@ -137,8 +151,12 @@ class ChatGPTCredentials:
                 # Fail closed on an ambiguous exchange: the upstream may have rotated
                 # the refresh token despite a lost response. Require browser login.
                 refresh = self._refresh
+                due_at = int(self._expires - 120)
                 self._access = self._refresh = None
                 self._expires = 0
                 result = self._request({"grant_type": "refresh_token", "client_id": CLIENT_ID, "refresh_token": refresh})
                 self._update(result)
+                self._refresh_count += 1
+                self._last_refresh_at = int(self._clock())
+                self._last_refresh_due_at = due_at
             return self._access

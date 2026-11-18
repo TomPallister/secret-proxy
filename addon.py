@@ -1016,6 +1016,28 @@ def _checkmarx_exchange_response(flow: http.HTTPFlow) -> bool:
     return True
 
 
+def _chatgpt_status_route(flow: http.HTTPFlow) -> bool:
+    """Proxy-auth protected, credential-free evidence of expiry-triggered refresh."""
+    if flow.request.host != SENTINEL_HOST or flow.request.path != '/chatgpt/status':
+        return False
+    if flow.request.method != 'GET':
+        flow.response = http.Response.make(405, b'{"error":"method_not_allowed"}')
+        return True
+    instance = os.environ.get('SECRET_PROXY_INSTANCE_ID', '')
+    if re.fullmatch(r'[0-9a-f]{32}', instance) is None:
+        flow.response = http.Response.make(503, b'{"error":"unavailable"}')
+        return True
+    try:
+        _current_manifest().canonical_name('CHATGPT_ACCESS_TOKEN')
+    except (AttributeError, KeyError):
+        flow.response = http.Response.make(403, b'{"error":"not_available"}')
+        return True
+    value = {'instance': instance, **_bound_generation().providers.chatgpt.status()}
+    flow.response = http.Response.make(200, json.dumps(value).encode(),
+        {'content-type': 'application/json', 'cache-control': 'no-store'})
+    return True
+
+
 def _chatgpt_login_route(flow: http.HTTPFlow) -> bool:
     """Return only a URL or an unusable sealed JWT, never OAuth credentials."""
     if (flow.request.host or "").lower() != SENTINEL_HOST:
@@ -1156,6 +1178,8 @@ def _request_locked(flow: http.HTTPFlow) -> None:
                                                    {"content-type": "application/json"})
                 return
         if _health_route(flow):
+            return
+        if _chatgpt_status_route(flow):
             return
         if _chatgpt_login_route(flow):
             return

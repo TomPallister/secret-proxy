@@ -1,6 +1,7 @@
 """No live OAuth calls or credential values in test output."""
 import base64
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -37,6 +38,40 @@ class TestChatGPTCredentials(unittest.TestCase):
         self.assertEqual(query["code_challenge_method"], "S256")
         callback = "http://localhost:1455/auth/callback?code=one-time-code&state=" + query["state"]
         return self.provider.finish(callback)
+
+    def test_status_is_credential_free_and_does_not_trigger_refresh(self):
+        empty = {'loggedIn': False, 'expiresAt': None, 'refreshCount': 0,
+                 'lastRefreshAt': None, 'lastRefreshDueAt': None}
+        self.assertEqual(self.provider.status(), empty)
+        self.login()
+        self.assertEqual(self.provider.status(), {**empty, 'loggedIn': True, 'expiresAt': 4600})
+        self.time[0] += 3500
+        self.assertTrue(self.provider.status()['loggedIn'])
+        self.assertEqual(len(self.calls), 1)  # Even after expiry skew: status never refreshes.
+        self.provider.get_token()
+        self.assertEqual(self.provider.status(), {'loggedIn': True, 'expiresAt': 8100,
+            'refreshCount': 1, 'lastRefreshAt': 4500, 'lastRefreshDueAt': 4480})
+        self.assertNotIn('account-1', json.dumps(self.provider.status()))
+        self.assertNotIn('refresh1', json.dumps(self.provider.status()))
+        self.assertEqual(len(self.calls), 2)
+        self.time[0] += 3500
+        self.responses.clear()
+        with self.assertRaises(IndexError): self.provider.get_token()
+        self.assertFalse(self.provider.status()['loggedIn'])
+        self.assertEqual(self.provider.status()['refreshCount'], 1)
+        self.assertIsNone(self.provider.status()['expiresAt'])
+
+    def test_new_login_resets_refresh_evidence(self):
+        self.login()
+        self.time[0] += 3500
+        self.provider.get_token()
+        self.assertEqual(self.provider.status()['refreshCount'], 1)
+        self.responses.append({'access_token': jwt('account-1', 'signature3'),
+                               'refresh_token': 'refresh3', 'expires_in': 3600})
+        self.login()
+        self.assertEqual(self.provider.status()['refreshCount'], 0)
+        self.assertIsNone(self.provider.status()['lastRefreshAt'])
+        self.assertIsNone(self.provider.status()['lastRefreshDueAt'])
 
     def test_login_seals_access_and_rotates_in_memory(self):
         credential = self.login()
@@ -103,6 +138,28 @@ class TestChatGPTAddon(unittest.TestCase):
             def get(self, name):
                 raise AssertionError("must not read vault: " + name)
         self.generation = addon._StoreGeneration(manifest, Resolver(), addon._ProviderState())
+
+    def test_status_endpoint_is_nonce_bound_read_only_and_never_resolves(self):
+        with patch.object(addon, '_capture_generation', return_value=self.generation), patch.dict(os.environ, {'SECRET_PROXY_INSTANCE_ID': 'a' * 32}):
+            flow = self.flow(addon.SENTINEL_HOST, 'GET', '/chatgpt/status')
+            addon.request(flow)
+            self.assertEqual(flow.response.status_code, 200)
+            self.assertEqual(json.loads(flow.response.content), {'instance': 'a' * 32,
+                'loggedIn': False, 'expiresAt': None, 'refreshCount': 0,
+                'lastRefreshAt': None, 'lastRefreshDueAt': None})
+            self.assertEqual(flow.response.headers['cache-control'], 'no-store')
+            post = self.flow(addon.SENTINEL_HOST, 'POST', '/chatgpt/status')
+            addon.request(post)
+            self.assertEqual(post.response.status_code, 405)
+            self.assertFalse(addon._chatgpt_status_route(self.flow('example.com', 'GET', '/chatgpt/status')))
+            self.assertFalse(addon._chatgpt_status_route(self.flow(addon.SENTINEL_HOST, 'GET', '/chatgpt/status?x=1')))
+        with patch.object(addon, '_capture_generation', return_value=self.generation), patch.dict(os.environ, {'SECRET_PROXY_INSTANCE_ID': 'bad'}):
+            addon.request(flow := self.flow(addon.SENTINEL_HOST, 'GET', '/chatgpt/status'))
+            self.assertEqual(flow.response.status_code, 503)
+        generation = addon._StoreGeneration(SecretManifest('1password', {}, {}), self.generation.resolver, addon._ProviderState())
+        with patch.object(addon, '_capture_generation', return_value=generation), patch.dict(os.environ, {'SECRET_PROXY_INSTANCE_ID': 'a' * 32}):
+            addon.request(flow := self.flow(addon.SENTINEL_HOST, 'GET', '/chatgpt/status'))
+            self.assertEqual(flow.response.status_code, 403)
 
     def test_proxy_only_login_and_token_endpoints_blocked(self):
         with patch.object(addon, "_capture_generation", return_value=self.generation):

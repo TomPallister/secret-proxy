@@ -25,7 +25,8 @@ GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'sealedjwt.py',
-         'gitsign.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py')
+         'gitsign.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
+         'manage.py', 'secret-proxy')
 
 
 def root_owned(path: Path):
@@ -92,10 +93,11 @@ def snapshot(repo: Path, commit: str, destination: Path):
     if b'\ngpgsig ' not in raw.split(b'\n\n', 1)[0]:
         raise HostError('The source commit must carry a signature (verify it as your own user first)')
     destination.mkdir(mode=0o755)
+    destination.chmod(0o755)  # mkdir modes are filtered by the caller's umask.
     for name in FILES:
         data = git('show', commit + ':' + name)
         (destination / name).write_bytes(data)
-        (destination / name).chmod(0o644)
+        (destination / name).chmod(0o755 if name == 'secret-proxy' else 0o644)
     (destination / 'source.json').write_text(json.dumps({'commit': commit}) + '\n')
     (destination / 'source.json').chmod(0o644)
 
@@ -123,6 +125,8 @@ def activate(release: Path):
     if link.exists() or link.is_symlink():
         raise HostError('Unexpected staging symlink')
     link.symlink_to(release)
+    if hasattr(os, 'lchmod'):  # macOS enforces the symlink's own permissions.
+        os.lchmod(link, 0o755)
     os.replace(link, ROOT / 'current')
 
 
@@ -152,6 +156,7 @@ def install(args):
             raise HostError('Refusing a symlinked install root')
         path.mkdir(mode=0o755, exist_ok=True)
         root_owned(path)
+        path.chmod(0o755)  # Only these validated, public install roots.
     registration = ROOT / 'instances' / (args.instance + '.json')
     existing = registration.exists() or deployment.private.exists() or deployment.shared.exists()
     if existing:
@@ -178,6 +183,7 @@ def install(args):
                     raise HostError('Staged release differs from its committed content')
         else:
             staged.rename(release)
+    release.chmod(0o755)  # Also repair byte-verified releases staged with umask 077.
     if existing:
         activate(release)
         print('Identical instance policy retained; committed release staged. No running service changed.')
@@ -192,12 +198,14 @@ def install(args):
     config = deployment.private / 'config'
     config.mkdir(mode=0o755, exist_ok=True)
     os.chown(config, 0, account.pw_gid)
+    config.chmod(0o755)  # The private parent remains 0700.
     for name in ('manifest.json', 'aws-okta.json', 'upstream-ca.pem'):
         if name in contents:
             (config / name).write_bytes(contents[name])
             os.chown(config / name, 0, account.pw_gid)
             (config / name).chmod(0o644)
     deployment.shared.mkdir(mode=0o750, exist_ok=True)
+    deployment.shared.chmod(0o750)
     os.chown(deployment.shared, account.pw_uid, account.pw_gid)
     # Reset only our own candidate directory ACL, never a legacy shared directory.
     run('/bin/chmod', '-N', str(deployment.shared))
