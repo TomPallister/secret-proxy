@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "secrets": {
+    "GITHUB_TOKEN": {
+      "placements": [{"kind": "header", "hosts": ["api.github.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "HEAD"]}]
+    },
+    "CHATGPT_ACCESS_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [{"kind": "header", "hosts": ["chatgpt.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["POST"], "paths": ["/backend-api/codex/responses"]}]
+    },
+    "GIT_SIGNING_SSH_KEY": {"internalOnly": true, "valueField": "sshPrivateKey"}
+  }
+}

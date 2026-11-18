@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 3,
+  "account": {
+    "vault": "Automation"
+  },
+  "checkmarxRealm": "example",
+  "secrets": {
+    "WIZ_CLIENT_ID": {
+      "internalOnly": true
+    },
+    "WIZ_CLIENT_SECRET": {
+      "internalOnly": true
+    },
+    "WIZ_ACCESS_TOKEN": {
+      "derivedFrom": [
+        "WIZ_CLIENT_ID",
+        "WIZ_CLIENT_SECRET"
+      ],
+      "placements": [
+        {
+          "kind": "header",
+          "hosts": [
+            "api.example.wiz.io"
+          ],
+          "name": "authorization",
+          "template": "Bearer {secret}",
+          "methods": [
+            "POST"
+          ],
+          "paths": [
+            "/graphql"
+          ]
+        }
+      ]
+    },
+    "CHECKMARX_API_KEY": {
+      "internalOnly": true
+    },
+    "CHECKMARX_ACCESS_TOKEN": {
+      "derivedFrom": [
+        "CHECKMARX_API_KEY"
+      ],
+      "placements": [
+        {
+          "kind": "header",
+          "hosts": [
+            "example.cxone.cloud"
+          ],
+          "name": "authorization",
+          "template": "Bearer {secret}"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,16 @@
+*
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!addon.py
+!entry.py
+!sigv4.py
+!awscreds.py
+!googlecreds.py
+!auth0creds.py
+!oauthcreds.py
+!chatgptcreds.py
+!sealedjwt.py
+!gitsign.py
+!secretstore.py
+!runtime.py

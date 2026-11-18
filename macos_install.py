@@ -1,0 +1,237 @@
+"""Stage an exact committed release and register an isolated Mac candidate.
+
+Run through sudo, explicitly. This never starts/stops/recreates a machine or a
+container, never rewrites the legacy deployment, and never reads a vault.
+"""
+from __future__ import annotations
+
+import argparse
+import grp
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+from awscreds import AwsCredsProvider
+from client import private_read, validate_config
+from host import Deployment, HostError, PODMAN, PYTHON, ROOT, SA_HOME, SHARED_ROOT
+from secretstore import SecretManifest
+
+GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
+FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
+         'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'googlecreds.py',
+         'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'sealedjwt.py',
+         'gitsign.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py')
+
+
+def root_owned(path: Path):
+    """Check the real executable AND every ancestor; no writable code roots."""
+    real = path.resolve(strict=True)
+    for part in (real, *real.parents):
+        info = part.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise HostError('A required executable or ancestor is not root-owned/private')
+    return real
+
+
+def run(*args):
+    result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                            env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': '/var/root'}, timeout=30)
+    if result.returncode:
+        raise HostError('Installation command failed: ' + Path(args[0]).name)
+    return result.stdout.decode().strip()
+
+
+def ensure_account():
+    try:
+        record = pwd.getpwnam('secagent')
+    except KeyError:
+        used_uids = {p.pw_uid for p in pwd.getpwall()}
+        used_gids = {g.gr_gid for g in grp.getgrall()}
+        try:
+            gid = grp.getgrnam('secagent').gr_gid
+        except KeyError:
+            gid = next(i for i in range(480, 500) if i not in used_gids)
+            for key, value in [('PrimaryGroupID', str(gid)), ('Password', '*')]:
+                run('/usr/bin/dscl', '.', '-create', '/Groups/secagent', key, value)
+        uid = next(i for i in range(480, 500) if i not in used_uids)
+        for key, value in [('UniqueID', str(uid)), ('PrimaryGroupID', str(gid)),
+                           ('NFSHomeDirectory', str(SA_HOME)), ('UserShell', '/usr/bin/false'),
+                           ('Password', '*'), ('IsHidden', '1')]:
+            run('/usr/bin/dscl', '.', '-create', '/Users/secagent', key, value)
+        record = pwd.getpwnam('secagent')
+    if record.pw_dir != str(SA_HOME) or record.pw_shell != '/usr/bin/false' or not 0 < record.pw_uid < 500:
+        raise HostError('Existing secagent account does not meet the isolation contract')
+    result = subprocess.run(['/usr/sbin/dseditgroup', '-o', 'checkmember', '-m', 'secagent', 'admin'], capture_output=True)
+    if result.returncode == 0:
+        raise HostError('secagent must not be an administrator')
+    for path in (SA_HOME, SA_HOME / '.tmp', SA_HOME / '.config'):
+        if path.is_symlink():
+            raise HostError('Refusing a symlinked private directory')
+        path.mkdir(mode=0o700, exist_ok=True)
+        os.chown(path, record.pw_uid, record.pw_gid)
+        path.chmod(0o700)
+    return record
+
+
+def snapshot(repo: Path, commit: str, destination: Path):
+    if re.fullmatch(r'[0-9a-f]{40}', commit) is None:
+        raise HostError('Specify an exact 40-character commit SHA')
+    base = [GIT, '-c', 'safe.directory=' + str(repo), '-c', 'core.fsmonitor=false', '-C', str(repo)]
+    env = {'PATH': '/usr/bin:/bin', 'HOME': '/var/empty', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_NO_REPLACE_OBJECTS': '1'}
+    def git(*args):
+        result = subprocess.run(base + list(args), env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        if result.returncode:
+            raise HostError('Could not read the specified source commit')
+        return result.stdout
+    raw = git('cat-file', 'commit', commit)
+    if b'\ngpgsig ' not in raw.split(b'\n\n', 1)[0]:
+        raise HostError('The source commit must carry a signature (verify it as your own user first)')
+    destination.mkdir(mode=0o755)
+    for name in FILES:
+        data = git('show', commit + ':' + name)
+        (destination / name).write_bytes(data)
+        (destination / name).chmod(0o644)
+    (destination / 'source.json').write_text(json.dumps({'commit': commit}) + '\n')
+    (destination / 'source.json').chmod(0o644)
+
+
+def validate_source_config(source: Path):
+    if source.is_symlink():
+        raise HostError('Refusing a symlinked configuration directory')
+    for path in source.iterdir():
+        if path.name not in {'manifest.json', 'aws-okta.json', 'upstream-ca.pem', 'bootstrap.json', 'client-environment.json', 'network.json'}:
+            raise HostError('Unexpected private configuration file')
+        if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
+            raise HostError('Invalid private configuration file')
+    contents = {p.name: private_read(p, 2 * 1024 * 1024) for p in source.iterdir()}
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest = Path(tmp) / 'manifest.json'
+        manifest.write_bytes(contents['manifest.json'])
+        SecretManifest.load(manifest)
+    if 'aws-okta.json' in contents:
+        AwsCredsProvider._validate_config(json.loads(contents['aws-okta.json']))
+    return contents
+
+
+def activate(release: Path):
+    link = ROOT / '.current-new'
+    if link.exists() or link.is_symlink():
+        raise HostError('Unexpected staging symlink')
+    link.symlink_to(release)
+    os.replace(link, ROOT / 'current')
+
+
+def install(args):
+    if sys.platform != 'darwin' or os.getuid() != 0 or os.environ.get('SUDO_USER') in (None, '', 'root'):
+        raise HostError('Run with sudo from your own macOS account')
+    caller = pwd.getpwnam(os.environ['SUDO_USER'])
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', caller.pw_name):
+        raise HostError('Unsupported local account name')
+    source = args.config.resolve(strict=True)
+    contents = validate_source_config(source)
+    policy = {'instance': args.instance, 'machine': args.machine, 'port': args.port}
+    if 'network.json' in contents:
+        policy['network'] = json.loads(contents['network.json'])
+    deployment = Deployment.from_dict(policy)
+    environment = json.loads(contents.get('client-environment.json', b'{}'))
+    client = {'sharedDir': str(deployment.shared), 'port': args.port, 'environment': environment}
+    if args.agent_dir:
+        client['agentDir'] = str(args.agent_dir)
+    validate_config(client)
+    for executable in (PODMAN, '/opt/podman/bin/krunkit', '/opt/podman/bin/gvproxy', PYTHON, GIT):
+        root_owned(Path(executable))
+    # Refuse pre-existing symlinks/writable roots instead of taking them over.
+    root_owned(Path('/opt'))
+    for path in (ROOT, ROOT / 'releases', ROOT / 'instances', SHARED_ROOT):
+        if path.is_symlink():
+            raise HostError('Refusing a symlinked install root')
+        path.mkdir(mode=0o755, exist_ok=True)
+        root_owned(path)
+    registration = ROOT / 'instances' / (args.instance + '.json')
+    existing = registration.exists() or deployment.private.exists() or deployment.shared.exists()
+    if existing:
+        expected_registration = deployment.to_dict()
+        if (not registration.is_file() or not deployment.private.is_dir() or not deployment.shared.is_dir()
+                or json.loads(private_read(registration, 4096)) != expected_registration
+                or json.loads(private_read(deployment.shared / 'client.json', 65536)) != client):
+            raise HostError('Existing instance differs; choose a new candidate name (no implicit overwrite)')
+        actual = {p.name: private_read(p, 2 * 1024 * 1024) for p in (deployment.private / 'config').iterdir()}
+        expected = {name: value for name, value in contents.items() if name in ('manifest.json', 'aws-okta.json', 'upstream-ca.pem')}
+        if actual != expected:
+            raise HostError('Existing private policy differs; no implicit overwrite')
+    release = ROOT / 'releases' / args.commit
+    # An already-staged release is reusable only if every byte matches Git.
+    # Immutable content from Git, never an uncommitted working-tree copy.
+    with tempfile.TemporaryDirectory(prefix='.stage-', dir=ROOT) as tmp:
+        staged = Path(tmp) / 'release'
+        snapshot(args.repo.resolve(), args.commit, staged)
+        if release.exists():
+            root_owned(release)
+            for name in (*FILES, 'source.json'):
+                root_owned(release / name)
+                if (release / name).read_bytes() != (staged / name).read_bytes():
+                    raise HostError('Staged release differs from its committed content')
+        else:
+            staged.rename(release)
+    if existing:
+        activate(release)
+        print('Identical instance policy retained; committed release staged. No running service changed.')
+        return
+    account = ensure_account()
+    for path in (deployment.private.parent, deployment.private):
+        if path.is_symlink():
+            raise HostError('Refusing a symlinked instance directory')
+        path.mkdir(mode=0o700, exist_ok=True)
+        os.chown(path, account.pw_uid, account.pw_gid)
+        path.chmod(0o700)
+    config = deployment.private / 'config'
+    config.mkdir(mode=0o755, exist_ok=True)
+    os.chown(config, 0, account.pw_gid)
+    for name in ('manifest.json', 'aws-okta.json', 'upstream-ca.pem'):
+        if name in contents:
+            (config / name).write_bytes(contents[name])
+            os.chown(config / name, 0, account.pw_gid)
+            (config / name).chmod(0o644)
+    deployment.shared.mkdir(mode=0o750, exist_ok=True)
+    os.chown(deployment.shared, account.pw_uid, account.pw_gid)
+    # Reset only our own candidate directory ACL, never a legacy shared directory.
+    run('/bin/chmod', '-N', str(deployment.shared))
+    # Explicit caller ACL works immediately, without requiring a new group login.
+    for entry in (f'user:{caller.pw_name} allow list,search,readattr,readextattr,readsecurity',
+                  f'user:{caller.pw_name} allow read,readattr,readextattr,readsecurity,file_inherit,only_inherit'):
+        run('/bin/chmod', '+a', entry, str(deployment.shared))
+    (deployment.shared / 'client.json').write_text(json.dumps(client, indent=2) + '\n')
+    (deployment.shared / 'client.json').chmod(0o640)
+    os.chown(deployment.shared / 'client.json', account.pw_uid, account.pw_gid)
+    registration.write_text(json.dumps(deployment.to_dict()) + '\n')
+    registration.chmod(0o644)
+    activate(release)
+    print('Registered isolated candidate: ' + args.instance)
+    print('No machine/container was started or stopped. No credentials were read.')
+    print('Client settings: ' + str(deployment.shared / 'client.json'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', required=True, type=Path)
+    parser.add_argument('--commit', required=True)
+    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--instance', default='candidate')
+    parser.add_argument('--machine', default='secagent')
+    parser.add_argument('--port', type=int, default=10260)
+    parser.add_argument('--agent-dir', type=Path)
+    install(parser.parse_args())
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        detail = str(error) if isinstance(error, HostError) else type(error).__name__
+        print('secret-proxy installation failed: ' + detail, file=sys.stderr)
+        sys.exit(1)
