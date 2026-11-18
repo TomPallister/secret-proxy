@@ -16,10 +16,13 @@ See [the preliminary licensing review](docs/licensing-review.md). The first
 release is intended to be source-only; prebuilt image redistribution is not
 cleared, particularly for the bundled 1Password CLI.
 
-**Publication is also blocked by the current dependency audit.** The existing
-lock has known advisories; the latest upstream mitmproxy still caps a dependency
-below its fixes. See [the audit and upgrade constraint](docs/dependency-audit.md).
-No dependency or running service was changed by that review.
+**Publication still needs dependency-risk review.** The updated Python lock has
+zero known advisory matches, with a documented/tested Tornado compatibility
+override. The refreshed image still has Debian and bundled-tool matches that
+have not been waived. See [the audit and remaining gate](docs/dependency-audit.md).
+These dependency changes have passed isolated tests, not a live deployment;
+the earlier live acceptance described above used the previous build. Both live
+proxies and rollback state remain unchanged.
 
 ## Security contract
 
@@ -261,6 +264,10 @@ podman run --rm -i --network none --read-only --cap-drop ALL \
   localhost/secret-proxy-candidate:phase2 - < tests/smoke_container.py
 ```
 
+For actual TLS/H1/H2 injection and signing against a generated local upstream,
+run the same network-disabled container command with `tests/smoke_wire.py` as
+stdin instead. All credentials and signing keys in that test are synthetic.
+
 Real Mac host/Podman contract test, against an explicit test connection:
 
 ```sh
@@ -300,6 +307,8 @@ uv run --locked python tests/smoke_pi.py --help
   The accepted deployment uses direct egress; no VPN was silently started.
 - Container rollback remains documented rather than live-rehearsed. Keep the
   old engine, configuration, CA and token available during normal-use validation.
+- Resolve or explicitly accept the remaining image/dependency findings, and
+  coordinate real-provider acceptance before deploying the upgraded candidate.
 - Choose the first-party licence, scan the exact publication history and obtain
   explicit publication approval. Source-only publication does not clear images
   for redistribution; see the separate licensing gates.

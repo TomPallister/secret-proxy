@@ -1,4 +1,4 @@
-FROM python:3.13-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 # The base digest fixes the starting filesystem, but Debian apt repositories
 # remain mutable. Package layers are not bit-for-bit reproducible until a dated
@@ -6,10 +6,11 @@ FROM python:3.13-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe
 
 # Pinned tool versions (no :latest).
 ENV UV_VERSION=0.8.17
-ENV OP_CLI_VERSION=2.39.0
+ENV OP_CLI_VERSION=2.42.0
 ENV SAML2AWS_VERSION=2.36.19
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Refresh packages already present in the pinned base as well as new tools.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
       curl \
       ca-certificates \
       xz-utils \
@@ -64,8 +65,8 @@ RUN --mount=type=secret,id=upstream_ca set -eux; \
     fi; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
-      arm64) url="https://cache.agilebits.com/dist/1P/op2/pkg/v${OP_CLI_VERSION}/op_linux_arm64_v${OP_CLI_VERSION}.zip"; sha='829baeff1c07e055cfa132031b1d9f2282ccdf5076258e482caf2fda70aea5d0' ;; \
-      amd64) url="https://cache.agilebits.com/dist/1P/op2/pkg/v${OP_CLI_VERSION}/op_linux_amd64_v${OP_CLI_VERSION}.zip"; sha='6fba7f376b6c6dec49f41b06408930a43ad064cce103c6a2ce5b3d0413a86434' ;; \
+      arm64) url="https://cache.agilebits.com/dist/1P/op2/pkg/v${OP_CLI_VERSION}/op_linux_arm64_v${OP_CLI_VERSION}.zip"; sha='e56c379fabafb393ce699258e484694abe464870fb41f35ce1b5c3f17868ba61' ;; \
+      amd64) url="https://cache.agilebits.com/dist/1P/op2/pkg/v${OP_CLI_VERSION}/op_linux_amd64_v${OP_CLI_VERSION}.zip"; sha='261fe3844a43e7e83a3d85e8a9f36411729436a1d3add1dc7dd46cbbceebe9e5' ;; \
       *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
     esac; \
     curl -fsSLo /tmp/op.zip "$url"; \
@@ -95,6 +96,15 @@ RUN --mount=type=secret,id=upstream_ca set -eux; \
     chmod +x /usr/local/bin/saml2aws; \
     saml2aws --version \
     && rm -f /tmp/build-ca.pem
+
+# Fetch/extraction tools and base-image pip are not runtime dependencies. uv
+# installs the locked environment; the proxy does not use pip or ensurepip.
+RUN apt-get purge -y --auto-remove curl xz-utils unzip jq \
+    && rm -rf /var/lib/apt/lists/* \
+      /usr/local/lib/python3.13/site-packages/pip \
+      /usr/local/lib/python3.13/site-packages/pip-*.dist-info \
+      /usr/local/lib/python3.13/ensurepip/_bundled/pip-*.whl \
+      /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.13
 
 # Explicit source allowlist: never copy private configuration or certificates.
 COPY addon.py entry.py sigv4.py awscreds.py googlecreds.py auth0creds.py oauthcreds.py chatgptcreds.py sealedjwt.py gitsign.py secretstore.py runtime.py /opt/secret-proxy/

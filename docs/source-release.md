@@ -41,7 +41,10 @@ and must also be reviewed; do not confuse a public signature with a secret key.
    fake test inputs can be legitimate findings, but new results need review.
 4. Run `./test.sh`, fatal Python lint and compilation from the exact candidate.
    Mutation-test the boundary assertions. The default unit suites use fixtures;
-   live smoke scripts require separate operator coordination.
+   live smoke scripts require separate operator coordination. Audit both the
+   locked Python graph and the exact built image. A clean Python result alone
+   does not cover OS packages or downloaded executables; resolve or explicitly
+   accept the remaining findings recorded in `dependency-audit.md`.
 5. Build a source archive/bundle from committed content, enumerate its members,
    clone it into a fresh directory, verify the commit signature and rerun gates.
    Record the commit/tree ID and archive digest in the external release ledger.

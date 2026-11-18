@@ -49,6 +49,20 @@ class TestChatGPTCredentials(unittest.TestCase):
         self.assertEqual(self.calls[1]["refresh_token"], "refresh1")
         self.assertEqual(self.provider.get_token(), jwt("account-1", "signature2"))
 
+    def test_second_expiry_uses_rotated_refresh_and_original_sealed_reference(self):
+        self.responses.append({"access_token": jwt("account-1", "signature3"),
+                               "refresh_token": "refresh3", "expires_in": 3600})
+        credential = self.login()
+        for signature in ("signature2", "signature3"):
+            self.time[0] += 3500
+            self.assertEqual(self.provider.get_token(), jwt("account-1", signature))
+        self.assertEqual([call["refresh_token"] for call in self.calls[1:]],
+                         ["refresh1", "refresh2"])
+        self.assertEqual(sealedjwt.unseal(credential["access"]),
+                         sealedjwt.MARKER + "CHATGPT_ACCESS_TOKEN")
+        for value in ("signature1", "signature2", "signature3", "refresh1", "refresh2", "refresh3"):
+            self.assertNotIn(value, json.dumps(credential))
+
     def test_bad_state_consumes_pending_and_does_not_exchange(self):
         self.provider.start()
         with self.assertRaises(ChatGPTAuthError):

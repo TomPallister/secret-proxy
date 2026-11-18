@@ -20,17 +20,22 @@ not exempt the project from provenance review or users from upstream terms.
 
 | Component | Observed licence | Consequence |
 | --- | --- | --- |
-| mitmproxy 11.1.3 | MIT | Preserve its notice when redistributing it. |
+| mitmproxy 12.3.1 | MIT | Preserve its notice when redistributing it. |
 | Most Python dependencies | MIT, BSD, Apache-2.0 or PSF | Preserve their respective notices; check bundled native-library notices too. |
 | ldap3 2.9.1 | LGPL v3 | Library-specific source, notice and replacement/relinking requirements need a distribution review. |
-| urwid 2.6.16 | LGPL-2.1-only | Same: do not call the whole Python dependency tree permissive. |
-| certifi 2026.7.22 | MPL-2.0 | Preserve notices and applicable source availability for covered files. |
+| urwid 4.0.13 | LGPL-2.1-only | Same: do not call the whole Python dependency tree permissive. |
+| certifi 2026.10.23 | MPL-2.0 | Preserve notices and applicable source availability for covered files. |
 | publicsuffix2 2.20191221 | MIT and MPL-2.0 | Code and bundled list data have distinct terms. |
 | saml2aws 2.36.19 | MIT at project level | Its compiled Go dependency tree still needs a binary-level review before image distribution. |
 | oathtool (Debian package) | GPL-3+; package also lists LGPL-2.1+ material | Invoked as a separate program. Distributing the executable needs the relevant notices and corresponding-source compliance. |
 | socat (Debian package) | GPL-2 with OpenSSL exception plus other licensed files | Separate executable; retain component-specific notices and comply with source obligations for the actual package version. |
-| 1Password CLI 2.39.0 | Proprietary terms | No affirmative permission to redistribute it in a public image has been established. Do not publish an image containing it without permission/clarification. |
+| 1Password CLI 2.42.0 | Proprietary terms | No affirmative permission to redistribute it in a public image has been established. Do not publish an image containing it without permission/clarification. |
 | Python/Debian base and uv 0.8.17 | Multiple component licences | A complete image review must include base packages and native/transitive components, not just Python metadata. |
+
+Metadata was refreshed for the dependency remediation on 2026-11-18. In
+particular, cryptography 50.0.2 declares Apache-2.0 OR BSD-3-Clause and Tornado
+6.6.1 declares Apache-2.0; the LGPL/MPL qualifications above still apply. The
+separate experimental saml2aws source rebuild is not selected in this image.
 
 The LGPL libraries and MPL-covered files do not by themselves require all
 first-party files to be GPL/MPL. Similarly, invoking an independent GPL utility
@@ -63,7 +68,7 @@ References:
 - [GNU GPL FAQ: mere aggregation](https://www.gnu.org/licenses/gpl-faq.html#MereAggregation)
 - [1Password terms](https://1password.com/legal/terms-of-service/) — review the applicable agreement and redistribution restrictions, rather than assuming a free download is freely redistributable.
 - [saml2aws pinned licence](https://github.com/Versent/saml2aws/blob/v2.36.19/LICENSE.md)
-- [mitmproxy pinned licence](https://github.com/mitmproxy/mitmproxy/blob/v11.1.3/LICENSE)
+- [mitmproxy pinned licence](https://github.com/mitmproxy/mitmproxy/blob/v12.3.1/LICENSE)
 - [MPL 2.0 FAQ](https://www.mozilla.org/en-US/MPL/2.0/FAQ/)
 
 ## Before source publication
