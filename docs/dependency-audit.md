@@ -65,6 +65,10 @@ Review applicability and obtain specific risk acceptance, wait for vendor fixes,
 or separately approve and maintain a tested replacement/rebuild before treating
 this candidate as cleared for publication or deployment.
 
+The operator chose to retain the official saml2aws binary on 2026-11-18. That
+choice did not approve publication, deployment or waive these findings. Do not
+adopt the custom rebuild below without a new explicit decision.
+
 ### Separate saml2aws rebuild experiment — not selected
 
 A private disposable experiment rebuilt the same upstream source commit with Go

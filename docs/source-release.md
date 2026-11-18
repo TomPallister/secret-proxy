@@ -2,7 +2,8 @@
 
 Nothing in this procedure authorises a deployment, service restart, vault change
 or publication. Obtain explicit operator approval before creating/pushing a
-public repository or release. A first-party licence must be chosen first.
+public repository or release. This candidate's first-party licence is Apache-2.0
+(`LICENSE`), selected by the operator; that choice is not publication approval.
 
 ## Publication boundary
 
@@ -59,7 +60,8 @@ predecessor. Its private configuration and history are not part of the public
 source artifact. Third-party packages are installed from the lockfile and
 pinned tool downloads, not vendored into the source tree. Source-header and
 history inspection alone cannot establish ownership of every line; the licence
-choice remains the operator's decision, not legal clearance by this document.
+selection of Apache-2.0 is the operator's decision, not legal clearance by this
+document.
 
 - `sigv4.py` implements the documented AWS signing protocol; `test_sigv4.py`
   uses published S3 chunk-signature **example data**, not live credentials:

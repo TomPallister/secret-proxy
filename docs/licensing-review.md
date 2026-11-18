@@ -1,7 +1,8 @@
 # Licensing review — release gate
 
-Status: preliminary engineering inventory, not legal clearance. No project
-licence has been selected and no prebuilt image is cleared for redistribution.
+Status: preliminary engineering inventory, not legal clearance. No prebuilt
+image is cleared for redistribution. The operator selected Apache-2.0 for
+first-party source on 2026-11-18; the exact text is in `LICENSE`.
 
 ## Source versus dependencies versus images
 
@@ -43,9 +44,9 @@ through its ordinary CLI does not by itself make the caller GPL. This assessment
 must be revisited if GPL code is copied into the engine or the programs are
 combined in a materially different way.
 
-An Apache-2.0 or MIT licence for first-party source appears feasible, **subject to
-provenance confirmation and operator choice**. Apache-2.0 adds an explicit patent
-grant; neither licence replaces the licences or terms of dependencies.
+The selected Apache-2.0 licence adds an explicit patent grant for first-party
+source. It does not replace dependency licences or terms, establish third-party
+ownership, clear binary redistribution, or authorise publication.
 
 ## Evidence and limits
 
@@ -74,7 +75,7 @@ References:
 ## Before source publication
 
 - Confirm first-party provenance and retain any required third-party attribution.
-- Obtain the operator's licence choice and add the exact licence text.
+- Retain the operator-selected Apache-2.0 licence and its exact official text.
 - Review the final tracked tree and all reachable history for private content.
 - Verify that no generated image, downloaded binary, cache or private fixture is
   included in the publication.

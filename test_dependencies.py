@@ -1,4 +1,5 @@
 """Security pins and the supported headless entrypoint (no web/console UI)."""
+import hashlib
 import importlib.metadata
 from pathlib import Path
 import subprocess
@@ -8,6 +9,13 @@ import unittest
 
 
 class DependencyTests(unittest.TestCase):
+    def test_selected_apache_licence_is_complete_and_declared(self):
+        root = Path(__file__).parent
+        self.assertEqual(hashlib.sha256((root / 'LICENSE').read_bytes()).hexdigest(),
+                         'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30')
+        self.assertEqual(tomllib.loads((root / 'pyproject.toml').read_text())['project']['license'],
+                         'Apache-2.0')
+
     def test_security_pins_are_explicit_in_project_and_lock(self):
         root = Path(__file__).parent
         project = tomllib.loads((root / 'pyproject.toml').read_text())

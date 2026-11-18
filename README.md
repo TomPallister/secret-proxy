@@ -10,8 +10,8 @@ authenticated routing, preserved sealed login and workspace, read-only AWS/GitHu
 Git signing, Bedrock and Codex model calls, compaction, and restart/relogin.
 Host routing rollback was also exercised. Consumer adapters live outside this
 engine. VPN attachment is tested with disposable namespaces, not a live tunnel.
-Nothing is published;
-a licence and a final clean-history review are required before distribution.
+Nothing is published; final clean-history and risk review plus operator approval
+are required before distribution. First-party source uses Apache-2.0.
 See [the preliminary licensing review](docs/licensing-review.md). The first
 release is intended to be source-only; prebuilt image redistribution is not
 cleared, particularly for the bundled 1Password CLI.
@@ -23,6 +23,12 @@ have not been waived. See [the audit and remaining gate](docs/dependency-audit.m
 These dependency changes have passed isolated tests, not a live deployment;
 the earlier live acceptance described above used the previous build. Both live
 proxies and rollback state remain unchanged.
+
+## Licence
+
+Copyright 2026 secret-proxy contributors. First-party source is licensed under
+the [Apache License, Version 2.0](LICENSE). Dependencies retain their own licences
+and terms; this does not grant permission to redistribute the bundled tools.
 
 ## Security contract
 
@@ -309,7 +315,7 @@ uv run --locked python tests/smoke_pi.py --help
   old engine, configuration, CA and token available during normal-use validation.
 - Resolve or explicitly accept the remaining image/dependency findings, and
   coordinate real-provider acceptance before deploying the upgraded candidate.
-- Choose the first-party licence, scan the exact publication history and obtain
+- Retain the selected Apache-2.0 licence, scan the exact publication history and obtain
   explicit publication approval. Source-only publication does not clear images
   for redistribution; see the separate licensing gates.
 
