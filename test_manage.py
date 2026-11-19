@@ -86,6 +86,32 @@ class ManageTests(unittest.TestCase):
                     manage.execute(self.settings(), 'auth-status')
                 self.assertEqual(output.getvalue(), '')
 
+    def test_login_provider_selects_the_proxy_owned_login(self):
+        with patch.object(manage.os, 'execv') as execute:
+            manage.execute(self.settings(), 'login', provider='chatgpt')
+            self.assertEqual(execute.call_args.args[1][-1], 'login')
+            manage.execute(self.settings(), 'login', provider='github-copilot')
+            self.assertEqual(execute.call_args.args[1][-3:], ['login', '--provider', 'github-copilot'])
+        with patch.object(manage, 'execute') as run, patch.object(manage, 'load_settings', return_value=self.settings()):
+            manage.main(['login', 'github-copilot'])
+            self.assertEqual(run.call_args.args[3], 'github-copilot')
+            manage.main(['login'])
+            self.assertIsNone(run.call_args.args[3])
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                manage.main(['login', 'unknown'])
+
+    def test_copilot_auth_status_has_its_own_credential_free_fields(self):
+        status = {'instance': 'a' * 32, 'loggedIn': True, 'expiresAt': 2000, 'refreshCount': 1, 'lastRefreshAt': 1000}
+        client = Mock(); client.call.return_value = status
+        with patch.object(manage, 'selected_client', return_value=client), patch.object(manage, 'private_read', return_value=json.dumps({'status': 'ready', 'instance': 'a' * 32}).encode()), contextlib.redirect_stdout(io.StringIO()) as output:
+            manage.execute(self.settings(), 'auth-status', provider='github-copilot')
+            self.assertEqual(json.loads(output.getvalue()), status)
+            client.call.assert_called_once_with('/github-copilot/status')
+            for change in ({'lastRefreshDueAt': 1}, {'token': 'must-not-print'}, {'expiresAt': 'x'}):
+                client.call.return_value = {**status, **change}
+                with self.subTest(change=change), self.assertRaises(manage.ClientError):
+                    manage.execute(self.settings(), 'auth-status', provider='github-copilot')
+
     def test_source_launcher_refuses_uninstalled_execution(self):
         result = subprocess.run([manage.sys.executable, str(Path(__file__).with_name('secret-proxy')), '--help'], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

@@ -1,4 +1,6 @@
 import base64
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,7 +14,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-from client import ClientError, client_env, read_hidden, save_credential, validate_credential
+import client
+from client import (ClientError, client_env, device_login, read_hidden, save_credential,
+                    validate_copilot_credential, validate_credential)
 
 
 def credential():
@@ -21,6 +25,78 @@ def credential():
     claims = base64.urlsafe_b64encode(json.dumps({'https://api.openai.com/auth': {'chatgpt_account_id': 'example'}}).encode()).decode().rstrip('=')
     return {'type': 'oauth', 'access': 'e30.' + claims + '.' + sig,
             'refresh': marker, 'expires': 4102444800000, 'accountId': 'example'}
+
+
+def copilot_credential():
+    reference = 'secret' + 'ref:GITHUB_COPILOT_SESSION_TOKEN'
+    return {'type': 'oauth', 'refresh': reference,
+            'access': 'tid=' + reference + ';exp=2000000000;proxy-ep=proxy.individual.githubcopilot.com',
+            'expires': 1999999700000, 'availableModelIds': ['model-a']}
+
+
+class FakeProxy:
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def call(self, path, body=None):
+        self.calls.append((path, body))
+        return self.answers.pop(0)
+
+
+class CopilotClientTests(unittest.TestCase):
+    def test_only_sealed_copilot_entries_accepted(self):
+        valid = copilot_credential()
+        self.assertEqual(validate_copilot_credential(valid), valid)
+        self.assertEqual(validate_copilot_credential({**valid, 'enterpriseUrl': 'github.example.com'})['enterpriseUrl'],
+                         'github.example.com')
+        for change in ({'access': 'tid=real;exp=1;proxy-ep=proxy.example.com:' + 'f' * 64},
+                       {'access': valid['access'] + ':signature'}, {'refresh': 'gho_real'},
+                       {'type': 'api_key'}, {'expires': True}, {'expires': 0}, {'extra': 'value'},
+                       {'enterpriseUrl': 'https://github.example.com'}, {'availableModelIds': 'model-a'}):
+            with self.subTest(change=change), self.assertRaises(ClientError):
+                validate_copilot_credential({**valid, **change})
+        with self.assertRaises(ClientError):
+            validate_copilot_credential({key: value for key, value in valid.items() if key != 'expires'})
+
+    def test_copilot_entry_is_saved_beside_other_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'auth.json'
+            target.write_text(json.dumps({'openai-codex': credential()}))
+            save_credential(Path(tmp), copilot_credential(), 'github-copilot')
+            saved = json.loads(target.read_text())
+            self.assertEqual(saved['openai-codex'], credential())
+            self.assertEqual(saved['github-copilot'], copilot_credential())
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(ClientError):
+                save_credential(Path(tmp), {**copilot_credential(), 'access': 'real'}, 'github-copilot')
+            self.assertEqual(json.loads(target.read_text()), saved)
+
+    def test_device_login_shows_only_the_code_and_lets_the_proxy_poll(self):
+        start = {'userCode': 'ABCD-1234', 'verificationUri': 'https://github.com/login/device',
+                 'expiresIn': 900, 'interval': 5}
+        proxy = FakeProxy([start, {'status': 'pending', 'retryAfter': 5}, {'status': 'pending', 'retryAfter': 25},
+                           {'status': 'complete', 'credential': copilot_credential()}])
+        stderr = io.StringIO()
+        with patch.object(client.time, 'sleep') as sleep, contextlib.redirect_stderr(stderr):
+            result = device_login(proxy, '/github-copilot')
+        self.assertEqual(result['credential'], copilot_credential())
+        self.assertEqual([call[0] for call in proxy.calls], ['/github-copilot/start'] + ['/github-copilot/poll'] * 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0, 15, ])
+        self.assertIn('ABCD-1234', stderr.getvalue())
+        self.assertIn('https://github.com/login/device', stderr.getvalue())
+
+    def test_device_login_refuses_untrusted_or_failed_responses(self):
+        good = {'userCode': 'ABCD-1234', 'verificationUri': 'https://github.com/login/device', 'expiresIn': 900}
+        for start in ({**good, 'verificationUri': 'javascript:alert(1)'}, {**good, 'userCode': 'a b'},
+                      {**good, 'expiresIn': 0}, {**good, 'verificationUri': 'https://github.com/x y'}):
+            with self.subTest(start=start), self.assertRaises(ClientError), contextlib.redirect_stderr(io.StringIO()):
+                device_login(FakeProxy([start]), '/github-copilot')
+        for answer in ({'status': 'failed', 'reason': 'access_denied'}, {'status': 'odd'},
+                       {'status': 'pending', 'retryAfter': -1}):
+            with self.subTest(answer=answer), self.assertRaises(ClientError), \
+                    contextlib.redirect_stderr(io.StringIO()), patch.object(client.time, 'sleep'):
+                device_login(FakeProxy([good, answer]), '/github-copilot')
 
 
 class ClientTests(unittest.TestCase):

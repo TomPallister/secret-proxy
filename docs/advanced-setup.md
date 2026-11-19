@@ -111,7 +111,8 @@ address checks above. See `examples/egress-manifest.json`:
   exactly one label. IP literals match only that address. Partial-label
   wildcards (`api*.example.com`), a bare `*` and duplicates are rejected at
   startup. Ports are not part of a pattern.
-- AWS endpoints and `auth.openai.com` are not implicitly allowed. In
+- AWS endpoints, `auth.openai.com` and the GitHub login domains (`<domain>`,
+  `api.<domain>`) are not implicitly allowed. In
   `allowlist` mode with AWS signing, list the endpoints you use, for example
   `*.amazonaws.com` or `sts.amazonaws.com`.
 - `allowPrivateCidrs`: networks without host bits. Entries overlapping
@@ -141,6 +142,36 @@ Limits:
   ChatGPT login exchange) do not go through these lists.
 - The proxy connects to the first checked address, so it does not fall back to
   later addresses when the first one fails to connect.
+
+## GitHub logins
+
+The proxy can own a GitHub Copilot login (for Pi). It is off unless the manifest
+declares the runtime-only entry. Example (also in `examples/github-manifest.json`):
+
+```json
+{
+  "githubLogins": {"copilot": {"domain": "github.com"}},
+  "secrets": {
+    "GITHUB_COPILOT_SESSION_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [{"kind": "header", "hosts": ["api.githubcopilot.com", "api.*.githubcopilot.com"],
+                      "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "POST"]}]
+    }
+  }
+}
+```
+
+- `githubLogins` is optional. `domain` defaults to `github.com`. For GitHub
+  Enterprise Cloud with data residency, set your own domain (for example
+  `github.example.com`); the device flow then uses that domain and the exchange
+  uses `api.<domain>`.
+- Do not create a vault item for `GITHUB_COPILOT_SESSION_TOKEN`. With
+  `runtimeOnly`, the value only ever comes from the login. Without it, the name
+  is an ordinary vault secret and the login stays off.
+- Enabling the login adds `<domain>` and `api.<domain>` to the intercepted hosts,
+  so the proxy can refuse a client's own device flow and answer its token
+  exchange. The placements decide where the Copilot token may go; the token's own
+  `proxy-ep` narrows that to one host.
 
 ## Candidate installation on macOS
 

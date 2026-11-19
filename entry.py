@@ -56,6 +56,14 @@ def _allow_hosts(manifest=None) -> list[str]:
         pass
     else:
         patterns.append(_host_pattern("auth.openai.com"))
+    # Proxy-owned GitHub logins: intercept the login host (to refuse a client's
+    # own device flow) and, for Copilot, the API host serving the exchange.
+    for kind in ("copilot",):
+        settings = manifest.github_login(kind)
+        if settings is not None:
+            patterns.append(_host_pattern(settings["domain"]))
+            if kind == "copilot":
+                patterns.append(_host_pattern("api." + settings["domain"]))
     return list(dict.fromkeys(patterns))
 
 

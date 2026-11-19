@@ -29,6 +29,12 @@ engineering evidence, not a penetration test or a security certification.
   host allow/deny list limits where proxied traffic may go.
 - ChatGPT access and rotating refresh tokens are memory-only. Restart requires
   browser sign-in again. Static secrets remain cached until invalidation/restart.
+- GitHub Copilot: the proxy runs the device flow and the Copilot token exchange.
+  The GitHub token and Copilot token are memory-only. The client's own exchange
+  call is answered by the proxy with a sealed token and never forwarded. The real
+  Copilot token is sent only to the API host named by its own `proxy-ep` field,
+  within the manifest placement. A client-side device flow using the Copilot
+  OAuth client ID, or an exchange with any other bearer, is refused.
 
 ## What is not protected
 
@@ -57,6 +63,9 @@ engineering evidence, not a penetration test or a security certification.
 - **Independent proof of vault scope.** Bootstrap checks declared item metadata;
   only provider-side configuration determines actual service-account permissions.
   Use a read-only capability scoped to the intended runtime vault.
+- **Other GitHub OAuth apps.** Blocking a client's own device flow covers only
+  the OAuth client IDs of the proxy-owned logins that are enabled. A client with
+  network access to GitHub can still sign in with a different app.
 - **Narrow CA authority.** Intercepting only configured hosts does not constrain
   the authority of a trusted root CA. The launcher does not install global trust.
 - **An atomic VPN kill switch.** Interface/container watchdogs are secondary.

@@ -49,13 +49,18 @@ Follow the browser instructions and paste the callback into the terminal's
 hidden prompt. You must log in again after a restart: those OAuth tokens are
 kept in memory, not saved to disk. Other integrations do not require this login.
 
+For **GitHub Copilot in Pi**, enable it in your manifest and run
+`secret-proxy login github-copilot`. You approve a code on GitHub; the proxy
+keeps the GitHub and Copilot tokens in memory and Pi gets only references.
+
 The proxy does not run as a background service. Use `stop` explicitly rather
 than assuming that closing its terminal stopped it.
 
 ## What it supports
 
 - API keys in headers, query parameters, forms and HTTP Basic authentication.
-- Proxy-managed OAuth for supported services, including ChatGPT/Codex.
+- Proxy-managed OAuth for supported services, including ChatGPT/Codex and
+  GitHub Copilot.
 - AWS request signing using Okta/SAML credentials. Calls that return
   credentials or secrets (`GetSecretValue`, `AssumeRole`, `CreateAccessKey`…)
   are refused by default; see the [AWS operation policy](docs/operations.md#aws-operation-policy).

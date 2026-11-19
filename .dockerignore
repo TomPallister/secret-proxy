@@ -11,6 +11,8 @@
 !auth0creds.py
 !oauthcreds.py
 !chatgptcreds.py
+!githubdevice.py
+!copilotcreds.py
 !sealedjwt.py
 !gitsign.py
 !egress.py

@@ -1,4 +1,4 @@
-"""Command-scoped host client and sealed ChatGPT login. No vault capability here."""
+"""Command-scoped host client and sealed proxy-owned logins. No vault capability here."""
 from __future__ import annotations
 
 import argparse
@@ -211,8 +211,41 @@ def validate_credential(value: object) -> dict:
         raise ClientError('Proxy returned an invalid or unsealed credential') from None
 
 
-def save_credential(agent_dir: Path, value: dict):
-    validate_credential(value)
+COPILOT_REFERENCE = MARKER + 'GITHUB_COPILOT_SESSION_TOKEN'
+_HOST_RE = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+'
+LOGIN_FAILURES = {'expired_token': 'the code expired before it was entered',
+                  'access_denied': 'access was denied in the browser',
+                  'login_failed': 'GitHub refused the login',
+                  'no_login': 'the login was replaced or cancelled',
+                  'unavailable': 'GitHub or the Copilot service was unavailable'}
+
+
+def validate_copilot_credential(value: object) -> dict:
+    """Accept only a sealed Copilot entry: references, real expiry, no token."""
+    try:
+        if not isinstance(value, dict) or not {'type', 'access', 'refresh', 'expires'} <= set(value) \
+                or set(value) - {'type', 'access', 'refresh', 'expires', 'enterpriseUrl', 'availableModelIds'}:
+            raise ValueError()
+        if value['type'] != 'oauth' or value['refresh'] != COPILOT_REFERENCE:
+            raise ValueError()
+        if type(value['expires']) is not int or value['expires'] <= 0:
+            raise ValueError()
+        pattern = ('tid=' + re.escape(COPILOT_REFERENCE) + r';exp=[0-9]{1,12}(?:;proxy-ep=' + _HOST_RE + ')?')
+        if not isinstance(value['access'], str) or re.fullmatch(pattern, value['access']) is None:
+            raise ValueError()
+        if 'enterpriseUrl' in value and (not isinstance(value['enterpriseUrl'], str)
+                                         or re.fullmatch(_HOST_RE, value['enterpriseUrl']) is None):
+            raise ValueError()
+        models = value.get('availableModelIds', [])
+        if not isinstance(models, list) or not all(isinstance(item, str) and re.fullmatch(r'[A-Za-z0-9._:/-]{1,128}', item) for item in models):
+            raise ValueError()
+        return value
+    except (ValueError, KeyError, TypeError):
+        raise ClientError('Proxy returned an invalid or unsealed credential') from None
+
+
+def save_credential(agent_dir: Path, value: dict, provider: str = 'openai-codex'):
+    {'openai-codex': validate_credential, 'github-copilot': validate_copilot_credential}[provider](value)
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = agent_dir / 'auth.json'
     if target.is_symlink():
@@ -221,7 +254,7 @@ def save_credential(agent_dir: Path, value: dict):
     old = json.loads(original) if original is not None else {}
     if not isinstance(old, dict):
         raise ClientError('Invalid Pi auth file')
-    old['openai-codex'] = value
+    old[provider] = value
     fd, temporary = tempfile.mkstemp(prefix='.auth-', dir=agent_dir)
     try:
         with os.fdopen(fd, 'w') as stream:
@@ -239,13 +272,42 @@ def save_credential(agent_dir: Path, value: dict):
             os.unlink(temporary)
 
 
+def device_login(client: ProxyClient, prefix: str) -> dict:
+    """Show the user code, then let the proxy poll GitHub until the login ends."""
+    start = client.call(prefix + '/start')
+    code, uri, expires = start.get('userCode'), start.get('verificationUri'), start.get('expiresIn')
+    parsed = urllib.parse.urlsplit(uri) if isinstance(uri, str) else None
+    if (not isinstance(code, str) or re.fullmatch(r'[A-Za-z0-9-]{4,32}', code) is None or parsed is None
+            or parsed.scheme != 'https' or not parsed.hostname or any(ord(c) < 33 for c in uri)
+            or type(expires) is not int or not 0 < expires <= 3600):
+        raise ClientError('Invalid device login response')
+    print(f'Open {uri} and enter the code: {code}', file=sys.stderr)
+    print('Waiting for you to approve the login in the browser...', file=sys.stderr)
+    deadline = time.monotonic() + expires + 30
+    while time.monotonic() < deadline:
+        result = client.call(prefix + '/poll', b'')
+        status = result.get('status')
+        if status == 'complete':
+            return result
+        if status == 'failed':
+            reason = result.get('reason')
+            raise ClientError('Login failed: ' + LOGIN_FAILURES.get(reason, 'unknown error'))
+        retry = result.get('retryAfter')
+        if status != 'pending' or type(retry) is not int or retry < 0:
+            raise ClientError('Invalid device login response')
+        # The proxy itself waits up to 10 seconds for GitHub's poll interval.
+        time.sleep(min(max(retry - 10, 0), 60))
+    raise ClientError('Login timed out')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True, type=Path, help='Non-secret client JSON')
     commands = parser.add_subparsers(dest='command', required=True)
     run = commands.add_parser('run', help='Run one command with scoped proxy/trust environment')
     run.add_argument('argv', nargs=argparse.REMAINDER)
-    login = commands.add_parser('login', help='Proxy-owned ChatGPT login for Pi')
+    login = commands.add_parser('login', help='Proxy-owned login (ChatGPT for Pi by default)')
+    login.add_argument('--provider', choices=('chatgpt', 'github-copilot'), default='chatgpt')
     login.add_argument('--agent-dir', type=Path)
     login.add_argument('--callback-stdin', action='store_true')
     commands.add_parser('status')
@@ -260,6 +322,11 @@ def main():
         if not argv:
             raise ClientError('A command is required')
         os.execvpe(argv[0], argv, client.env)
+    elif args.provider == 'github-copilot':
+        agent = args.agent_dir or Path(client.env.get('PI_CODING_AGENT_DIR', str(Path.home() / '.pi/agent')))
+        value = device_login(client, '/github-copilot').get('credential')
+        save_credential(agent, value, 'github-copilot')
+        print(f'Sealed GitHub Copilot reference saved to {agent / "auth.json"}; no usable token stored.')
     else:
         agent = args.agent_dir or Path(client.env.get('PI_CODING_AGENT_DIR', str(Path.home() / '.pi/agent')))
         url = client.call('/chatgpt/start').get('url')

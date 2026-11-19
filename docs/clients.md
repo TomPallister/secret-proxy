@@ -45,6 +45,47 @@ in RAM. The client saves only sealed references in the selected Pi auth file
 `/logout` concurrently. Restarting the proxy requires `secret-proxy login`
 again; your existing same-account client references can stay in place.
 
+## Pi with GitHub Copilot
+
+Add the Copilot entry to your manifest (see
+[advanced configuration](advanced-setup.md#github-logins)) and install with the
+Pi agent directory you want to use. Then, with the proxy running:
+
+```sh
+secret-proxy login github-copilot
+secret-proxy run -- /absolute/path/to/your/pi
+```
+
+Login prints a GitHub URL and a short code. Open the URL, enter the code and
+approve the request. The proxy polls GitHub itself, so leave the command running
+until it reports that the reference was saved. Choose a GitHub Copilot model in
+Pi. Do not use Pi's own `/login` for Copilot: the proxy refuses it.
+
+What happens:
+
+- The proxy keeps the GitHub token and the short-lived Copilot token in RAM and
+  refreshes the Copilot token before it expires. Nothing is stored in the vault.
+- The `github-copilot` entry in Pi's auth file (mode 0600, other providers left
+  alone) holds only references. `refresh` is `secretref:GITHUB_COPILOT_SESSION_TOKEN`.
+  `access` keeps the Copilot token's real `exp=` and `proxy-ep=` fields, which
+  Pi uses for its API address, with a reference instead of the token's
+  identifier and signature. `expires` is the real expiry minus Pi's five-minute
+  margin.
+- When Pi refreshes, its call to `api.github.com/copilot_internal/v2/token` is
+  answered by the proxy with a new sealed value. It never reaches GitHub.
+- The real Copilot token is added only for the API host named by its own
+  `proxy-ep` (`proxy.` becomes `api.`), and only where the manifest allows it.
+
+After a proxy restart the old entry stops working (the proxy answers with an
+injection error) until you run `secret-proxy login github-copilot` again.
+Models that GitHub requires you to enable first must be enabled in your GitHub
+Copilot settings; the proxy-owned login does not change model policy.
+
+Only Pi's Copilot provider is supported. VS Code, the Copilot CLI and other
+editors use their own sign-in and are not supported through this login; if one
+of them uses the same OAuth client ID as Pi, the proxy refuses its sign-in.
+Copilot telemetry hosts are not intercepted: they never receive either token.
+
 ## Compatibility limits
 
 Applications must honour the supplied proxy and CA settings. Curl and accepted

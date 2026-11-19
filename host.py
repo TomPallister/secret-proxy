@@ -31,7 +31,8 @@ PODMAN = '/opt/podman/bin/podman'
 SA_HOME = Path('/Users/secagent')
 BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
-               'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'sealedjwt.py',
+               'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
+               'copilotcreds.py', 'sealedjwt.py',
                'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py')
 
 

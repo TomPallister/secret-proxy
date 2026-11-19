@@ -26,6 +26,13 @@ UUID_RE = re.compile(
 )
 
 VALID_VALUE_FIELDS = ("password", "sshPrivateKey")
+# Values the proxy itself obtains through a login it owns. They are held in
+# RAM only: never read from the vault, and a restart requires a new login.
+RUNTIME_ONLY_NAMES = frozenset({"CHATGPT_ACCESS_TOKEN", "GITHUB_COPILOT_SESSION_TOKEN"})
+# Proxy-owned GitHub logins: the manifest key, its runtimeOnly secret and the
+# fields each one accepts.
+GITHUB_LOGINS = {"copilot": ("GITHUB_COPILOT_SESSION_TOKEN", frozenset({"domain"}))}
+_GITHUB_DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 ACCOUNT_NAMES = ("runtime",)
 
 
@@ -116,7 +123,7 @@ class SecretManifest:
         provider = "1password"
         with open(path) as f:
             data = json.load(f, object_pairs_hook=_unique_object)
-        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress"}:
+        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins"}:
             raise ValueError("invalid manifest root")
         if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 3:
             raise ValueError("schemaVersion must be exactly integer 3")
@@ -211,7 +218,7 @@ class SecretManifest:
                 )
 
             runtime_only = spec.get("runtimeOnly", False)
-            if type(runtime_only) is not bool or (runtime_only and name != "CHATGPT_ACCESS_TOKEN"):
+            if type(runtime_only) is not bool or (runtime_only and name not in RUNTIME_ONLY_NAMES):
                 raise ValueError(f"secrets.{name}.runtimeOnly is invalid")
             placements: list[SecretPlacement] = []
             internal_only = False
@@ -409,12 +416,18 @@ class SecretManifest:
         manifest = cls(provider, accounts, secrets)
         manifest.checkmarx_realm = realm
         manifest._egress = egress
+        manifest.github_logins = _github_logins(data.get("githubLogins"), secrets)
         return manifest
 
     def egress_policy(self) -> EgressPolicy:
         """Return the egress policy; manifest interception hosts are allowed."""
         policy = getattr(self, "_egress", None) or EgressPolicy()
         return policy.with_interception_hosts(self.interception_hosts())
+
+    def github_login(self, kind: str) -> dict | None:
+        """Settings for an enabled proxy-owned GitHub login, or None when off."""
+        value = getattr(self, "github_logins", {}).get(kind)
+        return dict(value) if value is not None else None
 
     def canonical_name(self, name: str) -> str:
         """Validate and return a canonical secret name.
@@ -613,6 +626,33 @@ class SecretManifest:
             Account configuration dict
         """
         return self._accounts.get(name, {})
+
+
+def _github_logins(raw: object, secrets: dict) -> dict:
+    """Validate ``githubLogins``. A login is on only when its runtimeOnly
+    secret is declared; the optional section only adjusts its settings."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict) or set(raw) - set(GITHUB_LOGINS):
+        raise ValueError("githubLogins supports only: " + ", ".join(sorted(GITHUB_LOGINS)))
+    result = {}
+    for kind, (canonical, allowed) in GITHUB_LOGINS.items():
+        settings = raw.get(kind, {})
+        if not isinstance(settings, dict) or set(settings) - allowed:
+            raise ValueError(f"githubLogins.{kind} is invalid")
+        info = secrets.get(canonical)
+        enabled = bool(info is not None and info.runtime_only)
+        if kind in raw and not enabled:
+            raise ValueError(f"githubLogins.{kind} requires runtimeOnly secret {canonical}")
+        if not enabled:
+            continue
+        domain = settings.get("domain", "github.com")
+        labels = domain.split(".") if isinstance(domain, str) else []
+        if (len(labels) < 2 or len(domain) > 253
+                or not all(_GITHUB_DOMAIN_LABEL_RE.fullmatch(label) for label in labels)):
+            raise ValueError(f"githubLogins.{kind}.domain must be a lowercase host name")
+        result[kind] = {"domain": domain}
+    return result
 
 
 # --- Backends ---

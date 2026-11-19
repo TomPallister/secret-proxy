@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "githubLogins": {"copilot": {"domain": "github.com"}},
+  "secrets": {
+    "GITHUB_COPILOT_SESSION_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [{"kind": "header", "hosts": ["api.githubcopilot.com", "api.*.githubcopilot.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "POST"]}]
+    }
+  }
+}

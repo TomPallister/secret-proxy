@@ -72,23 +72,30 @@ def wait_controllers(pids: list[int]):
             time.sleep(.2)
 
 
-def auth_status(client: ProxyClient, settings: dict) -> dict:
+# Proxy-owned logins: status route and the exact credential-free fields it returns.
+LOGINS = {
+    'chatgpt': ('/chatgpt/status', {'instance', 'loggedIn', 'expiresAt', 'refreshCount', 'lastRefreshAt', 'lastRefreshDueAt'}),
+    'github-copilot': ('/github-copilot/status', {'instance', 'loggedIn', 'expiresAt', 'refreshCount', 'lastRefreshAt'}),
+}
+
+
+def auth_status(client: ProxyClient, settings: dict, provider: str = 'chatgpt') -> dict:
     client.check_ready()
-    result = client.call('/chatgpt/status')
+    route, fields = LOGINS[provider]
+    result = client.call(route)
     expected = json.loads(private_read(SHARED_ROOT / settings['instance'] / 'ready.json', 4096))
-    fields = {'instance', 'loggedIn', 'expiresAt', 'refreshCount', 'lastRefreshAt', 'lastRefreshDueAt'}
     if (not isinstance(result, dict) or set(result) != fields
             or not isinstance(result['instance'], str) or re.fullmatch(r'[0-9a-f]{32}', result['instance']) is None
             or result['instance'] != expected['instance'] or type(result['loggedIn']) is not bool
             or type(result['refreshCount']) is not int or result['refreshCount'] < 0):
         raise ClientError('Invalid or stale authentication status')
-    for name in ('expiresAt', 'lastRefreshAt', 'lastRefreshDueAt'):
+    for name in sorted(fields & {'expiresAt', 'lastRefreshAt', 'lastRefreshDueAt'}):
         if result[name] is not None and (type(result[name]) is not int or result[name] < 0):
             raise ClientError('Invalid authentication status timestamp')
     return result
 
 
-def execute(settings: dict, command: str, argv=()):
+def execute(settings: dict, command: str, argv=(), provider: str | None = None):
     instance = settings['instance']
     config = str(SHARED_ROOT / instance / 'client.json')
     host = str(ROOT / 'current/host.py')
@@ -113,9 +120,10 @@ def execute(settings: dict, command: str, argv=()):
         selected_client(settings).check_ready()
         print('Proxy ready (authenticated instance check; vault/upstreams not tested)')
     elif command == 'auth-status':
-        print(json.dumps(auth_status(selected_client(settings), settings), indent=2))
+        print(json.dumps(auth_status(selected_client(settings), settings, provider or 'chatgpt'), indent=2))
     elif command == 'login':
-        os.execv(PYTHON, [PYTHON, client, '--config', config, 'login'])
+        extra = [] if provider in (None, 'chatgpt') else ['--provider', provider]
+        os.execv(PYTHON, [PYTHON, client, '--config', config, 'login', *extra])
     elif command == 'run':
         argv = list(argv)
         if argv[:1] == ['--']:
@@ -132,11 +140,14 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=Path.home() / '.config/secret-proxy/cli.json',
                         help='Private metadata file, never a token file')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('start', 'stop', 'status', 'login', 'auth-status'):
+    for name in ('start', 'stop', 'status'):
         commands.add_parser(name)
+    for name in ('login', 'auth-status'):
+        commands.add_parser(name).add_argument('provider', nargs='?', choices=sorted(LOGINS),
+                                               help='Proxy-owned login (default: chatgpt)')
     commands.add_parser('run').add_argument('argv', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    execute(load_settings(args.config), args.command, getattr(args, 'argv', ()))
+    execute(load_settings(args.config), args.command, getattr(args, 'argv', ()), getattr(args, 'provider', None))
 
 
 if __name__ == '__main__':

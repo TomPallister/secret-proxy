@@ -44,6 +44,8 @@ from awscreds import AwsCredsProvider
 from googlecreds import GoogleTokenProvider
 from auth0creds import Auth0ManagementTokenProvider
 from chatgptcreds import ChatGPTCredentials, ChatGPTAuthError
+import copilotcreds
+import githubdevice
 from oauthcreds import FormTokenProvider, FormTokenSpec, OAuthTokenError
 import gitsign
 import sealedjwt
@@ -95,6 +97,8 @@ class _ProviderState:
         self.auth0 = None
         self.form_tokens = {}
         self.chatgpt = ChatGPTCredentials()
+        # Proxy-owned GitHub logins, created on first use from the manifest.
+        self.github = {}
         self.aws = aws
         self.aws_tried = aws_tried
 
@@ -289,11 +293,14 @@ def _placement_allowed(
     manifest = _current_manifest()
     if manifest is None:
         return False
+    target = host if host is not None else (flow.request.host or "")
     try:
+        if not _pinned_host_allows(canonical, target):
+            return False
         return bool(manifest.placement_allowed(
             canonical,
             kind=kind,
-            host=host if host is not None else (flow.request.host or ""),
+            host=target,
             method=flow.request.method or "",
             path=path if path is not None else (flow.request.path or "/"),
             name=name,
@@ -494,7 +501,83 @@ def _form_token_provider(name: str) -> FormTokenProvider:
         return provider
 
 
+# --- Proxy-owned GitHub logins (copilotcreds.py, githubdevice.py) ----------
+# Each entry: manifest login kind, runtimeOnly canonical, sentinel path prefix,
+# client-facing error, and a factory taking the login's manifest settings.
+@dataclass(frozen=True)
+class _GitHubLogin:
+    kind: str
+    canonical: str
+    prefix: str
+    error: bytes
+    client_id: str
+    factory: object
+
+
+_GITHUB_LOGINS = (
+    _GitHubLogin("copilot", copilotcreds.CANONICAL, "/github-copilot",
+                 b'{"error":"use_github_copilot_login"}', copilotcreds.CLIENT_ID,
+                 lambda settings: copilotcreds.CopilotCredentials(domain=settings["domain"])),
+)
+
+
+def _bound_or_global():
+    bound = _bound_generation()
+    if bound is _UNBOUND:
+        with _store_lock:
+            bound = _generation_from_globals_locked()
+    return bound
+
+
+def _github_settings(login: _GitHubLogin, manifest=None) -> dict | None:
+    manifest = manifest if manifest is not None else _current_manifest()
+    try:
+        return manifest.github_login(login.kind)
+    except AttributeError:
+        return None
+
+
+def _github_provider(login: _GitHubLogin):
+    """The login's provider for the bound generation, or None when it is off."""
+    bound = _bound_or_global()
+    if bound is None:
+        return None
+    settings = _github_settings(login, bound.manifest)
+    if settings is None:
+        return None
+    state = bound.providers
+    with state.lock:
+        provider = state.github.get(login.kind)
+        if provider is None:
+            provider = state.github[login.kind] = login.factory(settings)
+        return provider
+
+
+def _github_login_for(canonical: str):
+    for login in _GITHUB_LOGINS:
+        if login.canonical == canonical and _github_settings(login) is not None:
+            return login
+    return None
+
+
+def _pinned_host_allows(canonical: str, host: str) -> bool:
+    """A Copilot token may go only to the API host named by its own proxy-ep."""
+    login = _github_login_for(canonical)
+    if login is None or login.kind != "copilot":
+        return True
+    provider = _github_provider(login)
+    pinned = provider.api_host() if provider is not None else None
+    # Logged out: there is no host to pin to, and resolution fails closed.
+    return pinned is None or (host or "").lower() == pinned
+
+
 def _resolve(ref: str) -> str:
+    login = _github_login_for(ref)
+    if login is not None:
+        provider = _github_provider(login)
+        if provider is None:
+            raise RuntimeError("secret resolver unavailable")
+        return provider.get_token()
     if ref == "CHATGPT_ACCESS_TOKEN":
         bound = _bound_generation()
         if bound is _UNBOUND:
@@ -936,7 +1019,7 @@ def _unseal_request(flow: http.HTTPFlow, *, include_body: bool) -> None:
     headers = flow.request.headers
     for header_name in list(headers.keys()):
         values = headers.get_all(header_name)
-        unsealed = [sealedjwt.unseal(value) for value in values]
+        unsealed = [copilotcreds.unseal(sealedjwt.unseal(value)) for value in values]
         if unsealed != values:
             headers.set_all(header_name, unsealed)
     if not include_body:
@@ -1078,6 +1161,113 @@ def _chatgpt_login_route(flow: http.HTTPFlow) -> bool:
     return True
 
 
+def _json_response(flow: http.HTTPFlow, status: int, value) -> bool:
+    body = value if isinstance(value, bytes) else json.dumps(value).encode()
+    flow.response = http.Response.make(
+        status, body, {"content-type": "application/json", "cache-control": "no-store"})
+    return True
+
+
+_DEVICE_FLOW_PATHS = ("/login/device/code", "/login/oauth/access_token")
+
+
+def _github_client_login_blocked(flow: http.HTTPFlow) -> bool:
+    """Refuse a client's own device/OAuth flow for a proxy-owned client ID.
+
+    Its reply would hand the client a real GitHub token. Only the proxy's own
+    login, which never runs through this hook, may use that client ID.
+    """
+    host = (flow.request.host or "").lower()
+    path = (flow.request.path or "").split("?", 1)[0]
+    if path not in _DEVICE_FLOW_PATHS:
+        return False
+    for login in _GITHUB_LOGINS:
+        settings = _github_settings(login)
+        if settings is None or host != settings["domain"]:
+            continue
+        if githubdevice.form_or_query_mentions(flow.request, login.client_id):
+            log.warning("secret_proxy: BLOCKED %s %s%s - client-side %s login", flow.request.method, host, path, login.kind)
+            return _json_response(flow, 403, login.error)
+    return False
+
+
+def _copilot_exchange_response(flow: http.HTTPFlow) -> bool:
+    """Answer a client's Copilot token exchange with a sealed token.
+
+    Pi's refresh path calls the exchange with its reference bearer. Forwarding
+    it would require the real GitHub token and return a live Copilot token, so
+    the proxy answers itself. Any other exchange (a real bearer, another
+    method, an unknown reference) is refused, never forwarded.
+    """
+    login = _GITHUB_LOGINS[0]
+    settings = _github_settings(login)
+    if settings is None:
+        return False
+    if (flow.request.host or "").lower() != "api." + settings["domain"]:
+        return False
+    if (flow.request.path or "").split("?", 1)[0] != copilotcreds.EXCHANGE_PATH:
+        return False
+    reference = sealedjwt.MARKER + copilotcreds.CANONICAL
+    auth = flow.request.headers.get_all("authorization")
+    if (flow.request.method or "").upper() != "GET" or len(auth) != 1 or auth[0] not in (
+        "Bearer " + reference, "token " + reference,
+    ):
+        log.warning("secret_proxy: BLOCKED %s %s - Copilot exchange without the login reference",
+                    flow.request.method, flow.request.host)
+        return _json_response(flow, 403, login.error)
+    provider = _github_provider(login)
+    try:
+        value = provider.exchange_answer()
+    except copilotcreds.CopilotAuthError:
+        log.warning("secret_proxy: GET %s - Copilot exchange refused: login required", flow.request.host)
+        return _json_response(flow, 403, login.error)
+    log.info("secret_proxy: GET %s - answered the Copilot token exchange with a sealed token", flow.request.host)
+    return _json_response(flow, 200, value)
+
+
+def _github_login_route(flow: http.HTTPFlow) -> bool:
+    """Start, poll and report proxy-owned GitHub device logins.
+
+    Responses carry only a user code and verification URL, a sealed client
+    credential, or credential-free status. GitHub tokens never leave the proxy.
+    """
+    if (flow.request.host or "").lower() != SENTINEL_HOST:
+        return False
+    raw_path = flow.request.path or ""
+    for login in _GITHUB_LOGINS:
+        if raw_path.split("?", 1)[0] not in (login.prefix + "/start", login.prefix + "/poll", login.prefix + "/status"):
+            continue
+        action = raw_path.split("?", 1)[0].rsplit("/", 1)[1]
+        if raw_path != login.prefix + "/" + action:
+            return _json_response(flow, 400, {"error": "bad_request"})
+        provider = _github_provider(login)
+        if provider is None:
+            return _json_response(flow, 403, {"error": "not_available"})
+        method = (flow.request.method or "").upper()
+        if method != {"start": "GET", "poll": "POST", "status": "GET"}[action]:
+            return _json_response(flow, 405, {"error": "method_not_allowed"})
+        if action == "status":
+            instance = os.environ.get("SECRET_PROXY_INSTANCE_ID", "")
+            if re.fullmatch(r"[0-9a-f]{32}", instance) is None:
+                return _json_response(flow, 503, {"error": "unavailable"})
+            return _json_response(flow, 200, {"instance": instance, **provider.status()})
+        try:
+            if action == "start":
+                value = provider.start()
+                log.info("secret_proxy: started proxy-owned GitHub %s login", login.kind)
+                return _json_response(flow, 200, value)
+            result = provider.poll()
+        except githubdevice.GitHubDeviceError as error:
+            log.warning("secret_proxy: GitHub %s login failed (%s)", login.kind, error.reason)
+            return _json_response(flow, 200, {"status": "failed", "reason": error.reason})
+        if result is None:
+            return _json_response(flow, 200, {"status": "pending", "retryAfter": provider.device.retry_after()})
+        log.info("secret_proxy: completed proxy-owned GitHub %s login", login.kind)
+        payload = {"credential": result} if login.kind == "copilot" else result
+        return _json_response(flow, 200, {"status": "complete", **payload})
+    return False
+
+
 GIT_SIGNING_SSH_KEY = "GIT_SIGNING_SSH_KEY"
 GIT_SIGNING_PATH = "/git/sign"
 GIT_SIGNING_KEY_HEADER = "x-git-signing-key"
@@ -1180,7 +1370,13 @@ def _request_locked(flow: http.HTTPFlow) -> None:
                 flow.response = http.Response.make(403, b'{"error":"use_chatgpt_login"}',
                                                    {"content-type": "application/json"})
                 return
+        if _github_client_login_blocked(flow):
+            return
         if _health_route(flow):
+            return
+        if _github_login_route(flow):
+            return
+        if _copilot_exchange_response(flow):
             return
         if _chatgpt_status_route(flow):
             return

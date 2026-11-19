@@ -11,6 +11,8 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    terminal attached. A ready instance is left alone.
 2. In another terminal, `secret-proxy login` starts proxy-owned PKCE. Paste the
    full callback only into its hidden prompt. No usable OAuth token is saved.
+   For GitHub Copilot, run `secret-proxy login github-copilot`: open the URL it
+   prints and enter the code. The proxy waits for GitHub, so leave it running.
 3. `secret-proxy status` checks authenticated TLS and the current boot nonce.
    This is liveness, not proof that every upstream integration works.
 4. Use clients through their existing, explicitly selected adapters, or
@@ -36,6 +38,11 @@ No tokens, account IDs, identity claims or upstream error bodies are returned.
 Status does not fetch a secret, perform a token exchange, move the clock, force
 refresh or keep an idle login alive. Login resets these counters; a process
 restart resets all in-memory state. `loggedIn` is not an upstream liveness probe.
+
+`secret-proxy auth-status github-copilot` reads `/github-copilot/status` the same
+way. It returns `instance`, `loggedIn`, `expiresAt` (the Copilot token's expiry),
+`refreshCount` (refreshes since the last login, done by the proxy before
+`refresh_in`) and `lastRefreshAt`. It never refreshes or returns a token.
 
 You do not need to wait for token expiry or run a refresh acceptance exercise to
 use this development tool. If authentication breaks during normal use, check

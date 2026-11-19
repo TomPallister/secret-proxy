@@ -48,6 +48,12 @@ def main():
             serialization.NoEncryption()).decode()
         (root / 'values.json').write_text(json.dumps(values))
         (root / 'values.json').chmod(0o600)
+        # Synthetic GitHub login: the fixture GitHub below issues these. Its
+        # Copilot token names this local upstream as its proxy-ep host.
+        copilot = {'github': 'gho_' + secrets.token_hex(20),
+                   'copilot': 'tid=' + secrets.token_hex(8) + ';exp=4102444800;proxy-ep=127.0.0.1;st=dotcom:' + secrets.token_hex(32)}
+        (root / 'copilot.json').write_text(json.dumps(copilot))
+        (root / 'copilot.json').chmod(0o600)
         # Self-signed fixture leaf is trusted only by this proxy subprocess.
         key = Ed25519PrivateKey.generate()
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, '127.0.0.1')])
@@ -75,6 +81,9 @@ def main():
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers['Content-Length']))
+                if self.path.startswith('/copilot/'):
+                    observed.append(self.headers['Authorization'] == 'Bearer ' + copilot['copilot'])
+                    return self.answer()
                 auth = base64.b64decode(self.headers['Authorization'].split()[1]).decode()
                 observed.append(parse_qs(body.decode()).get('key') == [values['API_KEY']] and
                                 auth == 'fixture:' + values['API_KEY'])
@@ -106,7 +115,11 @@ def main():
                             {'kind': 'header', 'hosts': ['chatgpt.com'], 'name': 'authorization',
                              'template': 'Bearer {secret}', 'methods': ['POST'],
                              'paths': ['/backend-api/codex/responses']}]},
-                        'GIT_SIGNING_SSH_KEY': {'internalOnly': True, 'valueField': 'sshPrivateKey'}}}))
+                        'GITHUB_COPILOT_SESSION_TOKEN': {'runtimeOnly': True, 'placements': [
+                            {'kind': 'header', 'hosts': ['127.0.0.1'], 'name': 'authorization',
+                             'template': 'Bearer {secret}', 'methods': ['POST'], 'paths': ['/copilot/*']}]},
+                        'GIT_SIGNING_SSH_KEY': {'internalOnly': True, 'valueField': 'sshPrivateKey'}},
+            'githubLogins': {'copilot': {'domain': 'github.example.com'}}}))
         # Synthetic AWS configuration: makes the proxy intercept AWS hosts. No
         # Okta values exist, so an allowed call fails at credential vending.
         (root / 'aws-okta.json').write_text(json.dumps({
@@ -133,6 +146,19 @@ class FixtureRunner:
             raise AssertionError('Unexpected provider operation')
         return subprocess.CompletedProcess(args, 0, json.dumps(result), '')
 secretstore.DefaultCommandRunner = FixtureRunner
+import githubdevice
+def fixture_github(url, *, method='GET', fields=None, headers=None, label='GitHub'):
+    issued = json.loads((Path(__file__).parent / 'copilot.json').read_text())
+    if url == 'https://github.example.com/login/device/code':
+        return 200, {'device_code': 'fixture-device-code', 'user_code': 'FIXT-0001', 'interval': 1,
+                     'verification_uri': 'https://github.example.com/login/device', 'expires_in': 300}
+    if url == 'https://github.example.com/login/oauth/access_token':
+        return 200, {'access_token': issued['github'], 'token_type': 'bearer', 'scope': 'read:user'}
+    if url == 'https://api.github.example.com/copilot_internal/v2/token':
+        assert headers['Authorization'] == 'Bearer ' + issued['github']
+        return 200, {'token': issued['copilot'], 'expires_at': 4102444800, 'refresh_in': 1500}
+    return 404, {}
+githubdevice.request_json = fixture_github
 import egress
 _address_refusal = egress.address_refusal
 def fixture_address_refusal(text, allowed=()):
@@ -142,6 +168,14 @@ egress.address_refusal = fixture_address_refusal
 from entry import (load, http_connect, requestheaders, request, responseheaders,
                    server_connect, server_connected, server_connect_error,
                    server_disconnected, client_disconnected)
+import entry
+_system_resolver = entry._resolver
+def fixture_resolver(host, port):
+    # The synthetic GitHub login domain is answered by the proxy itself.
+    if host in ('github.example.com', 'api.github.example.com'):
+        return ['127.0.0.1']
+    return _system_resolver(host, port)
+entry._resolver = fixture_resolver
 ''')
         capability = secrets.token_hex(24)
         auth = root / 'auth'
@@ -240,6 +274,28 @@ from entry import (load, http_connect, requestheaders, request, responseheaders,
                 assert status == 200 and signature.decode() == gitsign.sign(values['GIT_SIGNING_SSH_KEY'], payload)
                 assert b'PRIVATE KEY' not in signature
                 assert observed == [True, True, True]
+
+                # Proxy-owned GitHub Copilot login against the fixture GitHub.
+                code, body = request('GET', '/github-copilot/start', host=sentinel, target_port=443)
+                assert code == 200 and json.loads(body)['userCode'] == 'FIXT-0001'
+                code, body = request('POST', '/github-copilot/poll', body=b'', host=sentinel, target_port=443)
+                assert code == 200 and json.loads(body)['status'] == 'complete'
+                assert copilot['github'].encode() not in body and copilot['copilot'].encode() not in body
+                sealed = json.loads(body)['credential']
+                assert sealed['access'].startswith('tid=' + REF) and ';proxy-ep=127.0.0.1' in sealed['access']
+                assert request('POST', '/copilot/chat/completions', {'Authorization': 'Bearer ' + sealed['access'],
+                    'Content-Type': 'application/json'}, b'{}') == (200, b'ok')
+                code, body = request('GET', '/copilot_internal/v2/token', {'Authorization': 'Bearer ' + sealed['refresh']},
+                                     host='api.github.example.com', target_port=443)
+                assert code == 200 and json.loads(body)['token'] == sealed['access']
+                code, body = request('GET', '/copilot_internal/v2/token', {'Authorization': 'Bearer ' + copilot['github']},
+                                     host='api.github.example.com', target_port=443)
+                assert code == 403 and json.loads(body) == {'error': 'use_github_copilot_login'}
+                code, body = request('POST', '/login/device/code', {'Content-Type': 'application/x-www-form-urlencoded'},
+                                     urlencode({'client_id': 'Iv1.b507a08c87ecfe98', 'scope': 'read:user'}),
+                                     host='github.example.com', target_port=443)
+                assert code == 403 and json.loads(body) == {'error': 'use_github_copilot_login'}
+                assert observed == [True, True, True, True]
             finally:
                 child.terminate()
                 try:
@@ -254,7 +310,8 @@ from entry import (load, http_connect, requestheaders, request, responseheaders,
         assert 'AWS DENY 123456789012/ReadOnly secretsmanager:GetSecretValue' in output
         assert 'AWS DENY 123456789012/ReadOnly sts:AssumeRole' in output
         assert 'BODY-MARKER' not in output
-        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; no vault or external network')
+        assert copilot['github'] not in output and copilot['copilot'] not in output
+        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; proxy-owned Copilot login, sealed exchange and pinned injection; no vault or external network')
 
 
 def aws_auth(service):
