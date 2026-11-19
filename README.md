@@ -60,8 +60,8 @@ than assuming that closing its terminal stopped it.
   credentials or secrets (`GetSecretValue`, `AssumeRole`, `CreateAccessKey`…)
   are refused by default; see the [AWS operation policy](docs/operations.md#aws-operation-policy).
 - Git commit/tag signing without handing the client a private key.
-- Refusing proxied connections to metadata, loopback and private addresses
-  ([egress controls](docs/advanced-setup.md#egress-controls)).
+- Refusing proxied connections to metadata, loopback and private addresses,
+  with an optional host allow/deny list ([egress controls](docs/advanced-setup.md#egress-controls)).
 
 Each integration needs an explicit policy defining **where** its credential may
 be used. The starter setup includes read-only GitHub and optional ChatGPT/Codex;

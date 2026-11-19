@@ -91,7 +91,10 @@ def load(loader) -> None:
     _pins.clear()
     ctx.options.update(allow_hosts=patterns)
     addon.log.info("secret_proxy: intercepting %d configured host patterns", len(patterns))
-    addon.log.info("secret_proxy: egress allows %d private CIDRs", len(policy.allowed_cidrs))
+    addon.log.info(
+        "secret_proxy: egress mode %s (%d allow, %d deny, %d private CIDRs)",
+        policy.mode, len(policy.allow), len(policy.deny), len(policy.allowed_cidrs),
+    )
     for line in policy_lines:
         addon.log.info("%s", line)
 

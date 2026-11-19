@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "egress": {
+    "mode": "allowlist",
+    "allow": ["*.example.com", "registry.example.org", "api.*.example.net"],
+    "deny": ["paste.example.com"],
+    "allowPrivateCidrs": ["10.20.0.0/16", "fd12:3456::/32"]
+  },
+  "secrets": {
+    "GITHUB_TOKEN": {
+      "placements": [{"kind": "header", "hosts": ["api.github.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "HEAD"]}]
+    }
+  }
+}

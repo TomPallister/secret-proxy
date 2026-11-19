@@ -1,14 +1,20 @@
-"""Egress policy: refuse proxied connections to metadata, loopback and private addresses.
+"""Egress policy: destination address refusal and optional host allow/deny lists.
 
 Pure module (no mitmproxy import) so it can be validated by the macOS installer
 on Command Line Tools Python 3.9 and unit-tested with a fake resolver.
 
-Every address a destination resolves to is checked. Loopback, link-local,
-unspecified, multicast, reserved and known cloud-metadata addresses are always
-refused. Private and other special-purpose ranges are refused unless an
-explicit CIDR (manifest ``egress.allowPrivateCidrs``) allows them.
-IPv4-mapped, IPv4-compatible and NAT64 well-known-prefix IPv6 addresses are
-unwrapped and checked as IPv4.
+Two independent checks decide whether the proxy may open an upstream
+connection for a client:
+
+* **Addresses** (always on). Every address a destination resolves to is
+  checked. Loopback, link-local, unspecified, multicast, reserved and known
+  cloud-metadata addresses are always refused. Private and other
+  special-purpose ranges are refused unless an explicit CIDR allows them.
+  IPv4-mapped, IPv4-compatible and NAT64 well-known-prefix IPv6 addresses are
+  unwrapped and checked as IPv4.
+* **Host names** (optional ``egress`` manifest section). ``deny`` patterns are
+  checked first in every mode; in ``allowlist`` mode a host must be a manifest
+  interception host or match an ``allow`` pattern.
 
 The caller connects only to addresses returned by :meth:`EgressPolicy.check`,
 so a second DNS answer (rebinding) can never select an unchecked address.
@@ -24,7 +30,10 @@ from typing import Callable, Iterable, Optional, Sequence, Tuple, Union
 
 SENTINEL_HOST = "secret" + "ref.invalid"
 
+MODES = ("open", "allowlist")
+MAX_PATTERNS = 256
 MAX_CIDRS = 64
+_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _NUMERIC_HOST_RE = re.compile(r"^[0-9a-fA-FxX.]+$")
 
 IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
@@ -178,6 +187,81 @@ def address_refusal(text: str, allowed: Iterable[IPNetwork] = ()) -> Optional[st
     return None
 
 
+class HostPattern:
+    """A host pattern for the egress allow and deny lists.
+
+    ``*.example.com`` matches one or more labels before ``example.com`` (not
+    ``example.com`` itself). A ``*`` label anywhere else matches exactly one
+    label. IP literals match only the same address. Partial-label wildcards
+    such as ``api*.example.com`` are rejected.
+    """
+
+    def __init__(self, text: object, *, where: str):
+        if not isinstance(text, str) or not text:
+            raise EgressConfigError(f"{where} must contain nonempty strings")
+        value = text.strip().lower()
+        if value != text.lower():
+            raise EgressConfigError(f"{where}: pattern {text!r} has surrounding spaces")
+        if value.endswith("."):
+            value = value[:-1]
+        if not value or len(value) > 253:
+            raise EgressConfigError(f"{where}: invalid pattern {text!r}")
+        self.text = text
+        self.address = None
+        try:
+            literal = ipaddress.ip_address(value)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            self.address = str(literal)
+            self.labels: Tuple[str, ...] = ()
+            return
+        labels = tuple(value.split("."))
+        for label in labels:
+            if "*" in label and label != "*":
+                raise EgressConfigError(
+                    f"{where}: partial-label wildcard in {text!r}; use a whole '*' label"
+                )
+            if label != "*" and _LABEL_RE.fullmatch(label) is None:
+                raise EgressConfigError(f"{where}: invalid host label in {text!r}")
+        if all(label == "*" for label in labels):
+            raise EgressConfigError(
+                f"{where}: {text!r} would match every host; use mode \"open\" instead"
+            )
+        self.labels = labels
+
+    def matches(self, host: str) -> bool:
+        """Match a host already passed through :func:`normalize_host`."""
+        if self.address is not None:
+            return host == self.address
+        if parse_address(host) is not None:
+            return False
+        parts = host.split(".")
+        if self.labels[0] == "*":
+            suffix = self.labels[1:]
+            if len(parts) < len(suffix) + 1:
+                return False
+            tail = parts[len(parts) - len(suffix):] if suffix else []
+        else:
+            suffix = self.labels
+            if len(parts) != len(suffix):
+                return False
+            tail = parts
+        return all(expected == "*" or expected == actual
+                   for expected, actual in zip(suffix, tail))
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"HostPattern({self.text!r})"
+
+
+def _manifest_host_matches(pattern: str, host: str) -> bool:
+    """Manifest semantics: every ``*`` is exactly one whole label."""
+    expected, actual = pattern.lower().split("."), host.split(".")
+    return len(expected) == len(actual) and all(
+        left == "*" or left == right for left, right in zip(expected, actual)
+    )
+
+
 def _cidr(text: object, where: str) -> IPNetwork:
     if not isinstance(text, str) or not text:
         raise EgressConfigError(f"{where} must contain CIDR strings")
@@ -200,21 +284,46 @@ def _cidr(text: object, where: str) -> IPNetwork:
 
 
 class EgressPolicy:
-    """Validated egress configuration."""
+    """Validated egress configuration plus the proxy's interception hosts."""
 
-    def __init__(self, allowed_cidrs: Sequence[IPNetwork] = ()):
+    def __init__(self, mode: str = "open", allow: Sequence[HostPattern] = (),
+                 deny: Sequence[HostPattern] = (), allowed_cidrs: Sequence[IPNetwork] = (),
+                 interception_hosts: Sequence[str] = ()):
+        self.mode = mode
+        self.allow = tuple(allow)
+        self.deny = tuple(deny)
         self.allowed_cidrs = tuple(allowed_cidrs)
+        self.interception_hosts = tuple(interception_hosts)
 
     @classmethod
     def from_config(cls, value: object) -> "EgressPolicy":
-        """Validate the manifest ``egress`` section (None = no private ranges)."""
+        """Validate the manifest ``egress`` section (None = today's open default)."""
         if value is None:
             return cls()
         if not isinstance(value, dict):
             raise EgressConfigError("egress must be a JSON object")
-        unknown = set(value) - {"allowPrivateCidrs"}
+        unknown = set(value) - {"mode", "allow", "deny", "allowPrivateCidrs"}
         if unknown:
             raise EgressConfigError("egress has unknown fields: " + ", ".join(sorted(map(str, unknown))))
+        mode = value.get("mode", "open")
+        if mode not in MODES:
+            raise EgressConfigError('egress.mode must be "open" or "allowlist"')
+
+        def patterns(field: str):
+            raw = value.get(field, [])
+            if not isinstance(raw, list):
+                raise EgressConfigError(f"egress.{field} must be a list")
+            if len(raw) > MAX_PATTERNS:
+                raise EgressConfigError(f"egress.{field} has more than {MAX_PATTERNS} patterns")
+            parsed = [HostPattern(item, where=f"egress.{field}") for item in raw]
+            keys = [item.address or ".".join(item.labels) for item in parsed]
+            if len(set(keys)) != len(keys):
+                raise EgressConfigError(f"egress.{field} contains duplicate patterns")
+            return parsed
+
+        allow, deny = patterns("allow"), patterns("deny")
+        if mode == "open" and allow:
+            raise EgressConfigError('egress.allow has no effect in mode "open"; set mode "allowlist"')
         raw_cidrs = value.get("allowPrivateCidrs", [])
         if not isinstance(raw_cidrs, list):
             raise EgressConfigError("egress.allowPrivateCidrs must be a list")
@@ -223,7 +332,10 @@ class EgressPolicy:
         cidrs = [_cidr(item, "egress.allowPrivateCidrs") for item in raw_cidrs]
         if len(set(cidrs)) != len(cidrs):
             raise EgressConfigError("egress.allowPrivateCidrs contains duplicates")
-        return cls(cidrs)
+        return cls(mode, allow, deny, cidrs)
+
+    def with_interception_hosts(self, hosts: Iterable[str]) -> "EgressPolicy":
+        return EgressPolicy(self.mode, self.allow, self.deny, self.allowed_cidrs, tuple(hosts))
 
     # -- host-name decision -------------------------------------------------
     def host_refusal(self, host: str) -> Optional[str]:
@@ -232,7 +344,21 @@ class EgressPolicy:
             return "sentinel-upstream"
         if host in METADATA_HOSTS:
             return "metadata-host"
-        return None
+        if any(pattern.matches(host) for pattern in self.deny):
+            return "egress-deny"
+        if self.mode == "open":
+            return None
+        if any(_manifest_host_matches(pattern, host) for pattern in self.interception_hosts):
+            return None
+        if any(pattern.matches(host) for pattern in self.allow):
+            return None
+        return self._allowlist_miss(host)
+
+    def _allowlist_miss(self, host: str) -> Optional[str]:
+        # Hook point for the approval flow (issue #3): an allowlist miss could
+        # be routed to a pending approval here instead of an immediate refusal.
+        # Until that exists every miss is refused.
+        return "egress-allowlist"
 
     # -- full decision ------------------------------------------------------
     def check(self, host: object, port: int, resolver: Resolver) -> Decision:

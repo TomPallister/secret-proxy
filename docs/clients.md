@@ -68,8 +68,9 @@ see the [AWS operation policy](operations.md#aws-operation-policy).
 ## Refused destinations
 
 Requests to metadata, loopback, link-local and (by default) private addresses
-get `403` with `{"error":"secret_proxy_egress_refused","rule":"..."}`. The
-rule name says why; see [egress controls](advanced-setup.md#egress-controls).
+get `403` with `{"error":"secret_proxy_egress_refused","rule":"..."}`, and an
+optional allow-list can refuse other hosts the same way. The rule name says
+why; see [egress controls](advanced-setup.md#egress-controls).
 
 ## Low-level client interface
 

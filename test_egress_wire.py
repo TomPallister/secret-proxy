@@ -1,4 +1,4 @@
-"""Real mitmdump wiring for egress enforcement (#4).
+"""Real mitmdump wiring for egress enforcement (#4, #5).
 
 Starts the actual proxy entrypoint against a local fixture upstream. Only the
 resolver is faked (scripted, with a rebinding answer) and the fixture upstream's
@@ -122,6 +122,9 @@ class WireTests(unittest.TestCase):
         cls.tls_port = cls.tls_upstream.server_address[1]
         (root / "manifest.json").write_text(json.dumps({
             "schemaVersion": 3, "account": {"vault": "Fixture"},
+            "egress": {"mode": "allowlist", "deny": ["denied.example.test"],
+                       "allow": ["allowed.example.test", "rebind.example.test",
+                                 "private.example.test"]},
             "secrets": {"API_KEY": {"placements": [{
                 "kind": "header", "hosts": ["intercepted.example.test"], "name": "x-api-key",
                 "template": "{secret}"}]}},
@@ -213,14 +216,16 @@ class WireTests(unittest.TestCase):
 
     def test_connect_refusals_name_the_rule_and_reach_nothing(self):
         for host, rule in [("169.254.169.254", "metadata-address"), ("metadata.google.internal", "metadata-host"),
-                           ("127.0.0.2", "loopback-address"), ("private.example.test", "private-address")]:
+                           ("127.0.0.2", "loopback-address"), ("denied.example.test", "egress-deny"),
+                           ("unlisted.example.test", "egress-allowlist"), ("private.example.test", "private-address")]:
             with self.subTest(host=host):
                 sock, (status, body) = self.connect(host)
                 sock.close()
                 self.assertEqual(status, 403)
                 self.assertEqual(json.loads(body), {"error": "secret_proxy_egress_refused", "rule": rule})
         self.assertEqual(Upstream.requests, [])
-        self.assertNotIn("metadata.google.internal", self.calls())
+        self.assertNotIn("unlisted.example.test", self.calls())
+        self.assertNotIn("denied.example.test", self.calls())
 
     def test_rebinding_after_connect_uses_the_checked_address(self):
         before = self.calls().count("rebind.example.test")
@@ -250,6 +255,10 @@ class WireTests(unittest.TestCase):
         self.assertEqual(Upstream.requests, ["/one", "/two"])
         # The host name was restored after connecting, so mitmproxy reused it.
         self.assertEqual(len(Upstream.peers), 1)
+        with self.proxy() as sock:
+            sock.sendall(b"GET http://unlisted.example.test/ HTTP/1.1\r\nHost: unlisted.example.test\r\n\r\n")
+            status, body = read_response(sock)
+        self.assertEqual((status, json.loads(body)["rule"]), (403, "egress-allowlist"))
 
     def test_intercepted_tls_verifies_the_name_and_reuses_the_pinned_connection(self):
         sock, (status, _) = self.connect("intercepted.example.test", self.tls_port)

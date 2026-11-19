@@ -1,4 +1,4 @@
-"""Egress policy: address refusal and DNS pinning (#4)."""
+"""Egress policy: address refusal, DNS pinning and host allow/deny lists (#4, #5)."""
 import asyncio
 import ipaddress
 import json
@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import egress
-from egress import Allowed, EgressConfigError, EgressPolicy, Refusal
+from egress import Allowed, EgressConfigError, EgressPolicy, HostPattern, Refusal
 
 ROOT = Path(__file__).parent
 PUBLIC_V4 = "93.184.216.34"
@@ -33,8 +33,8 @@ class FakeResolver:
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
 
-def policy(config=None):
-    return EgressPolicy.from_config(config)
+def policy(config=None, hosts=()):
+    return EgressPolicy.from_config(config).with_interception_hosts(hosts)
 
 
 class AddressTests(unittest.TestCase):
@@ -160,17 +160,58 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(policy().check("intranet.example.com", 443, resolver), Refusal("private-address"))
 
 
+class PatternTests(unittest.TestCase):
+    def matches(self, pattern, host):
+        return HostPattern(pattern, where="test").matches(egress.normalize_host(host))
+
+    def test_leading_wildcard_matches_one_or_more_labels(self):
+        self.assertTrue(self.matches("*.example.com", "api.example.com"))
+        self.assertTrue(self.matches("*.example.com", "a.b.c.example.com"))
+        self.assertFalse(self.matches("*.example.com", "example.com"))
+        self.assertFalse(self.matches("*.example.com", "api.example.org"))
+        self.assertFalse(self.matches("*.example.com", "evilexample.com"))
+
+    def test_inner_wildcard_matches_exactly_one_label(self):
+        self.assertTrue(self.matches("api.*.example.com", "api.eu.example.com"))
+        self.assertFalse(self.matches("api.*.example.com", "api.eu.west.example.com"))
+        self.assertFalse(self.matches("api.*.example.com", "api.example.com"))
+        self.assertTrue(self.matches("*.*.example.com", "a.b.example.com"))
+        self.assertFalse(self.matches("*.*.example.com", "b.example.com"))
+
+    def test_exact_case_and_trailing_dot(self):
+        self.assertTrue(self.matches("API.Example.com.", "api.example.COM."))
+        self.assertFalse(self.matches("api.example.com", "www.api.example.com"))
+
+    def test_ip_literals_match_only_the_same_address(self):
+        self.assertTrue(self.matches("2001:db8::1", "[2001:DB8:0::1]"))
+        self.assertTrue(self.matches("192.0.2.7", "192.0.2.7"))
+        self.assertFalse(self.matches("*.0.2.7", "192.0.2.7"))
+
+    def test_bad_patterns_are_rejected(self):
+        for pattern in ("api*.example.com", "*api.example.com", "a.*b.example.com",
+                        "*", "*.*", "", " api.example.com", "under_score.example.com",
+                        "-bad.example.com", 7, "x." * 200):
+            with self.subTest(pattern=pattern), self.assertRaises(EgressConfigError):
+                HostPattern(pattern, where="egress.allow")
+
+
 class ConfigTests(unittest.TestCase):
-    def test_absent_section_allows_public_hosts_only(self):
+    def test_absent_section_is_open_with_no_lists(self):
         p = EgressPolicy.from_config(None)
-        self.assertEqual(p.allowed_cidrs, ())
+        self.assertEqual((p.mode, p.allow, p.deny, p.allowed_cidrs), ("open", (), (), ()))
         resolver = FakeResolver({"anything.example.net": [[PUBLIC_V4]]})
         self.assertEqual(p.check("anything.example.net", 443, resolver), Allowed((PUBLIC_V4,)))
 
     def test_invalid_configs_have_clear_errors(self):
         for config, message in [
             ([], "JSON object"),
+            ({"mode": "closed"}, "egress.mode"),
             ({"extra": 1}, "unknown fields: extra"),
+            ({"mode": "allowlist", "allow": "x.example.com"}, "must be a list"),
+            ({"mode": "allowlist", "allow": ["a*.example.com"]}, "partial-label wildcard"),
+            ({"deny": ["*"]}, "every host"),
+            ({"allow": ["api.example.com"]}, 'mode "open"'),
+            ({"deny": ["a.example.com", "A.example.com"]}, "duplicate"),
             ({"allowPrivateCidrs": ["10.0.0.1/8"]}, "host bits"),
             ({"allowPrivateCidrs": ["127.0.0.0/8"]}, "loopback"),
             ({"allowPrivateCidrs": ["0.0.0.0/0"]}, "cannot be allowed"),
@@ -184,25 +225,54 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(EgressConfigError, message):
                     EgressPolicy.from_config(config)
 
-    def test_manifest_section_is_validated(self):
+    def test_deny_wins_in_both_modes_including_manifest_hosts(self):
+        resolver = FakeResolver({"paste.example.net": [[PUBLIC_V4]], "api.example.com": [[PUBLIC_V4]]})
+        open_mode = policy({"deny": ["*.example.net"]})
+        self.assertEqual(open_mode.check("paste.example.net", 443, resolver), Refusal("egress-deny"))
+        self.assertEqual(open_mode.check("api.example.com", 443, resolver), Allowed((PUBLIC_V4,)))
+        allow = policy({"mode": "allowlist", "allow": ["*.example.net"], "deny": ["paste.example.net"]})
+        self.assertEqual(allow.check("paste.example.net", 443, resolver), Refusal("egress-deny"))
+        manifest = policy({"mode": "allowlist", "deny": ["api.example.com"]}, hosts=["api.example.com"])
+        self.assertEqual(manifest.check("api.example.com", 443, resolver), Refusal("egress-deny"))
+
+    def test_allowlist_mode(self):
+        resolver = FakeResolver({
+            "api.example.com": [[PUBLIC_V4]], "files.example.org": [[PUBLIC_V4]],
+            "tenant.example.io": [[PUBLIC_V4]], "other.example.io": [[PUBLIC_V4]],
+            "rebind.example.com": [["10.1.1.1"]],
+        })
+        p = policy({"mode": "allowlist", "allow": ["*.example.org", "rebind.example.com"]},
+                   hosts=["api.example.com", "*.example.io"])
+        self.assertEqual(p.check("api.example.com", 443, resolver), Allowed((PUBLIC_V4,)))
+        self.assertEqual(p.check("files.example.org", 443, resolver), Allowed((PUBLIC_V4,)))
+        # Manifest '*' keeps manifest semantics: exactly one label.
+        self.assertEqual(p.check("tenant.example.io", 443, resolver), Allowed((PUBLIC_V4,)))
+        self.assertEqual(p.check("a.b.example.io", 443, resolver), Refusal("egress-allowlist"))
+        self.assertEqual(p.check("unlisted.example.net", 443, resolver), Refusal("egress-allowlist"))
+        # Listed hosts are still subject to the address checks.
+        self.assertEqual(p.check("rebind.example.com", 443, resolver), Refusal("private-address"))
+        self.assertNotIn(("unlisted.example.net", 443), resolver.calls)
+
+    def test_manifest_section_is_validated_and_examples_load(self):
         from secretstore import SecretManifest
-        self.assertEqual(SecretManifest.load(ROOT / "examples/manifest.json").egress_policy().allowed_cidrs, ())
-        data = json.loads((ROOT / "examples/manifest.json").read_text())
-        data["egress"] = {"allowPrivateCidrs": ["10.20.0.0/16"]}
+        example = SecretManifest.load(ROOT / "examples/egress-manifest.json")
+        p = example.egress_policy()
+        self.assertEqual(p.mode, "allowlist")
+        self.assertIn("api.github.com", p.interception_hosts)
+        self.assertEqual(SecretManifest.load(ROOT / "examples/manifest.json").egress_policy().mode, "open")
+        data = json.loads((ROOT / "examples/egress-manifest.json").read_text())
+        data["egress"]["allow"].append("bad*.example.com")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.json"
             path.write_text(json.dumps(data))
-            self.assertEqual(len(SecretManifest.load(path).egress_policy().allowed_cidrs), 1)
-            data["egress"]["allowPrivateCidrs"] = ["127.0.0.0/8"]
-            path.write_text(json.dumps(data))
-            with self.assertRaisesRegex(EgressConfigError, "loopback"):
+            with self.assertRaisesRegex(EgressConfigError, "partial-label"):
                 SecretManifest.load(path)
 
 
 class StartupTests(unittest.TestCase):
     def bad_manifest(self, directory):
         data = json.loads((ROOT / "examples/manifest.json").read_text())
-        data["egress"] = {"allowPrivateCidrs": ["127.0.0.0/8"]}
+        data["egress"] = {"mode": "allowlist", "allow": ["api*.example.com"]}
         path = Path(directory) / "manifest.json"
         path.write_text(json.dumps(data))
         return path
@@ -212,7 +282,7 @@ class StartupTests(unittest.TestCase):
         from mitmproxy.exceptions import OptionsError
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(entry.addon, "SECRETS_FILE", self.bad_manifest(directory)):
-                with self.assertRaisesRegex(OptionsError, "invalid egress configuration: .*loopback"):
+                with self.assertRaisesRegex(OptionsError, "invalid egress configuration: .*partial-label"):
                     entry.load(None)
 
     def test_runtime_prints_a_clear_error_before_reading_capabilities(self):
@@ -224,7 +294,7 @@ class StartupTests(unittest.TestCase):
                 env={**os.environ, "PYTHONPATH": str(ROOT)},
             )
         self.assertEqual(result.returncode, 1)
-        self.assertIn("secret-proxy runtime failed: egress.allowPrivateCidrs: '127.0.0.0/8' overlaps loopback", result.stderr)
+        self.assertIn("secret-proxy runtime failed: egress.allow: partial-label wildcard", result.stderr)
 
 
 # --- mitmproxy hook wiring --------------------------------------------------
@@ -244,7 +314,9 @@ class HookTests(unittest.TestCase):
             "intranet.example.com": [["10.20.0.9"]],
         })
         patches = [
-            patch.object(entry, "_egress_policy", policy()),
+            patch.object(entry, "_egress_policy", policy(
+                {"mode": "allowlist", "allow": ["*.example.com"], "deny": ["blocked.example.com"]},
+                hosts=["api.example.com"])),
             patch.object(entry, "_resolver", self.resolver),
             patch.dict(entry._pins, clear=True),
             patch.dict(entry._connecting, clear=True),
@@ -274,6 +346,7 @@ class HookTests(unittest.TestCase):
 
     def test_connect_refusals_are_403_naming_the_rule_without_upstream(self):
         for host, rule in [("169.254.169.254", "metadata-address"), ("metadata.google.internal", "metadata-host"),
+                           ("blocked.example.com", "egress-deny"), ("unlisted.example.net", "egress-allowlist"),
                            ("intranet.example.com", "private-address"), ("127.0.0.1", "loopback-address")]:
             with self.subTest(host=host):
                 flow = self.connect_flow(host)
@@ -325,7 +398,7 @@ class HookTests(unittest.TestCase):
         other = self.server(self.connect_flow("y"), "rebind.example.com")
         run(self.entry.server_connect(other))
         self.assertEqual(other.server.error, "secret-proxy egress refused (metadata-address)")
-        for host in ("169.254.169.254", egress.SENTINEL_HOST, "intranet.example.com"):
+        for host in ("169.254.169.254", egress.SENTINEL_HOST, "unlisted.example.net"):
             with self.subTest(host=host):
                 refused = self.server(self.connect_flow("z"), host)
                 run(self.entry.server_connect(refused))
@@ -338,7 +411,8 @@ class HookTests(unittest.TestCase):
             self.assertIn("policy-unavailable", data.server.error)
 
     def test_plain_http_refused_before_addon_runs(self):
-        for host, rule in [("169.254.169.254", "metadata-address"), ("intranet.example.com", "private-address")]:
+        for host, rule in [("169.254.169.254", "metadata-address"), ("unlisted.example.net", "egress-allowlist"),
+                           ("blocked.example.com", "egress-deny")]:
             with self.subTest(host=host), patch.object(self.entry.addon, "requestheaders") as addon_hook:
                 flow = self.plain_flow(host)
                 run(self.entry.requestheaders(flow))

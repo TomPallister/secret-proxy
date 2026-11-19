@@ -120,11 +120,13 @@ existing instance's policy, as for any other policy file.
 ## Refused destinations
 
 The proxy refuses connections to loopback, link-local, metadata, multicast and
-reserved addresses, and by default to private ranges. A client sees a `403`
-with `secret_proxy_egress_refused` and the rule name; the proxy terminal logs
+reserved addresses, by default to private ranges, and to any host the optional
+`egress` allow/deny list refuses. A client sees a `403` with
+`secret_proxy_egress_refused` and the rule name; the proxy terminal logs
 `BLOCKED ... egress <rule>` with the host and port only. If a legitimate
 internal destination is refused with `private-address`, add its network to
-`egress.allowPrivateCidrs` in a new candidate registration. See
+`egress.allowPrivateCidrs` in a new candidate registration; for
+`egress-allowlist`, add the host to `egress.allow`. See
 [egress controls](advanced-setup.md#egress-controls).
 
 **Upgrading from a release without egress checks:** private destinations that

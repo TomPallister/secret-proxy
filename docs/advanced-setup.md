@@ -89,25 +89,42 @@ Refused by default, allowed by explicit CIDR: private ranges (`10/8`,
 `172.16/12`, `192.168/16`, CGNAT `100.64/10`, `fc00::/7`, `fec0::/10`) and
 other special-purpose ranges (documentation, benchmarking, 6to4, Teredo).
 
-An optional `egress` section in `manifest.json` lists the private networks
-the proxy may reach:
+An optional `egress` section in `manifest.json` configures the rest. Every
+field is optional; without the section, egress is open as before apart from the
+address checks above. See `examples/egress-manifest.json`:
 
 ```json
 "egress": {
+  "mode": "allowlist",
+  "allow": ["*.example.com", "registry.example.org", "api.*.example.net"],
+  "deny": ["paste.example.com"],
   "allowPrivateCidrs": ["10.20.0.0/16", "fd12:3456::/32"]
 }
 ```
 
-`allowPrivateCidrs` takes networks without host bits. Entries overlapping
-loopback, link-local or other always-refused ranges, IPv4-in-IPv6 forms and
-entirely public networks are rejected.
+- `mode`: `open` (default) or `allowlist`. In `allowlist` mode a host must
+  match `allow` or be a manifest placement host. `allow` is refused in `open`
+  mode so a mistaken mode does not silently ignore it.
+- `deny` is checked first in both modes, including for manifest hosts.
+- Patterns: an exact host; `*.example.com` matches one or more labels before
+  `example.com` (not `example.com` itself); a `*` label elsewhere matches
+  exactly one label. IP literals match only that address. Partial-label
+  wildcards (`api*.example.com`), a bare `*` and duplicates are rejected at
+  startup. Ports are not part of a pattern.
+- AWS endpoints and `auth.openai.com` are not implicitly allowed. In
+  `allowlist` mode with AWS signing, list the endpoints you use, for example
+  `*.amazonaws.com` or `sts.amazonaws.com`.
+- `allowPrivateCidrs`: networks without host bits. Entries overlapping
+  loopback, link-local or other always-refused ranges, IPv4-in-IPv6 forms and
+  entirely public networks are rejected.
 
 Refusals are a `403` naming the rule, sent before any upstream connection:
 `{"error":"secret_proxy_egress_refused","rule":"private-address"}`. Rules
 are `metadata-host`, `metadata-address`, `loopback-address`,
 `link-local-address`, `unspecified-address`, `multicast-address`,
-`reserved-address`, `private-address`, `special-purpose-address` and
-`invalid-host`. A name that does not resolve gets `502` with rule `unresolved`.
+`reserved-address`, `private-address`, `special-purpose-address`,
+`egress-deny`, `egress-allowlist` and `invalid-host`. A name that does not
+resolve gets `502` with rule `unresolved`.
 
 The policy is read at startup and invalid configuration stops startup with a
 message naming the problem. The installer validates it too. Change it with a
@@ -118,6 +135,10 @@ Limits:
 - It covers only traffic that comes through the proxy. To stop clients going
   direct, route them through it, for example with an internal network that has
   no other way out.
+- Host patterns match the requested name. The addresses that name resolves to
+  are checked separately.
+- The proxy's own connections (1Password, Okta/AWS credential minting, the
+  ChatGPT login exchange) do not go through these lists.
 - The proxy connects to the first checked address, so it does not fall back to
   later addresses when the first one fails to connect.
 

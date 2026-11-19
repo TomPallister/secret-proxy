@@ -135,7 +135,8 @@ class SecretManifest:
             raise ValueError("invalid checkmarxRealm")
         if "CHECKMARX_ACCESS_TOKEN" in raw_secrets and not realm:
             raise ValueError("checkmarxRealm is required for Checkmarx")
-        # Optional; absent allows no private ranges. Raises EgressConfigError.
+        # Optional; absent means open egress (address checks still apply).
+        # Raises EgressConfigError.
         egress = EgressPolicy.from_config(data.get("egress"))
 
         def validate_string_list(
@@ -411,8 +412,9 @@ class SecretManifest:
         return manifest
 
     def egress_policy(self) -> EgressPolicy:
-        """Return the validated egress (address) policy."""
-        return getattr(self, "_egress", None) or EgressPolicy()
+        """Return the egress policy; manifest interception hosts are allowed."""
+        policy = getattr(self, "_egress", None) or EgressPolicy()
+        return policy.with_interception_hosts(self.interception_hosts())
 
     def canonical_name(self, name: str) -> str:
         """Validate and return a canonical secret name.
