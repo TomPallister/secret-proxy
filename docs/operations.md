@@ -117,6 +117,20 @@ the exception its own role with narrow upstream permissions. Adding or changing
 either file is a private policy change: the installer refuses to overwrite an
 existing instance's policy, as for any other policy file.
 
+## Refused destinations
+
+The proxy refuses connections to loopback, link-local, metadata, multicast and
+reserved addresses, and by default to private ranges. A client sees a `403`
+with `secret_proxy_egress_refused` and the rule name; the proxy terminal logs
+`BLOCKED ... egress <rule>` with the host and port only. If a legitimate
+internal destination is refused with `private-address`, add its network to
+`egress.allowPrivateCidrs` in a new candidate registration. See
+[egress controls](advanced-setup.md#egress-controls).
+
+**Upgrading from a release without egress checks:** private destinations that
+used to work, for example internal hosts through a VPN, are now refused until
+you list them. Check the networks you need before switching over.
+
 ## Upgrade without changing the trust boundary
 
 - Verify the exact new signed source and its audit before installing. The

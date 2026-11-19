@@ -32,7 +32,7 @@ SA_HOME = Path('/Users/secagent')
 BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'sealedjwt.py',
-               'gitsign.py', 'secretstore.py', 'runtime.py')
+               'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py')
 
 
 class HostError(Exception):

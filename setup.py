@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 
+from egress import EgressConfigError
 from host import Deployment, HostError, PYTHON, ROOT, validate_bootstrap_config
 from macos_install import validate_source_config
 from client import validate_config
@@ -197,6 +198,6 @@ if __name__ == '__main__':
     try:
         main()
     except (Exception, KeyboardInterrupt) as error:
-        detail = str(error) if isinstance(error, SetupError) else type(error).__name__
+        detail = str(error) if isinstance(error, (SetupError, EgressConfigError)) else type(error).__name__
         print('Setup stopped: ' + detail, file=sys.stderr)
         sys.exit(1)

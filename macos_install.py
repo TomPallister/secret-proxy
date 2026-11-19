@@ -20,13 +20,14 @@ from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
 from client import private_read, validate_config
 from host import Deployment, HostError, PODMAN, PYTHON, ROOT, SA_HOME, SHARED_ROOT
+from egress import EgressConfigError
 from secretstore import SecretManifest
 
 GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'sealedjwt.py',
-         'gitsign.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
+         'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
          'manage.py', 'secret-proxy')
 # Private policy copied into the instance (bootstrap metadata stays desktop-side).
 POLICY_FILES = ('manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem')
@@ -248,6 +249,6 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
-        detail = str(error) if isinstance(error, HostError) else type(error).__name__
+        detail = str(error) if isinstance(error, (HostError, EgressConfigError)) else type(error).__name__
         print('secret-proxy installation failed: ' + detail, file=sys.stderr)
         sys.exit(1)

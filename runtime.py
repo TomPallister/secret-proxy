@@ -27,6 +27,7 @@ import time
 from secretstore import SecretManifest
 from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
+from egress import EgressConfigError
 
 MAX_BOOTSTRAP = 16384
 
@@ -238,7 +239,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         # Provider/JSON errors must not echo any capability or callback content.
-        # AWS policy errors are fixed configuration text (field positions only).
-        detail = str(error) if isinstance(error, AwsPolicyError) else type(error).__name__
+        # AWS policy and egress configuration errors contain only policy text, so show them.
+        detail = str(error) if isinstance(error, (AwsPolicyError, EgressConfigError)) else type(error).__name__
         print("secret-proxy runtime failed: " + detail, file=sys.stderr)
         sys.exit(1)

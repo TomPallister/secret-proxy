@@ -12,5 +12,6 @@
 !chatgptcreds.py
 !sealedjwt.py
 !gitsign.py
+!egress.py
 !secretstore.py
 !runtime.py

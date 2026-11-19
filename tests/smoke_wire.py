@@ -133,7 +133,15 @@ class FixtureRunner:
             raise AssertionError('Unexpected provider operation')
         return subprocess.CompletedProcess(args, 0, json.dumps(result), '')
 secretstore.DefaultCommandRunner = FixtureRunner
-from entry import load, requestheaders, request, responseheaders
+import egress
+_address_refusal = egress.address_refusal
+def fixture_address_refusal(text, allowed=()):
+    # Only the generated upstream's exact loopback address; all else is real.
+    return None if text == '127.0.0.1' else _address_refusal(text, allowed)
+egress.address_refusal = fixture_address_refusal
+from entry import (load, http_connect, requestheaders, request, responseheaders,
+                   server_connect, server_connected, server_connect_error,
+                   server_disconnected, client_disconnected)
 ''')
         capability = secrets.token_hex(24)
         auth = root / 'auth'
@@ -185,6 +193,15 @@ from entry import load, requestheaders, request, responseheaders
                 before = len(observed)
                 assert request('GET', '/denied', {'X-Api-Key': REF + 'API_KEY'})[0] == 403
                 assert len(observed) == before  # Refused before any upstream call.
+                for target in ('169.254.169.254', '127.0.0.2'):
+                    refused = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                    try:
+                        refused.request('CONNECT', f'{target}:443', headers={'Proxy-Authorization': proxy_auth})
+                        answer = refused.getresponse()
+                        assert answer.status == 403, answer.status
+                        assert json.loads(answer.read())['error'] == 'secret_proxy_egress_refused'
+                    finally:
+                        refused.close()
 
                 # Negotiate HTTP/2 to the proxy, which downgrades to fixture H1.
                 tunnel = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
@@ -237,7 +254,7 @@ from entry import load, requestheaders, request, responseheaders
         assert 'AWS DENY 123456789012/ReadOnly secretsmanager:GetSecretValue' in output
         assert 'AWS DENY 123456789012/ReadOnly sts:AssumeRole' in output
         assert 'BODY-MARKER' not in output
-        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); generated-key signing; no vault or external network')
+        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; no vault or external network')
 
 
 def aws_auth(service):

@@ -22,6 +22,10 @@ engineering evidence, not a penetration test or a security certification.
 - Bootstrap capabilities use bounded stdin rather than command arguments. Provider
   failures are sanitised; there is no persistent request log in the host launch
   contract. Browser callbacks belong in the hidden terminal prompt, not chat/logs.
+- Proxied connections to loopback, link-local, cloud-metadata, multicast and
+  reserved addresses are refused, and private ranges unless explicitly allowed.
+  The proxy resolves a name once, checks every address and connects only to a
+  checked one, so DNS rebinding cannot redirect that connection.
 - ChatGPT access and rotating refresh tokens are memory-only. Restart requires
   browser sign-in again. Static secrets remain cached until invalidation/restart.
 
@@ -39,9 +43,12 @@ engineering evidence, not a penetration test or a security certification.
   return or create keys are not blocked. Narrow upstream permissions and external
   policy accordingly; this is not response-data loss prevention.
 - **All host traffic.** The host client supplies command-scoped proxy variables;
-  a program can ignore them. Selective TLS interception is not an egress firewall.
-  A development container's no-direct-egress network is an external consumer
-  control, not a property of every proxy client.
+  a program can ignore them. Egress address checks apply only
+  to traffic that goes through the proxy; they are not an egress firewall for the
+  machine. A development container's no-direct-egress network is an external
+  consumer control, not a property of every proxy client.
+- **Data sent to public hosts.** Any public host can still receive anything a
+  client sends it through the proxy.
 - **Root, sudo or trusted bootstrap.** Administrators can read process memory,
   change the installation or act as the proxy owner. Review source and signing-key
   trust before authorising installation. A desktop-user-owned container alone is

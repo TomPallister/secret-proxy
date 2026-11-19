@@ -65,6 +65,62 @@ uv run --locked python migrate_aws.py --source /private/path/aws-okta.json \
 Use the active protected configuration, not a repository seed. Review the
 result outside this repository before installing it as a new candidate.
 
+## Egress controls
+
+The proxy decides every upstream connection before opening it, for CONNECT
+tunnels (intercepted or not) and plain HTTP. It resolves the name **once**,
+checks **every** address in the answer, then connects to a checked address.
+A second DNS answer (rebinding) cannot change where that connection goes.
+
+Always refused, and not configurable:
+
+- loopback, link-local (`169.254.0.0/16`, `fe80::/10`), unspecified,
+  multicast and reserved (`240.0.0.0/4`) addresses;
+- cloud metadata addresses (`169.254.169.254`, `169.254.170.2`,
+  `fd00:ec2::254`, `100.100.100.200`), even inside an allowed private range;
+- metadata names such as `metadata.google.internal`, `metadata` and
+  `instance-data`.
+
+IPv4-mapped, IPv4-compatible and NAT64 (`64:ff9b::/96`) IPv6 addresses are
+checked as the IPv4 address they carry. Numeric forms such as `2852039166` are
+read as the address they encode.
+
+Refused by default, allowed by explicit CIDR: private ranges (`10/8`,
+`172.16/12`, `192.168/16`, CGNAT `100.64/10`, `fc00::/7`, `fec0::/10`) and
+other special-purpose ranges (documentation, benchmarking, 6to4, Teredo).
+
+An optional `egress` section in `manifest.json` lists the private networks
+the proxy may reach:
+
+```json
+"egress": {
+  "allowPrivateCidrs": ["10.20.0.0/16", "fd12:3456::/32"]
+}
+```
+
+`allowPrivateCidrs` takes networks without host bits. Entries overlapping
+loopback, link-local or other always-refused ranges, IPv4-in-IPv6 forms and
+entirely public networks are rejected.
+
+Refusals are a `403` naming the rule, sent before any upstream connection:
+`{"error":"secret_proxy_egress_refused","rule":"private-address"}`. Rules
+are `metadata-host`, `metadata-address`, `loopback-address`,
+`link-local-address`, `unspecified-address`, `multicast-address`,
+`reserved-address`, `private-address`, `special-purpose-address` and
+`invalid-host`. A name that does not resolve gets `502` with rule `unresolved`.
+
+The policy is read at startup and invalid configuration stops startup with a
+message naming the problem. The installer validates it too. Change it with a
+new candidate registration, like any other policy change.
+
+Limits:
+
+- It covers only traffic that comes through the proxy. To stop clients going
+  direct, route them through it, for example with an internal network that has
+  no other way out.
+- The proxy connects to the first checked address, so it does not fall back to
+  later addresses when the first one fails to connect.
+
 ## Candidate installation on macOS
 
 Prerequisites: Apple silicon macOS supporting libkrun, the root-owned Podman
@@ -138,7 +194,9 @@ fresh machine it creates only the required private config mount.
 
 ## Optional externally managed VPN
 
-Without `network.json` the candidate uses direct egress. To attach to an already
+Without `network.json` the candidate uses direct egress. Internal hosts
+reached through a VPN usually resolve to private addresses, which are refused
+unless listed in `egress.allowPrivateCidrs` (see [egress controls](#egress-controls)). To attach to an already
 running VPN container on the **same secagent engine**, add external private
 `network.json` before registering a **new** candidate instance:
 

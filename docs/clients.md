@@ -65,6 +65,12 @@ AWS calls that return credentials or secrets, such as `secretsmanager
 get-secret-value`, are refused with `AccessDeniedException` from secret-proxy;
 see the [AWS operation policy](operations.md#aws-operation-policy).
 
+## Refused destinations
+
+Requests to metadata, loopback, link-local and (by default) private addresses
+get `403` with `{"error":"secret_proxy_egress_refused","rule":"..."}`. The
+rule name says why; see [egress controls](advanced-setup.md#egress-controls).
+
 ## Low-level client interface
 
 The daily CLI delegates to the installed client. For an explicitly registered

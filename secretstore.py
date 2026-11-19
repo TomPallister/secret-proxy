@@ -13,6 +13,8 @@ from urllib.parse import unquote, urlsplit
 from pathlib import Path
 from typing import Mapping, Protocol
 
+from egress import EgressPolicy
+
 
 # Validation patterns
 CANONICAL_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
@@ -114,7 +116,7 @@ class SecretManifest:
         provider = "1password"
         with open(path) as f:
             data = json.load(f, object_pairs_hook=_unique_object)
-        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm"}:
+        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress"}:
             raise ValueError("invalid manifest root")
         if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 3:
             raise ValueError("schemaVersion must be exactly integer 3")
@@ -133,6 +135,8 @@ class SecretManifest:
             raise ValueError("invalid checkmarxRealm")
         if "CHECKMARX_ACCESS_TOKEN" in raw_secrets and not realm:
             raise ValueError("checkmarxRealm is required for Checkmarx")
+        # Optional; absent allows no private ranges. Raises EgressConfigError.
+        egress = EgressPolicy.from_config(data.get("egress"))
 
         def validate_string_list(
             name: str, field_name: str, value: object, *, nonempty: bool = False
@@ -403,7 +407,12 @@ class SecretManifest:
 
         manifest = cls(provider, accounts, secrets)
         manifest.checkmarx_realm = realm
+        manifest._egress = egress
         return manifest
+
+    def egress_policy(self) -> EgressPolicy:
+        """Return the validated egress (address) policy."""
+        return getattr(self, "_egress", None) or EgressPolicy()
 
     def canonical_name(self, name: str) -> str:
         """Validate and return a canonical secret name.
