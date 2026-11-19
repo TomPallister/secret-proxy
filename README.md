@@ -52,6 +52,9 @@ kept in memory, not saved to disk. Other integrations do not require this login.
 For **GitHub Copilot in Pi**, enable it in your manifest and run
 `secret-proxy login github-copilot`. You approve a code on GitHub; the proxy
 keeps the GitHub and Copilot tokens in memory and Pi gets only references.
+`secret-proxy login github` does the same for the GitHub CLI (`gh`): gh gets
+a reference in `GH_TOKEN`, and the proxy adds the real token where your policy
+allows.
 
 The proxy does not run as a background service. Use `stop` explicitly rather
 than assuming that closing its terminal stopped it.

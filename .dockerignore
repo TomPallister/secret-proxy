@@ -13,6 +13,7 @@
 !chatgptcreds.py
 !githubdevice.py
 !copilotcreds.py
+!ghclicreds.py
 !sealedjwt.py
 !gitsign.py
 !egress.py

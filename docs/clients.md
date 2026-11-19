@@ -86,6 +86,43 @@ editors use their own sign-in and are not supported through this login; if one
 of them uses the same OAuth client ID as Pi, the proxy refuses its sign-in.
 Copilot telemetry hosts are not intercepted: they never receive either token.
 
+## GitHub CLI (gh)
+
+Add the gh entry to your manifest (see
+[advanced configuration](advanced-setup.md#github-logins)) and give gh a reference
+in `client-environment.json`, before installation:
+
+```json
+{"GH_TOKEN": "secretref:GH_CLI_OAUTH_TOKEN"}
+```
+
+Then, with the proxy running:
+
+```sh
+secret-proxy login github
+secret-proxy run -- gh api user
+```
+
+Login works like the Copilot one: open the URL, enter the code, and leave the
+command running. The proxy uses the GitHub CLI's own OAuth app and scopes
+(`repo`, `read:org`, `gist` unless the manifest says otherwise) and keeps the
+token in RAM. gh sees only the reference, so `gh auth status` reports that
+`GH_TOKEN` is in use, and `gh auth login` is refused (by gh itself, and by the
+proxy for gh's OAuth app). `GH_TOKEN` and `GH_ENTERPRISE_TOKEN` in the client
+configuration must be references; anything else is refused.
+
+For Git over HTTPS, run `gh auth setup-git` once so Git asks gh for credentials.
+gh then hands Git the reference with the user name `x-access-token`, and the
+proxy adds the real token as the Basic password where the manifest allows it.
+
+After a proxy restart, run `secret-proxy login github` again. The existing
+vault-stored `GITHUB_TOKEN` integration is separate and unchanged.
+
+On macOS, gh is a Go program and ignores `SSL_CERT_FILE`, so it cannot trust the
+proxy certificate yet. It works in Linux containers that trust the proxy CA. On
+macOS it needs the planned `secret-proxy trust-ca` command (a separate change);
+do not disable TLS verification instead.
+
 ## Compatibility limits
 
 Applications must honour the supplied proxy and CA settings. Curl and accepted

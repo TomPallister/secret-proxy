@@ -45,6 +45,7 @@ from googlecreds import GoogleTokenProvider
 from auth0creds import Auth0ManagementTokenProvider
 from chatgptcreds import ChatGPTCredentials, ChatGPTAuthError
 import copilotcreds
+import ghclicreds
 import githubdevice
 from oauthcreds import FormTokenProvider, FormTokenSpec, OAuthTokenError
 import gitsign
@@ -518,6 +519,9 @@ _GITHUB_LOGINS = (
     _GitHubLogin("copilot", copilotcreds.CANONICAL, "/github-copilot",
                  b'{"error":"use_github_copilot_login"}', copilotcreds.CLIENT_ID,
                  lambda settings: copilotcreds.CopilotCredentials(domain=settings["domain"])),
+    _GitHubLogin("cli", ghclicreds.CANONICAL, "/github",
+                 b'{"error":"use_gh_login"}', ghclicreds.CLIENT_ID,
+                 lambda settings: ghclicreds.GhCliCredentials(domain=settings["domain"], scopes=settings["scopes"])),
 )
 
 
@@ -1199,7 +1203,7 @@ def _copilot_exchange_response(flow: http.HTTPFlow) -> bool:
     the proxy answers itself. Any other exchange (a real bearer, another
     method, an unknown reference) is refused, never forwarded.
     """
-    login = _GITHUB_LOGINS[0]
+    login = next(item for item in _GITHUB_LOGINS if item.kind == "copilot")
     settings = _github_settings(login)
     if settings is None:
         return False
@@ -1218,7 +1222,7 @@ def _copilot_exchange_response(flow: http.HTTPFlow) -> bool:
     provider = _github_provider(login)
     try:
         value = provider.exchange_answer()
-    except copilotcreds.CopilotAuthError:
+    except (copilotcreds.CopilotAuthError, githubdevice.GitHubDeviceError):
         log.warning("secret_proxy: GET %s - Copilot exchange refused: login required", flow.request.host)
         return _json_response(flow, 403, login.error)
     log.info("secret_proxy: GET %s - answered the Copilot token exchange with a sealed token", flow.request.host)

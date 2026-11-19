@@ -27,7 +27,7 @@ GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
-         'copilotcreds.py', 'sealedjwt.py',
+         'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
          'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
          'manage.py', 'secret-proxy')
 # Private policy copied into the instance (bootstrap metadata stays desktop-side).

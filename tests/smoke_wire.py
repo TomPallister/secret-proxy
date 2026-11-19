@@ -74,6 +74,9 @@ def main():
             protocol_version = 'HTTP/1.1'
 
             def do_GET(self):
+                if self.path.startswith('/gh/'):
+                    observed.append(self.headers['Authorization'] == 'token ' + copilot['github'])
+                    return self.answer()
                 query = parse_qs(urlsplit(self.path).query)
                 observed.append(self.headers.get('X-Api-Key') == values['API_KEY'] and
                                 query.get('key', [values['API_KEY']]) == [values['API_KEY']])
@@ -118,8 +121,11 @@ def main():
                         'GITHUB_COPILOT_SESSION_TOKEN': {'runtimeOnly': True, 'placements': [
                             {'kind': 'header', 'hosts': ['127.0.0.1'], 'name': 'authorization',
                              'template': 'Bearer {secret}', 'methods': ['POST'], 'paths': ['/copilot/*']}]},
+                        'GH_CLI_OAUTH_TOKEN': {'runtimeOnly': True, 'placements': [
+                            {'kind': 'header', 'hosts': ['127.0.0.1'], 'name': 'authorization',
+                             'template': 'token {secret}', 'methods': ['GET'], 'paths': ['/gh/*']}]},
                         'GIT_SIGNING_SSH_KEY': {'internalOnly': True, 'valueField': 'sshPrivateKey'}},
-            'githubLogins': {'copilot': {'domain': 'github.example.com'}}}))
+            'githubLogins': {'copilot': {'domain': 'github.example.com'}, 'cli': {'domain': 'github.example.com'}}}))
         # Synthetic AWS configuration: makes the proxy intercept AWS hosts. No
         # Okta values exist, so an allowed call fails at credential vending.
         (root / 'aws-okta.json').write_text(json.dumps({
@@ -296,6 +302,19 @@ entry._resolver = fixture_resolver
                                      host='github.example.com', target_port=443)
                 assert code == 403 and json.loads(body) == {'error': 'use_github_copilot_login'}
                 assert observed == [True, True, True, True]
+
+                # Proxy-owned gh login: gh holds only a reference in GH_TOKEN.
+                assert request('GET', '/gh/user', {'Authorization': 'token ' + REF + 'GH_CLI_OAUTH_TOKEN'})[0] == 502
+                code, body = request('GET', '/github/start', host=sentinel, target_port=443)
+                assert code == 200 and json.loads(body)['userCode'] == 'FIXT-0001'
+                code, body = request('POST', '/github/poll', body=b'', host=sentinel, target_port=443)
+                assert code == 200 and json.loads(body) == {'status': 'complete', 'scopes': ['read:user']}
+                assert request('GET', '/gh/user', {'Authorization': 'token ' + REF + 'GH_CLI_OAUTH_TOKEN'}) == (200, b'ok')
+                code, body = request('POST', '/login/device/code', {'Content-Type': 'application/x-www-form-urlencoded'},
+                                     urlencode({'client_id': '178c6fc778ccc68e1d6a', 'scope': 'repo'}),
+                                     host='github.example.com', target_port=443)
+                assert code == 403 and json.loads(body) == {'error': 'use_gh_login'}
+                assert observed == [True] * 5
             finally:
                 child.terminate()
                 try:
@@ -311,7 +330,7 @@ entry._resolver = fixture_resolver
         assert 'AWS DENY 123456789012/ReadOnly sts:AssumeRole' in output
         assert 'BODY-MARKER' not in output
         assert copilot['github'] not in output and copilot['copilot'] not in output
-        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; proxy-owned Copilot login, sealed exchange and pinned injection; no vault or external network')
+        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; proxy-owned Copilot and gh logins, sealed exchange and pinned injection; no vault or external network')
 
 
 def aws_auth(service):

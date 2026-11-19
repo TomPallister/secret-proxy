@@ -76,6 +76,7 @@ def wait_controllers(pids: list[int]):
 LOGINS = {
     'chatgpt': ('/chatgpt/status', {'instance', 'loggedIn', 'expiresAt', 'refreshCount', 'lastRefreshAt', 'lastRefreshDueAt'}),
     'github-copilot': ('/github-copilot/status', {'instance', 'loggedIn', 'expiresAt', 'refreshCount', 'lastRefreshAt'}),
+    'github': ('/github/status', {'instance', 'loggedIn', 'scopes'}),
 }
 
 
@@ -87,7 +88,9 @@ def auth_status(client: ProxyClient, settings: dict, provider: str = 'chatgpt') 
     if (not isinstance(result, dict) or set(result) != fields
             or not isinstance(result['instance'], str) or re.fullmatch(r'[0-9a-f]{32}', result['instance']) is None
             or result['instance'] != expected['instance'] or type(result['loggedIn']) is not bool
-            or type(result['refreshCount']) is not int or result['refreshCount'] < 0):
+            or ('refreshCount' in fields and (type(result['refreshCount']) is not int or result['refreshCount'] < 0))
+            or ('scopes' in fields and (not isinstance(result['scopes'], list) or not all(
+                isinstance(scope, str) and re.fullmatch(r'[a-z0-9:_-]{1,64}', scope) for scope in result['scopes'])))):
         raise ClientError('Invalid or stale authentication status')
     for name in sorted(fields & {'expiresAt', 'lastRefreshAt', 'lastRefreshDueAt'}):
         if result[name] is not None and (type(result[name]) is not int or result[name] < 0):

@@ -145,8 +145,9 @@ Limits:
 
 ## GitHub logins
 
-The proxy can own a GitHub Copilot login (for Pi). It is off unless the manifest
-declares the runtime-only entry. Example (also in `examples/github-manifest.json`):
+The proxy can own a GitHub Copilot login (for Pi) and a GitHub CLI login (for
+`gh`). Each is off unless the manifest declares its runtime-only entry. Copilot
+example (`examples/github-manifest.json` has both):
 
 ```json
 {
@@ -172,6 +173,34 @@ declares the runtime-only entry. Example (also in `examples/github-manifest.json
   so the proxy can refuse a client's own device flow and answer its token
   exchange. The placements decide where the Copilot token may go; the token's own
   `proxy-ep` narrows that to one host.
+
+For gh, declare `GH_CLI_OAUTH_TOKEN`. The example in `examples/` is read-only:
+it allows `GET`/`HEAD` on `api.github.com` with gh's `token` header. That covers
+`gh api` reads, but most other gh commands use GraphQL, which is a `POST`. A
+full-access policy, including uploads and Git over HTTPS, looks like this:
+
+```json
+{
+  "githubLogins": {"cli": {"domain": "github.com", "scopes": ["repo", "read:org", "gist"]}},
+  "secrets": {
+    "GH_CLI_OAUTH_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [
+        {"kind": "header", "hosts": ["api.github.com", "uploads.github.com"],
+         "name": "authorization", "template": "token {secret}"},
+        {"kind": "basic-password", "hosts": ["github.com"], "username": "x-access-token"}
+      ]
+    }
+  }
+}
+```
+
+- `scopes` defaults to gh's own minimum (`repo`, `read:org`, `gist`). Fewer
+  scopes limit what the token can do on GitHub, whatever the placements allow.
+- Path rules can't tell a Git fetch from a push, so Git placements grant both.
+  Use GitHub permissions and scopes to limit writes.
+- Enabling the login adds `<domain>` to the intercepted hosts so the proxy can
+  refuse gh's own device flow.
 
 ## Candidate installation on macOS
 

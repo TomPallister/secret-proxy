@@ -28,10 +28,16 @@ UUID_RE = re.compile(
 VALID_VALUE_FIELDS = ("password", "sshPrivateKey")
 # Values the proxy itself obtains through a login it owns. They are held in
 # RAM only: never read from the vault, and a restart requires a new login.
-RUNTIME_ONLY_NAMES = frozenset({"CHATGPT_ACCESS_TOKEN", "GITHUB_COPILOT_SESSION_TOKEN"})
+RUNTIME_ONLY_NAMES = frozenset({"CHATGPT_ACCESS_TOKEN", "GITHUB_COPILOT_SESSION_TOKEN", "GH_CLI_OAUTH_TOKEN"})
 # Proxy-owned GitHub logins: the manifest key, its runtimeOnly secret and the
 # fields each one accepts.
-GITHUB_LOGINS = {"copilot": ("GITHUB_COPILOT_SESSION_TOKEN", frozenset({"domain"}))}
+GITHUB_LOGINS = {
+    "copilot": ("GITHUB_COPILOT_SESSION_TOKEN", frozenset({"domain"})),
+    "cli": ("GH_CLI_OAUTH_TOKEN", frozenset({"domain", "scopes"})),
+}
+# The GitHub CLI's own minimum scopes for `gh auth login`.
+GH_CLI_DEFAULT_SCOPES = ("repo", "read:org", "gist")
+_GITHUB_SCOPE_RE = re.compile(r"[a-z0-9:_-]{1,64}")
 _GITHUB_DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 ACCOUNT_NAMES = ("runtime",)
 
@@ -652,6 +658,12 @@ def _github_logins(raw: object, secrets: dict) -> dict:
                 or not all(_GITHUB_DOMAIN_LABEL_RE.fullmatch(label) for label in labels)):
             raise ValueError(f"githubLogins.{kind}.domain must be a lowercase host name")
         result[kind] = {"domain": domain}
+        if "scopes" in allowed:
+            scopes = settings.get("scopes", list(GH_CLI_DEFAULT_SCOPES))
+            if (not isinstance(scopes, list) or not 0 < len(scopes) <= 20 or len(set(scopes)) != len(scopes)
+                    or not all(isinstance(scope, str) and _GITHUB_SCOPE_RE.fullmatch(scope) for scope in scopes)):
+                raise ValueError(f"githubLogins.{kind}.scopes must be unique OAuth scope names")
+            result[kind]["scopes"] = tuple(scopes)
     return result
 
 

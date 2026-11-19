@@ -35,6 +35,10 @@ engineering evidence, not a penetration test or a security certification.
   Copilot token is sent only to the API host named by its own `proxy-ep` field,
   within the manifest placement. A client-side device flow using the Copilot
   OAuth client ID, or an exchange with any other bearer, is refused.
+- GitHub CLI: the proxy runs gh's device flow and keeps the OAuth token in RAM.
+  gh receives only a reference in `GH_TOKEN`; the client refuses a configured
+  `GH_TOKEN` that is not a reference. gh's own device flow is refused. The
+  token can only be added where the manifest places `GH_CLI_OAUTH_TOKEN`.
 
 ## What is not protected
 

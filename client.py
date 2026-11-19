@@ -20,6 +20,7 @@ import urllib.parse
 MARKER = 'secret' + 'ref:'
 HOST = 'secret' + 'ref.invalid'
 MAX_CALLBACK = 32768
+GH_TOKEN_VARIABLES = ('GH_TOKEN', 'GH_ENTERPRISE_TOKEN')
 
 
 class ClientError(Exception):
@@ -64,6 +65,9 @@ def validate_config(config: dict) -> dict:
                 or key.lower().endswith('proxy')
                 or not isinstance(value, str) or any(ord(c) < 32 for c in value)):
             raise ClientError('Unsafe client environment setting')
+        # gh reads these; they may only ever carry a reference, never a token.
+        if key in GH_TOKEN_VARIABLES and re.fullmatch(re.escape(MARKER) + r'[A-Z][A-Z0-9_]+', value) is None:
+            raise ClientError(key + ' must be a secret reference, not a token')
     return config
 
 
@@ -307,7 +311,7 @@ def main():
     run = commands.add_parser('run', help='Run one command with scoped proxy/trust environment')
     run.add_argument('argv', nargs=argparse.REMAINDER)
     login = commands.add_parser('login', help='Proxy-owned login (ChatGPT for Pi by default)')
-    login.add_argument('--provider', choices=('chatgpt', 'github-copilot'), default='chatgpt')
+    login.add_argument('--provider', choices=('chatgpt', 'github-copilot', 'github'), default='chatgpt')
     login.add_argument('--agent-dir', type=Path)
     login.add_argument('--callback-stdin', action='store_true')
     commands.add_parser('status')
@@ -322,6 +326,12 @@ def main():
         if not argv:
             raise ClientError('A command is required')
         os.execvpe(argv[0], argv, client.env)
+    elif args.provider == 'github':
+        scopes = device_login(client, '/github').get('scopes')
+        if not isinstance(scopes, list) or not all(isinstance(s, str) and re.fullmatch(r'[a-z0-9:_-]{1,64}', s) for s in scopes):
+            raise ClientError('Invalid device login response')
+        print('GitHub CLI login held by the proxy (scopes: ' + (', '.join(scopes) or 'none reported') + ').')
+        print('Run gh through `secret-proxy run`; it receives only a reference in GH_TOKEN.')
     elif args.provider == 'github-copilot':
         agent = args.agent_dir or Path(client.env.get('PI_CODING_AGENT_DIR', str(Path.home() / '.pi/agent')))
         value = device_login(client, '/github-copilot').get('credential')

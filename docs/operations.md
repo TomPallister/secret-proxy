@@ -13,6 +13,7 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    full callback only into its hidden prompt. No usable OAuth token is saved.
    For GitHub Copilot, run `secret-proxy login github-copilot`: open the URL it
    prints and enter the code. The proxy waits for GitHub, so leave it running.
+   `secret-proxy login github` works the same way for the GitHub CLI.
 3. `secret-proxy status` checks authenticated TLS and the current boot nonce.
    This is liveness, not proof that every upstream integration works.
 4. Use clients through their existing, explicitly selected adapters, or
@@ -43,6 +44,8 @@ restart resets all in-memory state. `loggedIn` is not an upstream liveness probe
 way. It returns `instance`, `loggedIn`, `expiresAt` (the Copilot token's expiry),
 `refreshCount` (refreshes since the last login, done by the proxy before
 `refresh_in`) and `lastRefreshAt`. It never refreshes or returns a token.
+`secret-proxy auth-status github` returns only `instance`, `loggedIn` and the
+`scopes` GitHub granted to the gh login.
 
 You do not need to wait for token expiry or run a refresh acceptance exercise to
 use this development tool. If authentication breaks during normal use, check
