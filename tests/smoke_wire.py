@@ -107,6 +107,13 @@ def main():
                              'template': 'Bearer {secret}', 'methods': ['POST'],
                              'paths': ['/backend-api/codex/responses']}]},
                         'GIT_SIGNING_SSH_KEY': {'internalOnly': True, 'valueField': 'sshPrivateKey'}}}))
+        # Synthetic AWS configuration: makes the proxy intercept AWS hosts. No
+        # Okta values exist, so an allowed call fails at credential vending.
+        (root / 'aws-okta.json').write_text(json.dumps({
+            'okta_hosts': ['example.okta.com'],
+            'default_app_url': 'https://example.okta.com/home/amazon_aws/example/1',
+            'default_account': '123456789012', 'default_role': 'ReadOnly', 'allowed_roles': ['ReadOnly'],
+            'OKTA_USERNAME': 'OKTA_USERNAME', 'OKTA_PASSWORD': 'OKTA_PASSWORD', 'OKTA_SECRET': 'OKTA_SECRET'}))
         fixture = root / 'fixture_entry.py'
         fixture.write_text('''import json
 from pathlib import Path
@@ -208,6 +215,7 @@ from entry import load, requestheaders, request, responseheaders
                             stream.sendall(pending)
                     assert status == '200' and body == b'ok'
                 context.set_alpn_protocols(['http/1.1'])
+                aws_checks(request, port, proxy_auth, context)
                 payload = (b'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n'
                     b'author Developer <developer@example.com> 1700000000 +0000\n'
                     b'committer Developer <developer@example.com> 1700000000 +0000\n\nfeat: fixture\n')
@@ -226,7 +234,74 @@ from entry import load, requestheaders, request, responseheaders
                 server.server_close()
         output = (root / 'runtime.log').read_text()
         assert values['API_KEY'] not in output and values['GIT_SIGNING_SSH_KEY'] not in output
-        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; generated-key signing; no vault or external network')
+        assert 'AWS DENY 123456789012/ReadOnly secretsmanager:GetSecretValue' in output
+        assert 'AWS DENY 123456789012/ReadOnly sts:AssumeRole' in output
+        assert 'BODY-MARKER' not in output
+        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); generated-key signing; no vault or external network')
+
+
+def aws_auth(service):
+    return ('AWS4-HMAC-SHA256 Credential=secret-proxy-dummy-akid-resigned-on-wire/20260101/'
+            f'eu-west-1/{service}/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef')
+
+
+def aws_headers(service, extra):
+    return {'Authorization': aws_auth(service), 'x-amz-date': '20260101T000000Z',
+            'x-amz-security-token': 'secretrole:123456789012/ReadOnly', **extra}
+
+
+def h2_request(port, proxy_auth, context, host, headers, body):
+    tunnel = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    tunnel.set_tunnel(host, 443, {'Proxy-Authorization': proxy_auth})
+    tunnel.connect()
+    context.set_alpn_protocols(['h2'])
+    try:
+        with context.wrap_socket(tunnel.sock, server_hostname=host) as stream:
+            assert stream.selected_alpn_protocol() == 'h2'
+            protocol = h2.connection.H2Connection(config=h2.config.H2Configuration(header_encoding='utf-8'))
+            protocol.initiate_connection()
+            protocol.send_headers(1, [(':method', 'POST'), (':scheme', 'https'), (':authority', host),
+                                      (':path', '/')] + [(k.lower(), v) for k, v in headers.items()]
+                                  + [('content-length', str(len(body)))])
+            protocol.send_data(1, body, end_stream=True)
+            stream.sendall(protocol.data_to_send())
+            finished, data, status, response_headers = False, b'', None, {}
+            while not finished:
+                packet = stream.recv(65536)
+                assert packet, 'HTTP/2 closed early'
+                for event in protocol.receive_data(packet):
+                    if isinstance(event, h2.events.ResponseReceived):
+                        response_headers = dict(event.headers)
+                        status = response_headers[':status']
+                    elif isinstance(event, h2.events.DataReceived):
+                        data += event.data
+                    elif isinstance(event, h2.events.StreamEnded):
+                        finished = True
+                pending = protocol.data_to_send()
+                if pending:
+                    stream.sendall(pending)
+            return status, response_headers, data
+    finally:
+        context.set_alpn_protocols(['http/1.1'])
+
+
+def aws_checks(request, port, proxy_auth, context):
+    """Denied AWS operations get 403 from the proxy over H1 and H2; nothing upstream."""
+    status, body = request('POST', '/', aws_headers('secretsmanager', {
+        'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': 'secretsmanager.GetSecretValue'}),
+        b'{"SecretId":"BODY-MARKER"}', host='secretsmanager.eu-west-1.amazonaws.com', target_port=443)
+    assert status == 403 and json.loads(body)['__type'] == 'AccessDeniedException', (status, body)
+    assert b'BODY-MARKER' not in body
+    status, headers, body = h2_request(port, proxy_auth, context, 'sts.amazonaws.com', aws_headers('sts', {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'}),
+        b'Action=AssumeRole&RoleSessionName=BODY-MARKER')
+    assert status == '403' and b'<Code>AccessDeniedException</Code>' in body, (status, body)
+    assert headers.get('x-amzn-errortype') == 'AccessDeniedException'
+    # An allowed operation passes the policy and only then reaches credential
+    # vending, which fails here because no Okta values exist.
+    status, headers, body = h2_request(port, proxy_auth, context, 'sts.amazonaws.com', aws_headers('sts', {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'}), b'Action=GetCallerIdentity')
+    assert status in ('403', '502') and json.loads(body)['error'] == 'secret_proxy_aws_resign_failed', (status, body)
 
 
 if __name__ == '__main__':
