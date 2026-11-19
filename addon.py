@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 from mitmproxy import http
 
+import awsops
 import sigv4
 from awscreds import AwsCredsProvider
 from googlecreds import GoogleTokenProvider
@@ -63,6 +64,8 @@ CONFIG_DIR = Path(os.environ.get("SECRET_PROXY_CONFIG_DIR", Path.home() / ".conf
 # the config-dir path as a local/dev fallback for direct addon use and tests.
 SECRETS_FILE = Path(os.environ.get("SECRET_PROXY_SECRETS_FILE", CONFIG_DIR / "secrets.json"))
 AWS_OKTA_FILE = CONFIG_DIR / "aws-okta.json"
+# Optional operator rules on top of the built-in AWS operation deny list.
+AWS_POLICY_FILE = CONFIG_DIR / "aws-policy.json"
 
 log = logging.getLogger("secret_proxy")
 # Emit only the purpose-built sanitised messages to the attached proxy terminal.
@@ -1479,6 +1482,220 @@ def _resign_presigned(flow: http.HTTPFlow) -> None:
     log.info(f"secret_proxy: {flow.request.method} {flow.request.host} - AWS presigned re-signed as {account}/{role}")
 
 
+# --- AWS operation policy --------------------------------------------------
+# Some AWS operations return a credential or secret value (GetSecretValue,
+# AssumeRole, CreateAccessKey...). Every dummy-signed request is identified and
+# checked against awsops' policy BEFORE the creds provider is touched, so a
+# denied call never causes an STS mint or a re-signature. Presigned (query-auth)
+# URLs are out of scope: they fetch objects and keep their existing behaviour.
+
+
+class AwsOperationDenied(Exception):
+    """A re-sign refused by the AWS operation policy (fixed, secret-free text)."""
+
+    def __init__(self, op, decision, account, role):
+        super().__init__(decision.reason)
+        self.op = op
+        self.decision = decision
+        self.account = account
+        self.role = role
+
+
+_aws_policy_lock = threading.Lock()
+_aws_policy_cache = None  # (signature, (policy, default_target))
+
+
+def _file_signature(path: Path):
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (info.st_mtime_ns, info.st_size, info.st_ino)
+
+
+def _read_json_object(path: Path) -> dict:
+    with open(path, "rb") as stream:
+        data = stream.read(2 * 1024 * 1024 + 1)
+    if len(data) > 2 * 1024 * 1024:
+        raise awsops.AwsPolicyError(f"{path.name}: file too large")
+    try:
+        document = json.loads(data)
+    except ValueError:
+        raise awsops.AwsPolicyError(f"{path.name}: invalid JSON") from None
+    if not isinstance(document, dict):
+        raise awsops.AwsPolicyError(f"{path.name}: expected an object")
+    return document
+
+
+def _load_aws_policy():
+    """Return (AwsOperationPolicy, (default_account, default_role)).
+
+    Reads only configuration (never a secret). Reloads when either file changes.
+    Raises awsops.AwsPolicyError for an invalid policy: callers fail closed.
+    """
+    global _aws_policy_cache
+    signature = (_file_signature(AWS_POLICY_FILE), _file_signature(AWS_OKTA_FILE),
+                 str(AWS_POLICY_FILE), str(AWS_OKTA_FILE))
+    with _aws_policy_lock:
+        if _aws_policy_cache is not None and _aws_policy_cache[0] == signature:
+            return _aws_policy_cache[1]
+        rules = ()
+        if signature[0] is not None:
+            with open(AWS_POLICY_FILE, "rb") as stream:
+                data = stream.read(2 * 1024 * 1024 + 1)
+            if len(data) > 2 * 1024 * 1024:
+                raise awsops.AwsPolicyError("aws-policy.json: file too large")
+            rules = awsops.load_policy_bytes(data)
+        overrides = ()
+        default_target = (None, None)
+        if signature[1] is not None:
+            config = _read_json_object(AWS_OKTA_FILE)
+            if "operation_overrides" in config:
+                overrides = awsops.parse_overrides(config["operation_overrides"])
+            default_target = (config.get("default_account"), config.get("default_role"))
+        result = (awsops.AwsOperationPolicy(rules, overrides), default_target)
+        _aws_policy_cache = (signature, result)
+        return result
+
+
+def aws_policy_startup_summary() -> list[str]:
+    """Load and validate the AWS operation policy; return log lines (no secrets)."""
+    policy, _default = _load_aws_policy()
+    builtin = len(awsops.DEFAULT_DENY_RULES)
+    lines = [
+        f"secret_proxy: AWS operation policy: {builtin} built-in deny rules, "
+        f"{len(policy.rules) - builtin} rules from {AWS_POLICY_FILE.name}, "
+        f"{len(policy.overrides)} role overrides"
+    ]
+    for override in policy.overrides:
+        lines.append(
+            "secret_proxy: AWS operation OVERRIDE enabled: "
+            f"{override.describe()} (bypasses deny rules for that role only)"
+        )
+    return lines
+
+
+def _aws_request_view(flow: http.HTTPFlow, body) -> "awsops.AwsRequest":
+    raw_path = flow.request.path or "/"
+    path, _, query = raw_path.partition("?")
+    headers = tuple((str(k), str(v)) for k, v in flow.request.headers.items(multi=True))
+    return awsops.AwsRequest(
+        method=flow.request.method or "",
+        host=flow.request.host or "",  # the authority: HTTP/2 has no Host header
+        path=path or "/",
+        query=query,
+        headers=headers,
+        body=body,
+    )
+
+
+def _aws_selected_target(flow: http.HTTPFlow, default_target) -> tuple:
+    """(account, role) for policy and logs; the provider still validates them."""
+    account, role = default_target
+    tok = flow.request.headers.get("x-amz-security-token", "")
+    if tok.startswith("secretrole:") and "/" in tok:
+        acct, selected = tok[len("secretrole:"):].split("/", 1)
+        if acct and selected:
+            account, role = acct, selected
+    if not isinstance(account, str) or re.fullmatch(r"[0-9]{12}", account) is None:
+        account = None
+    if not isinstance(role, str) or re.fullmatch(r"[A-Za-z0-9+=,.@_-]{1,64}", role) is None:
+        role = None
+    return account, role
+
+
+def _aws_policy_check(flow: http.HTTPFlow, body):
+    """Identify the AWS operation and enforce the policy, before any creds work.
+
+    Returns (operation, decision, account, role) when allowed; raises
+    AwsOperationDenied when denied. *body* is None when unavailable.
+    """
+    try:
+        policy, default_target = _load_aws_policy()
+    except Exception as e:  # noqa: BLE001 - an unreadable policy denies everything
+        log.error("secret_proxy: AWS operation policy unavailable (%s); denying", type(e).__name__)
+        op = awsops.AwsOperation(awsops.UNKNOWN, awsops.UNKNOWN, awsops.PROTOCOL_UNKNOWN,
+                                 "policy unavailable")
+        decision = awsops.Decision(awsops.DENY, "the AWS operation policy could not be loaded",
+                                   "policy unavailable")
+        raise AwsOperationDenied(op, decision, None, None) from None
+    account, role = _aws_selected_target(flow, default_target)
+    try:
+        op = awsops.classify(_aws_request_view(flow, body))
+    except Exception as e:  # noqa: BLE001 - never forward what we cannot identify
+        log.error("secret_proxy: AWS operation classification failed (%s)", type(e).__name__)
+        op = awsops.AwsOperation(awsops.UNKNOWN, awsops.UNKNOWN, awsops.PROTOCOL_UNKNOWN,
+                                 "classification failed")
+    if op.operation != awsops.UNKNOWN:
+        # Defence in depth: the re-signer must sign for the same service.
+        try:
+            signing = sigv4.parse_authorization(flow.request.headers.get("Authorization", ""))["service"]
+        except Exception:  # noqa: BLE001
+            signing = None
+        if signing != op.service:
+            op = awsops.AwsOperation(op.service, awsops.UNKNOWN, op.protocol,
+                                     "signing scope differs from the inspected scope")
+    decision = policy.evaluate(op, account, role)
+    who = f"{account or '-'}/{role or '-'}"
+    flow.metadata["secret_proxy_aws_operation"] = op.label
+    if not decision.allowed:
+        log.warning(
+            "secret_proxy: AWS DENY %s %s (%s; rule=%s)", who, op.label, decision.reason, decision.rule,
+        )
+        raise AwsOperationDenied(op, decision, account, role)
+    if decision.overridden:
+        log.warning("secret_proxy: AWS ALLOW (override) %s %s", who, op.label)
+    return op, decision, account, role
+
+
+def _cbor_text(value: str) -> bytes:
+    data = value.encode("utf-8")
+    n = len(data)
+    if n < 24:
+        head = bytes([0x60 | n])
+    elif n < 256:
+        head = bytes([0x78, n])
+    else:
+        head = bytes([0x79]) + n.to_bytes(2, "big")
+    return head + data
+
+
+def _aws_denied_response(flow: http.HTTPFlow, e: AwsOperationDenied) -> None:
+    """403 AccessDeniedException in the request's own protocol."""
+    op = e.op
+    message = f"secret-proxy blocked {op.label}: {e.decision.reason}"
+    code = "AccessDeniedException"
+    headers = {"x-amzn-ErrorType": code, "cache-control": "no-store"}
+    protocol = op.protocol
+    smithy = flow.request.headers.get("smithy-protocol", "").strip().lower()
+    if protocol == awsops.PROTOCOL_QUERY or (protocol == awsops.PROTOCOL_REST and op.service == "s3"):
+        from xml.sax.saxutils import escape
+        if protocol == awsops.PROTOCOL_QUERY:
+            body = (
+                "<ErrorResponse><Error><Type>Sender</Type>"
+                f"<Code>{code}</Code><Message>{escape(message)}</Message>"
+                "</Error><RequestId>secret-proxy</RequestId></ErrorResponse>"
+            )
+        else:
+            body = f"<Error><Code>{code}</Code><Message>{escape(message)}</Message></Error>"
+        headers["content-type"] = "text/xml"
+        payload = body.encode()
+    elif protocol == awsops.PROTOCOL_RPCV2 and smithy == "rpc-v2-cbor":
+        payload = b"\xa2" + _cbor_text("__type") + _cbor_text(code) + _cbor_text("message") + _cbor_text(message)
+        headers["content-type"] = "application/cbor"
+        headers["smithy-protocol"] = "rpc-v2-cbor"
+    else:
+        content_type = "application/json"
+        if protocol == awsops.PROTOCOL_JSON:
+            requested = flow.request.headers.get("content-type", "").split(";")[0].strip().lower()
+            content_type = requested if requested.startswith("application/x-amz-json-") else "application/x-amz-json-1.1"
+        elif protocol == awsops.PROTOCOL_RPCV2:
+            headers["smithy-protocol"] = "rpc-v2-json"
+        headers["content-type"] = content_type
+        payload = json.dumps({"__type": code, "message": message}).encode()
+    flow.response = http.Response.make(403, payload, headers)
+
+
 def _aws_resign_apply(flow: http.HTTPFlow, body):
     """Mint STS creds for the request's target and re-sign it. *body* is the
     payload bytes to hash when x-amz-content-sha256 is absent (non-S3); pass None
@@ -1488,11 +1705,20 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
     no creds provider is configured."""
     if not _require_https(flow):
         return None
+    # The operation decision precedes the provider, any STS mint and re-signing.
+    op, decision, policy_account, policy_role = _aws_policy_check(flow, body)
     provider = _get_aws_provider()
     if provider is None:
         log.warning(f"secret_proxy: {flow.request.host} AWS SigV4 but no creds provider (aws-okta.json missing) - passthrough")
         return None
     account, role = _aws_target(flow, provider)
+    if decision.overridden and (account, role) != (policy_account, policy_role):
+        # An override is for one exact role; never mint for any other target.
+        denied = awsops.Decision(awsops.DENY, "the role override does not match the signing target",
+                                 "operation_overrides")
+        log.warning("secret_proxy: AWS DENY %s/%s %s (%s)", policy_account or "-", policy_role or "-",
+                    op.label, denied.reason)
+        raise AwsOperationDenied(op, denied, policy_account, policy_role)
     creds = provider.get_creds(account, role)
     parts = urlsplit(flow.request.url)
     headers_lower = {k.lower(): v for k, v in flow.request.headers.items()}
@@ -1515,6 +1741,9 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
 
 
 def _aws_error(flow: http.HTTPFlow, e: Exception) -> None:
+    if isinstance(e, AwsOperationDenied):
+        _aws_denied_response(flow, e)
+        return
     # AwsCredsError carries a fixed, secret-free reason. Credential-vending
     # failures answer 403 rather than 502: AWS SDKs retry 5xx, and each retry
     # used to be another Okta login attempt towards a lockout.
@@ -1582,7 +1811,24 @@ def _requestheaders_locked(flow: http.HTTPFlow) -> None:
         )
         return
     must_finish_now = bool(incoming_stream or is_aws_presigned)
-    if is_aws_sigv4 and flow.request.headers.get("x-amz-content-sha256") is not None:
+    payload_hash = flow.request.headers.get("x-amz-content-sha256")
+    # Operations named in the body (awsQuery Action, SSM WithDecryption) need a
+    # bounded look at it before the policy can allow them. A small, non-chunked
+    # request is left to the buffered hook, which re-signs over the same
+    # x-amz-content-sha256. Signed aws-chunked uploads are REST and decided on
+    # method, path and headers alone; they are never buffered here.
+    defer_for_body = False
+    if (
+        is_aws_ours
+        and payload_hash is not None
+        and not incoming_stream
+        and not payload_hash.upper().startswith("STREAMING-")
+    ):
+        try:
+            defer_for_body = awsops.classify(_aws_request_view(flow, None)).needs_body
+        except Exception:  # noqa: BLE001 - the policy check below denies it
+            defer_for_body = False
+    if is_aws_sigv4 and payload_hash is not None and not defer_for_body:
         must_finish_now = True
 
     if must_finish_now and _metadata_has_secret_reference(flow):
@@ -1608,10 +1854,9 @@ def _requestheaders_locked(flow: http.HTTPFlow) -> None:
         return
     if not is_aws_ours:
         return
+    if payload_hash is None or defer_for_body:
+        return  # need the body (hash or operation) -> buffered resign in request()
     try:
-        payload_hash = flow.request.headers.get("x-amz-content-sha256")
-        if payload_hash is None:
-            return  # non-S3: need the body to hash -> buffered resign in request()
         res = _aws_resign_apply(flow, None)
     except Exception as e:  # noqa: BLE001
         _restore_metadata_snapshot(flow)
@@ -1626,7 +1871,7 @@ def _requestheaders_locked(flow: http.HTTPFlow) -> None:
         flow.request.stream = _modify
     else:
         flow.request.stream = True  # seed already re-signed; stream body unchanged
-    log.info(f"secret_proxy: {flow.request.method} {flow.request.host} - AWS re-signed (streaming) as {flow.metadata.get('secret_proxy_aws')}")
+    log.info(f"secret_proxy: {flow.request.method} {flow.request.host} - AWS re-signed (streaming) as {flow.metadata.get('secret_proxy_aws')} {flow.metadata.get('secret_proxy_aws_operation', '')}")
 
 
 def requestheaders(flow: http.HTTPFlow) -> None:
@@ -1646,4 +1891,4 @@ def _resign_aws(flow: http.HTTPFlow) -> None:
     if res["reframer"] is not None and body:
         rf = res["reframer"]
         flow.request.raw_content = rf.feed(body) + rf.done()
-    log.info(f"secret_proxy: {flow.request.method} {flow.request.host} - AWS re-signed (buffered) as {flow.metadata.get('secret_proxy_aws')}")
+    log.info(f"secret_proxy: {flow.request.method} {flow.request.host} - AWS re-signed (buffered) as {flow.metadata.get('secret_proxy_aws')} {flow.metadata.get('secret_proxy_aws_operation', '')}")

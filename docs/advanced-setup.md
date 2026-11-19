@@ -13,6 +13,10 @@ Supply a private directory containing:
   fictional/public example identities.
 - Optional `aws-okta.json`: explicit approved `okta_hosts`, SAML app URLs,
   default account/role and role allowlists. No organisational defaults exist.
+  Optional `operation_overrides` allow named AWS operations for one exact role.
+- Optional `aws-policy.json`: extra AWS operation deny rules and allow lists on
+  top of the built-in deny list. See [AWS operation policy](operations.md#aws-operation-policy)
+  and `examples/aws-policy.json`.
 - `checkmarxRealm` in the manifest when enabling Checkmarx.
 - Optional `upstream-ca.pem`: corporate trust roots. Used as a build secret and
   as an external runtime trust input, never baked into the image.

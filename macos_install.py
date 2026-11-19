@@ -17,16 +17,19 @@ import sys
 import tempfile
 
 from awscreds import AwsCredsProvider
+from awsops import AwsPolicyError, load_policy_bytes
 from client import private_read, validate_config
 from host import Deployment, HostError, PODMAN, PYTHON, ROOT, SA_HOME, SHARED_ROOT
 from secretstore import SecretManifest
 
 GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
-         'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'googlecreds.py',
+         'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'sealedjwt.py',
          'gitsign.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
          'manage.py', 'secret-proxy')
+# Private policy copied into the instance (bootstrap metadata stays desktop-side).
+POLICY_FILES = ('manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem')
 
 
 def root_owned(path: Path):
@@ -106,7 +109,7 @@ def validate_source_config(source: Path):
     if source.is_symlink():
         raise HostError('Refusing a symlinked configuration directory')
     for path in source.iterdir():
-        if path.name not in {'manifest.json', 'aws-okta.json', 'upstream-ca.pem', 'bootstrap.json', 'client-environment.json', 'network.json'}:
+        if path.name not in {'manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem', 'bootstrap.json', 'client-environment.json', 'network.json'}:
             raise HostError('Unexpected private configuration file')
         if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
             raise HostError('Invalid private configuration file')
@@ -117,6 +120,11 @@ def validate_source_config(source: Path):
         SecretManifest.load(manifest)
     if 'aws-okta.json' in contents:
         AwsCredsProvider._validate_config(json.loads(contents['aws-okta.json']))
+    if 'aws-policy.json' in contents:
+        try:
+            load_policy_bytes(contents['aws-policy.json'])
+        except AwsPolicyError as error:
+            raise HostError('Invalid AWS operation policy: ' + str(error)) from None
     return contents
 
 
@@ -166,7 +174,7 @@ def install(args):
                 or json.loads(private_read(deployment.shared / 'client.json', 65536)) != client):
             raise HostError('Existing instance differs; choose a new candidate name (no implicit overwrite)')
         actual = {p.name: private_read(p, 2 * 1024 * 1024) for p in (deployment.private / 'config').iterdir()}
-        expected = {name: value for name, value in contents.items() if name in ('manifest.json', 'aws-okta.json', 'upstream-ca.pem')}
+        expected = {name: value for name, value in contents.items() if name in POLICY_FILES}
         if actual != expected:
             raise HostError('Existing private policy differs; no implicit overwrite')
     release = ROOT / 'releases' / args.commit
@@ -199,7 +207,7 @@ def install(args):
     config.mkdir(mode=0o755, exist_ok=True)
     os.chown(config, 0, account.pw_gid)
     config.chmod(0o755)  # The private parent remains 0700.
-    for name in ('manifest.json', 'aws-okta.json', 'upstream-ca.pem'):
+    for name in POLICY_FILES:
         if name in contents:
             (config / name).write_bytes(contents[name])
             os.chown(config / name, 0, account.pw_gid)

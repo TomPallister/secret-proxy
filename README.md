@@ -56,7 +56,9 @@ than assuming that closing its terminal stopped it.
 
 - API keys in headers, query parameters, forms and HTTP Basic authentication.
 - Proxy-managed OAuth for supported services, including ChatGPT/Codex.
-- AWS request signing using Okta/SAML credentials.
+- AWS request signing using Okta/SAML credentials. Calls that return
+  credentials or secrets (`GetSecretValue`, `AssumeRole`, `CreateAccessKey`…)
+  are refused by default; see the [AWS operation policy](docs/operations.md#aws-operation-policy).
 - Git commit/tag signing without handing the client a private key.
 
 Each integration needs an explicit policy defining **where** its credential may
@@ -66,8 +68,8 @@ it does not enable every integration automatically.
 ## What it does not promise
 
 A client can still **use the access you grant it**. This protects proxy-held
-credentials; it does not prevent every allowed API from returning or creating
-other credentials. It is not a sandbox for arbitrary malicious software.
+credentials; apart from the AWS deny list, it does not prevent allowed APIs from
+returning or creating other credentials. It is not a sandbox for arbitrary malicious software.
 
 The Mac installer puts the proxy in a separate non-admin account and VM.
 Root/admin access and your private policy remain trusted. Applications must

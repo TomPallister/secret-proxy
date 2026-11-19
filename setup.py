@@ -132,7 +132,10 @@ def install(base, instance, port, agent_dir):
             raise SetupError('Existing installation, CLI settings or command found. Nothing changed; see docs/operations.md.')
     if base.is_symlink():
         raise SetupError('Refusing a symlinked settings directory.')
-    contents = validate_source_config(base / 'config')
+    try:
+        contents = validate_source_config(base / 'config')
+    except HostError as error:  # fixed text, e.g. an invalid aws-policy.json rule
+        raise SetupError(str(error)) from None
     bootstrap = json.loads(contents['bootstrap.json'])
     validate_bootstrap_config(bootstrap)
     if json.loads(contents['manifest.json'])['account']['vault'] != bootstrap['runtimeVault']:

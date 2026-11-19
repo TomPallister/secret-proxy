@@ -68,8 +68,19 @@ def load(loader) -> None:
         # AddonManager deliberately propagates OptionsError from load hooks;
         # a normal Exception would only be logged and startup would continue.
         raise OptionsError(message) from error
+    try:
+        # Built-in AWS deny list + optional aws-policy.json + role overrides.
+        # Overrides are logged here so they are visible at every start.
+        policy_lines = addon.aws_policy_startup_summary()
+    except Exception as error:
+        message = "secret_proxy: invalid AWS operation policy; refusing to start"
+        detail = str(error) if isinstance(error, addon.awsops.AwsPolicyError) else type(error).__name__
+        addon.log.error("%s (%s)", message, detail)
+        raise OptionsError(message) from error
     ctx.options.update(allow_hosts=patterns)
     addon.log.info("secret_proxy: intercepting %d configured host patterns", len(patterns))
+    for line in policy_lines:
+        addon.log.info("%s", line)
 
 
 async def request(flow) -> None:

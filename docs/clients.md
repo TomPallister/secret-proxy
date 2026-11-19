@@ -61,6 +61,9 @@ using this project.
 
 Other OAuth services, AWS and Git signing also need their matching private policy
 and client configuration. See [advanced configuration](advanced-setup.md).
+AWS calls that return credentials or secrets, such as `secretsmanager
+get-secret-value`, are refused with `AccessDeniedException` from secret-proxy;
+see the [AWS operation policy](operations.md#aws-operation-policy).
 
 ## Low-level client interface
 

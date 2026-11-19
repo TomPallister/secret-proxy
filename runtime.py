@@ -26,6 +26,7 @@ import time
 
 from secretstore import SecretManifest
 from awscreds import AwsCredsProvider
+from awsops import AwsPolicyError, load_policy_bytes
 
 MAX_BOOTSTRAP = 16384
 
@@ -107,6 +108,16 @@ def configure_aws(config: Path, target: Path) -> None:
         raise ValueError("saml2aws configuration failed")
 
 
+def validate_aws_policy(config: Path) -> None:
+    """Refuse to start with an invalid optional aws-policy.json."""
+    path = config / "aws-policy.json"
+    if path.exists():
+        data = path.read_bytes()
+        if len(data) > 2 * 1024 * 1024:
+            raise AwsPolicyError("aws-policy.json: file too large")
+        load_policy_bytes(data)
+
+
 def wait_ready(child, port: int, capability: str, instance: str, ca: Path, timeout: float = 30) -> dict:
     deadline = time.monotonic() + timeout
     expected = {"status": "ready", "instance": instance}
@@ -178,6 +189,7 @@ def main():
     if aws.exists():
         # Validate before credentials are consumed; never mint during validation.
         AwsCredsProvider.from_config_file(str(aws), lambda _: (_ for _ in ()).throw(AssertionError()))
+    validate_aws_policy(config)
     capabilities = read_bootstrap(sys.stdin.fileno())
     os.umask(0o077)
     args.state_dir.mkdir(parents=True, exist_ok=True)
@@ -226,5 +238,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         # Provider/JSON errors must not echo any capability or callback content.
-        print("secret-proxy runtime failed: " + type(error).__name__, file=sys.stderr)
+        # AWS policy errors are fixed configuration text (field positions only).
+        detail = str(error) if isinstance(error, AwsPolicyError) else type(error).__name__
+        print("secret-proxy runtime failed: " + detail, file=sys.stderr)
         sys.exit(1)

@@ -43,6 +43,80 @@ use this development tool. If authentication breaks during normal use, check
 for diagnosis, not a release checklist. Never dump tokens or process memory to
 investigate a failure.
 
+## AWS operation policy
+
+Some AWS calls send a credential or a secret value back to the caller. The proxy
+checks every AWS request that carries its dummy credentials **before** it mints
+or uses STS credentials, and refuses these by default:
+
+| Service | Denied operations |
+|---|---|
+| `secretsmanager` | `GetSecretValue`, `BatchGetSecretValue` |
+| `ssm` | `GetParameter`, `GetParameters`, `GetParametersByPath`, `GetParameterHistory`, only when `WithDecryption` is true |
+| `iam` | `CreateAccessKey`, `CreateServiceSpecificCredential`, `ResetServiceSpecificCredential` |
+| `sts` | `Assume*` and `Get*Token` (for example `AssumeRole`, `GetSessionToken`, `GetFederationToken`) |
+| `ecr`, `ecr-public`, `codeartifact` | `GetAuthorizationToken` |
+| `lambda` | `GetFunction`, `GetFunctionConfiguration`, `ListFunctions`, `ListVersionsByFunction` (they return environment variables) |
+| `kms` | `Decrypt`, `DeriveSharedSecret` |
+| any | `Unknown` |
+
+`sts get-caller-identity`, S3, `ssm get-parameter` without decryption and other
+calls are unaffected. This is a **new default**: it applies even with no policy
+file. Terraform plans that read Lambda functions now need an override.
+
+The operation comes from the request itself: `X-Amz-Target` (JSON protocols), the
+`Action` form or query value (Query protocols), the `/service/…/operation/…` path
+(RPC v2) or the method and path (REST, Lambda and CodeArtifact only; other REST
+requests are `Unclassified`). The service comes from the signature's credential
+scope and must match the host. Anything missing, duplicated, conflicting,
+encoded, non-UTF-8, over 16 MiB when the body is needed, or carrying more than one
+protocol's operation field is `Unknown`, and is denied.
+
+A denied call gets HTTP 403 with code `AccessDeniedException` and a message such
+as `secret-proxy blocked sts:AssumeRole: …`, in the protocol's own JSON, XML or
+CBOR shape. The proxy terminal shows one line with the account, role, service,
+operation and decision. Bodies and responses are never logged. Presigned URLs are
+out of scope and behave as before.
+
+### Optional `aws-policy.json`
+
+Add rules next to the manifest. The built-in deny list always applies; the file can
+add deny rules and per-service allow lists, never remove a built-in rule:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {"action": "deny", "service": "dynamodb", "operations": ["Scan"]},
+    {"action": "allow", "service": "ec2", "operations": ["Describe*"]}
+  ]
+}
+```
+
+`service` is a lower-case glob over `[a-z0-9-*?]`; `operations` are globs over
+`[A-Za-z0-9_*?]`, matched without regard to case. Once a service has an allow
+rule, its other operations (including `Unknown` and `Unclassified`) are denied.
+An invalid file stops the proxy from starting and names the bad rule. See
+`examples/aws-policy.json`.
+
+### Overrides for one role
+
+For a genuine need, allow specific operations for **one exact account and role**
+in `aws-okta.json`:
+
+```json
+"operation_overrides": [
+  {"account": "123456789012", "role": "Deployer", "service": "secretsmanager",
+   "operations": ["GetSecretValue"], "comment": "release tooling"}
+]
+```
+
+There are none by default. Each override is printed at start-up and each use logs
+`AWS ALLOW (override)`. Any client that can select that role can use it, so give
+the exception its own role with narrow upstream permissions. Adding or changing
+either file is a private policy change: the installer refuses to overwrite an
+existing instance's policy, as for any other policy file.
+
 ## Upgrade without changing the trust boundary
 
 - Verify the exact new signed source and its audit before installing. The

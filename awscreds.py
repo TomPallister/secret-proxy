@@ -12,7 +12,9 @@ Config (dict, from $SECRET_PROXY_CONFIG_DIR/aws-okta.json):
   default_app_url,
   account_app_urls (per-account Okta SAML app overrides),
   allowed_roles (global role allow-list),
-  account_role_overrides (per-account role allow-list overrides)
+  account_role_overrides (per-account role allow-list overrides),
+  operation_overrides (explicit per-role exceptions to the AWS operation
+    deny list; see awsops.py and docs/operations.md)
 
 Secrets are resolved via an injected ``get_secret(name) -> secret`` callable
 (addon.py's resolver). Nothing is logged.
@@ -34,6 +36,8 @@ import threading
 import time
 from typing import Callable
 from urllib.parse import urlsplit
+
+from awsops import AwsPolicyError, parse_overrides
 
 log = logging.getLogger("secret_proxy.awscreds")
 
@@ -223,6 +227,13 @@ class AwsCredsProvider:
 
         if "allowed_roles" in config:
             cls._validate_role_list("allowed_roles", config["allowed_roles"])
+
+        if "operation_overrides" in config:
+            # Explicit per-role exceptions to the AWS operation deny list.
+            try:
+                parse_overrides(config["operation_overrides"])
+            except AwsPolicyError as exc:
+                raise AwsCredsError(f"invalid {exc}") from None
 
         if "account_role_overrides" in config:
             overrides = config["account_role_overrides"]

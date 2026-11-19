@@ -12,7 +12,11 @@ engineering evidence, not a penetration test or a security certification.
   methods, paths and field names. An internal-only value cannot be obtained by
   presenting its name to the URL-rewrite sentinel.
 - AWS credentials are minted and requests re-signed inside the proxy, constrained
-  by explicit account/role policy. Git signing returns a signature, not the key.
+  by explicit account/role policy. Before minting, each request's operation is
+  identified and checked; AWS operations that return credentials or secret values
+  (Secrets Manager, SSM decryption, IAM keys, STS, registry tokens, Lambda
+  configuration, KMS Decrypt) and unidentifiable requests are refused by default.
+  Git signing returns a signature, not the key.
 - Client readiness uses authenticated TLS and an exact per-boot nonce. A stale
   readiness file must not silently select an old or unauthenticated service.
 - Bootstrap capabilities use bounded stdin rather than command arguments. Provider
@@ -26,11 +30,14 @@ engineering evidence, not a penetration test or a security certification.
 - **Use of access.** An authorised or compromised client can perform operations
   that its configured credentials and upstream account permit. This is not a
   per-human authorisation system or a general read-only API gateway.
-- **Credentials returned by upstream APIs.** For example, AWS credential/key
-  creation or secret-reading operations can return sensitive values. AWS signing
-  has an account/role guard, not an AWS-action filter. Secret/key-creating vendor
-  APIs are not comprehensively blocked. Narrow upstream permissions and external
-  policy accordingly; injection-only does not imply response-data loss prevention.
+- **Credentials returned by upstream APIs.** The AWS deny list covers the
+  common credential-returning operations, not every one: other AWS responses can
+  still hold sensitive values (for example CloudFormation parameters or data a
+  role can read), REST services other than Lambda/CodeArtifact are not named
+  operation by operation, and presigned URLs are not checked. A role override
+  applies to any client that can select that role. Non-AWS vendor APIs that
+  return or create keys are not blocked. Narrow upstream permissions and external
+  policy accordingly; this is not response-data loss prevention.
 - **All host traffic.** The host client supplies command-scoped proxy variables;
   a program can ignore them. Selective TLS interception is not an egress firewall.
   A development container's no-direct-egress network is an external consumer

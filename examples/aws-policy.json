@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "action": "deny",
+      "service": "dynamodb",
+      "operations": ["Scan", "BatchGetItem"],
+      "comment": "Extra deny rules apply on top of the built-in deny list, which cannot be removed here."
+    },
+    {
+      "action": "allow",
+      "service": "ec2",
+      "operations": ["Describe*", "GetConsoleOutput"],
+      "comment": "An allow rule turns this service into allow-list mode: other ec2 operations are denied."
+    }
+  ]
+}
