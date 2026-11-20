@@ -10,7 +10,8 @@ launcher configuration. Bootstrap metadata is not a service-account token.
 1. `secret-proxy start` prepares the image before desktop approval. Keep its
    terminal attached. A ready instance is left alone.
 2. In another terminal, `secret-proxy login chatgpt` starts proxy-owned PKCE. Paste the
-   full callback only into its hidden prompt. No usable OAuth token is saved.
+   full callback only into its hidden prompt. The client saves only a sealed
+   record; optional proxy-side persistence is described below.
    For GitHub Copilot, run `secret-proxy login github-copilot`: open the URL it
    prints and enter the code. The proxy waits for GitHub, so leave it running.
    `secret-proxy login github` works the same way for the GitHub CLI.
@@ -38,9 +39,10 @@ done. The first use of a login, or the first `auth-status` for it, restores it:
 - gh: the stored token is used as it is.
 
 Restore runs once per start, and the proxy never polls the vault: it reads the
-vault on restore and writes it on login, logout and each ChatGPT rotation. That
-stays within 1Password's service-account limits. If something fails, the proxy
-logs a fixed message (never a value) and carries on:
+vault on restore and writes it on login, logout and each ChatGPT rotation.
+Those operations consume the service account's request quota; configure limits
+for your usage rather than assuming the vault is never rate-limited. If something
+fails, the proxy logs a fixed message (never a value) and carries on:
 
 | Message | What it means |
 | --- | --- |
@@ -61,7 +63,11 @@ the running proxy and deletes its stored item. It needs the login's grant and th
 current boot nonce, so it never acts on a restarted proxy. If the delete fails,
 it says so; the proxy stays signed out and retries the delete on later use. Sealed
 references saved by clients stay in their files but stop working until the next
-login. 1Password keeps deleted items in Recently Deleted for 30 days.
+login. Logout does not revoke tokens at OpenAI/GitHub; revoke upstream access
+separately if that is your intent. 1Password keeps deleted items in Recently
+Deleted for 30 days. If a delete remains pending when the proxy stops, its next
+start can still find the old item; confirm the delete succeeded before relying
+on logout to persist across restarts.
 
 ## Scoped client tokens
 
@@ -105,9 +111,10 @@ checks the response against the current boot nonce. The output contains only:
   refresh and the expiry-minus-120-seconds threshold that triggered it.
 
 No tokens, account IDs, identity claims or upstream error bodies are returned.
-Status does not fetch a secret, perform a token exchange, move the clock, force
-refresh or keep an idle login alive. Login resets these counters; a process
-restart resets all in-memory state. `loggedIn` is not an upstream liveness probe.
+Without a login store, status does not fetch a secret, perform a token exchange,
+move the clock, force refresh or keep an idle login alive. Login resets these
+counters; a process restart resets all in-memory state. `loggedIn` is not an
+upstream liveness probe.
 
 With a [login store](#stored-logins), every login's status also has `stored`
 (the login vault holds this login, as of the last read or write) and
@@ -118,7 +125,8 @@ and Copilot is one token request.
 `secret-proxy auth-status github-copilot` reads `/github-copilot/status` the same
 way. It returns `instance`, `loggedIn`, `expiresAt` (the Copilot token's expiry),
 `refreshCount` (refreshes since the last login, done by the proxy before
-`refresh_in`) and `lastRefreshAt`. It never refreshes or returns a token.
+`refresh_in`) and `lastRefreshAt`. It never returns a usable token; with a login
+store it can mint the initial Copilot session as part of restoration.
 `secret-proxy auth-status github` returns only `instance`, `loggedIn` and the
 `scopes` GitHub granted to the gh login.
 
@@ -210,7 +218,9 @@ check, add an override in `aws-okta.json`:
 
 There are none by default. Each override is printed at start-up and each use logs
 `AWS ALLOW (override)`. Any client that can select that role can use it, so give
-the exception its own role with narrow upstream permissions. Adding or changing
+the exception its own role with narrow upstream permissions. An override never
+waives the built-in signing-service/host verification, even for `Unknown` or
+wildcard operations. Adding or changing
 either file is a private policy change: the installer refuses to overwrite an
 existing instance's policy, as for any other policy file.
 

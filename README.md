@@ -2,100 +2,96 @@
 
 **Let tools use your API keys without giving them the keys.**
 
-Your app sends a placeholder such as `secretref:GITHUB_TOKEN`. The proxy reads
-the real value from 1Password and adds it to the request on its way to GitHub.
-The app never needs the stored token.
+Your app sends a credential reference. The proxy reads the real value from
+1Password and adds it on the way to the allowed API. The app never needs the token.
 
 ```text
-Your app → placeholder → secret-proxy → real credential → allowed API
+Your app → reference → secret-proxy → real credential → allowed API
 ```
 
-Useful for AI coding agents and development tools. It works with host applications
-as well as containers; you do not need a containerised development environment.
+Works with host applications and containers, including AI coding agents.
 
 ## Get started
 
 The supported installer is for **Apple silicon macOS**, using Podman and
 **1Password with service-account support**. This is a personal-development
-tool and an early testing release, not a production service.
+and early testing release, not a production service.
 
 **[Follow the setup guide →](docs/setup.md)**
-
-The first-time setup has three parts:
 
 1. Create a small 1Password vault and a read-only service account.
 2. Run `./setup.sh init` to generate configuration, then `./setup.sh install`.
 3. Run `secret-proxy start` and try the read-only GitHub example.
 
-Setup asks for **names, not tokens**. Real credentials stay in 1Password.
-It does not start anything automatically or replace an existing installation.
+Setup asks for **names, not tokens**. It does not start anything automatically
+or replace an existing installation.
 
 ## Everyday use
 
 ```sh
-# Terminal 1 — keep this open
-secret-proxy start
-
-# Terminal 2
-secret-proxy status
+secret-proxy start                 # terminal 1: keep attached
+secret-proxy status                # terminal 2: authenticated readiness
 secret-proxy run -- your-command
-
-# When finished
-secret-proxy stop
+secret-proxy login chatgpt         # optional: first Codex login or recovery
+secret-proxy auth-status chatgpt
+secret-proxy stop                  # deliberate stop, not closing a terminal
 ```
 
-For **ChatGPT/Codex in Pi**, run `secret-proxy login chatgpt` after starting the proxy.
-Follow the browser instructions and paste the callback into the terminal's
-hidden prompt. By default you log in again after a restart: tokens stay in memory.
-An opt-in [login vault](docs/advanced-setup.md#login-store) keeps them across restarts.
+`login`, `auth-status` and `logout` require a provider: `chatgpt`,
+`github-copilot` or `github`. For ChatGPT/Codex, paste the browser callback only
+into the hidden terminal prompt. GitHub logins use a device code. Pi receives
+sealed records; gh receives a reference in `GH_TOKEN`, never the real token.
+Each integration must be enabled in your policy. API reads, GraphQL and Git
+clone/push require their own placements; login does not grant them automatically.
 
-For **GitHub Copilot in Pi**, enable it in your manifest and run
-`secret-proxy login github-copilot`. You approve a code on GitHub; the proxy
-keeps the GitHub and Copilot tokens in memory and Pi gets only references.
-`secret-proxy login github` does the same for the GitHub CLI (`gh`): gh gets
-a reference in `GH_TOKEN`, and the proxy adds the real token where your policy
-allows.
+By default, proxy-owned logins are memory-only and need login after restart.
+The optional [login vault](docs/advanced-setup.md#login-store) is **separate and
+read/write**; the secrets vault stays read-only. It holds ChatGPT's rotating
+refresh token and the GitHub tokens for Copilot/gh, not short-lived access/session
+tokens. First use (including `auth-status`) can restore a saved login.
 
-The proxy does not run as a background service. Use `stop` explicitly rather
-than assuming that closing its terminal stopped it.
+`secret-proxy logout github` clears that proxy login and deletes its saved item,
+if configured; it does not revoke upstream access. Check reported save/delete
+failures before stopping; see [stored logins](docs/operations.md#stored-logins).
+The proxy is foreground, not a background service; use `stop` explicitly.
 
-macOS Go tools such as `gh` ignore `SSL_CERT_FILE`. With a name-constrained CA
-(the setup default), `secret-proxy trust-ca` trusts it for your configured hosts
-only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
+macOS Go tools such as gh ignore `SSL_CERT_FILE`. With a name-constrained CA
+(the setup default), `secret-proxy trust-ca` adds it to your login keychain;
+`secret-proxy untrust-ca` undoes that. Review the permitted DNS subtrees first:
+wildcard rules can broaden constraints beyond individual request placements.
+See [client compatibility](docs/clients.md); never disable TLS verification.
 
-## What it supports
+## Features and policy
 
-- API keys in headers, query parameters, forms and HTTP Basic authentication.
-- Proxy-managed OAuth for supported services, including ChatGPT/Codex and GitHub Copilot.
-- AWS request signing using Okta/SAML credentials. `aws-policy.json` decides which
-  AWS calls are refused; the starter file blocks Secrets Manager reads and
-  decrypted Parameter Store `SecureString` values ([details](docs/operations.md#aws-operation-policy)).
-- Git commit/tag signing without handing the client a private key.
-- Optional [scoped clients](docs/advanced-setup.md#scoped-clients): separate
-  tokens that may use only the secrets, AWS roles and logins they are granted.
-- Refusing proxied connections to metadata, loopback and private addresses,
-  with an optional host allow/deny list ([egress controls](docs/advanced-setup.md#egress-controls)).
-- Optional [approval rules](docs/advanced-setup.md#approval-rules) (`secret-proxy approvals`) and a signed [audit log](docs/advanced-setup.md#audit-log).
+| Feature | Configuration and limits |
+| --- | --- |
+| API-key injection | Headers, queries, forms, Basic auth and URL rewrites; exact placement rules |
+| Proxy-owned OAuth | Supported derived-token services, ChatGPT/Codex, GitHub Copilot and gh |
+| Login persistence | Optional separate [read/write login vault](docs/advanced-setup.md#login-store) |
+| AWS signing and filtering | Okta/SAML; [aws-policy.json](docs/operations.md#aws-operation-policy) starter blocks Secrets Manager reads and decrypted SSM SecureString responses |
+| Git signing | Commit/tag signatures without handing clients a private key |
+| Scoped clients | Separate tokens and [grants](docs/advanced-setup.md#scoped-clients) for secrets, AWS roles, signing and logins |
+| Egress checks | Metadata/private-address refusal; optional [host allow/deny lists](docs/advanced-setup.md#egress-controls) |
+| Operator approvals | [Once/session decisions](docs/advanced-setup.md#approval-rules); deny without a listener or on timeout, never widen client grants |
+| Audit log | Optional [hash-chained decisions](docs/advanced-setup.md#audit-log), retention and signed seals with a configured key; active tail remains unsigned until sealed |
+| macOS CA trust | Explicit trust/untrust for the name-constrained CA, not unrestricted host trust |
 
-Each integration needs an explicit policy defining **where** its credential may
-be used. The starter setup includes read-only GitHub and optional ChatGPT/Codex;
-it does not enable every integration automatically.
+The starter enables read-only GitHub and optional ChatGPT/Codex, not every
+integration. Configuration changes require deliberate installation/restart;
+editing a source manifest is not deployment. No automatic lifecycle changes.
 
-## What it does not promise
+## Security boundaries
 
-A client can still **use the access you grant it**. This protects proxy-held
-credentials; apart from the AWS rules in `aws-policy.json`, it does not prevent
-allowed APIs from returning or creating other credentials. It is not a sandbox for arbitrary malicious software.
+A client can still **use the access you grant it**. Apart from the AWS policy,
+allowed APIs may return or create other credentials. This is not a sandbox for
+arbitrary malicious software, and the audit log is not a complete traffic log.
 
-The Mac installer puts the proxy in a separate non-admin account and VM.
-Root/admin access and your private policy remain trusted. Applications must
-honour the proxy and certificate settings; not every application does.
+The Mac installer uses a separate non-admin account and VM. Root/admin access
+and private policy remain trusted. Applications must honour proxy/trust settings;
+not every application does. Read [SECURITY.md](SECURITY.md) and the known
+[dependency issues](docs/dependency-audit.md) before deciding whether it fits.
 
-Known dependency issues remain documented for this testing release.
-Read [security boundaries](SECURITY.md) and [dependency notes](docs/dependency-audit.md)
-before deciding whether it fits your needs.
-
-## More detail
+## Guides
 
 - [Setup and first request](docs/setup.md)
 - [Connecting Pi and other applications](docs/clients.md)
@@ -105,6 +101,5 @@ before deciding whether it fits your needs.
 
 ## Licence
 
-[Apache-2.0](LICENSE) for this project's source. Third-party tools retain their
-own licences. Releases are source-only; see [third-party licensing](docs/licensing-review.md)
-before redistributing built images.
+[Apache-2.0](LICENSE) for first-party source. Releases are source-only;
+[third-party licences](docs/licensing-review.md) still apply to built images.
