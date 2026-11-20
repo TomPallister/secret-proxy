@@ -30,6 +30,7 @@ from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
 from egress import EgressConfigError
 from capolicy import CAPolicyError
+from audit import AuditConfigError
 
 MAX_BOOTSTRAP = 16384
 
@@ -103,7 +104,8 @@ def htpasswd(capabilities: dict, named_clients) -> str:
                    for user, token in lines)
 
 
-def command(config: Path, state: Path, auth: Path, port: int, capabilities: dict):
+def command(config: Path, state: Path, auth: Path, port: int, capabilities: dict,
+            audit_dir: Path = Path("/data/audit")):
     """Build a fixed launch contract; secrets are confined to the child env."""
     root = Path(__file__).resolve().parent
     mitmdump = root / ".venv/bin/mitmdump"
@@ -121,6 +123,9 @@ def command(config: Path, state: Path, auth: Path, port: int, capabilities: dict
         "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
         "OP_SERVICE_ACCOUNT_TOKEN": capabilities["op_token"],
         "SECRET_PROXY_INSTANCE_ID": secrets.token_hex(16),
+        # Used only when the manifest enables the audit log: the proxy's own
+        # persistent volume, never /config and never a client-shared directory.
+        "SECRET_PROXY_AUDIT_DIR": str(audit_dir),
     }
     if capabilities.get("approver_token"):
         # Only a digest: the proxy can check an answer but not make one.
@@ -218,6 +223,7 @@ def main():
     parser.add_argument("--config-dir", type=Path, default=Path("/config"))
     parser.add_argument("--state-dir", type=Path, default=Path("/data/mitmproxy"))
     parser.add_argument("--runtime-dir", type=Path, default=Path("/tmp/secret-proxy"))
+    parser.add_argument("--audit-dir", type=Path, default=Path("/data/audit"))
     parser.add_argument("--port", type=int, default=10256)
     parser.add_argument("--required-interface")
     parser.add_argument("--ca-label", default=os.environ.get("SECRET_PROXY_CA_LABEL"),
@@ -251,7 +257,8 @@ def main():
         auth = Path(tmp) / "htpasswd"
         auth.write_text(htpasswd(capabilities, named_clients))
         auth.chmod(0o600)
-        argv, env = command(config, args.state_dir.resolve(), auth, args.port, capabilities)
+        argv, env = command(config, args.state_dir.resolve(), auth, args.port, capabilities,
+                            args.audit_dir)
         if aws.exists():
             saml_config = Path(tmp) / "saml2aws.ini"
             configure_aws(aws, saml_config)
@@ -292,7 +299,7 @@ if __name__ == "__main__":
         # Provider/JSON errors must not echo any capability or callback content.
         # AWS policy, egress, CA policy and client errors contain only policy text, so show them.
         detail = (str(error) if isinstance(error, (AwsPolicyError, EgressConfigError, CAPolicyError,
-                                                   clientgrants.ClientConfigError))
+                                                   clientgrants.ClientConfigError, AuditConfigError))
                   else type(error).__name__)
         print("secret-proxy runtime failed: " + detail, file=sys.stderr)
         sys.exit(1)

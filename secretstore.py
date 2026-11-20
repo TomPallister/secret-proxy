@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Mapping, Protocol
 
 import approvals
+import audit
 from egress import EgressPolicy
 import clientgrants
 
@@ -144,7 +145,7 @@ class SecretManifest:
         provider = "1password"
         with open(path) as f:
             data = json.load(f, object_pairs_hook=_unique_object)
-        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients", "approvals"}:
+        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients", "approvals", "audit"}:
             raise ValueError("invalid manifest root")
         if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 3:
             raise ValueError("schemaVersion must be exactly integer 3")
@@ -454,6 +455,9 @@ class SecretManifest:
         # Optional; absent means one default client with every grant (today's
         # behaviour). Raises ClientConfigError, a ValueError.
         manifest.clients = clientgrants.parse_clients(data.get("clients"), secrets, enabled_logins)
+        # Optional and off by default: None means nothing is ever written.
+        # Raises AuditConfigError, a ValueError.
+        manifest.audit = audit.parse_settings(data.get("audit"), secrets)
         return manifest
 
     def egress_policy(self) -> EgressPolicy:

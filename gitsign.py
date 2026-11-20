@@ -11,6 +11,9 @@ Only Ed25519 keys are supported, and only git commit and tag objects are
 signed: the payload must look like one, so the container cannot use the proxy
 to sign arbitrary data, and the signature's ``git`` namespace stops it being
 replayed as anything other than a git signature.
+
+``sign_message`` signs arbitrary bytes in another, explicit namespace for the
+proxy's own use (audit log seals); no client route reaches it.
 """
 
 from __future__ import annotations
@@ -86,9 +89,6 @@ def sign(private_key_openssh: str, payload: bytes, expected_public_key: str | No
         raise GitSignError("the object to sign is too large")
     object_kind(payload)
     key = _load_key(private_key_openssh)
-    public_raw = key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
     if expected_public_key is not None:
         actual = public_key_line(private_key_openssh)
         if normalise_public_key(expected_public_key) != actual:
@@ -96,11 +96,33 @@ def sign(private_key_openssh: str, payload: bytes, expected_public_key: str | No
                 "git's user.signingkey is not the key secret-proxy signs with"
             )
 
+    return _sshsig(key, payload, NAMESPACE)
+
+
+def sign_message(private_key_openssh: str, message: bytes, namespace: bytes) -> str:
+    """Return an armored SSHSIG over arbitrary *message* in *namespace*.
+
+    For proxy-internal use only (the audit log seals its hash chain with
+    namespace ``secret-proxy-audit``). Never reachable from a client: the git
+    route always signs in the ``git`` namespace, so a signature made here
+    cannot be replayed as a git signature, and vice versa.
+    """
+    if not isinstance(namespace, bytes) or not namespace or namespace == NAMESPACE:
+        raise GitSignError("an explicit, non-git namespace is required")
+    if len(message) > MAX_PAYLOAD_BYTES:
+        raise GitSignError("the message to sign is too large")
+    return _sshsig(_load_key(private_key_openssh), message, namespace)
+
+
+def _sshsig(key: Ed25519PrivateKey, payload: bytes, namespace: bytes) -> str:
+    public_raw = key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
     public_blob = _ssh_string(b"ssh-ed25519") + _ssh_string(public_raw)
     digest = hashlib.sha512(payload).digest()
     signed_data = (
         b"SSHSIG"
-        + _ssh_string(NAMESPACE)
+        + _ssh_string(namespace)
         + _ssh_string(b"")
         + _ssh_string(HASH_ALGORITHM)
         + _ssh_string(digest)
@@ -110,7 +132,7 @@ def sign(private_key_openssh: str, payload: bytes, expected_public_key: str | No
         b"SSHSIG"
         + struct.pack(">I", 1)
         + _ssh_string(public_blob)
-        + _ssh_string(NAMESPACE)
+        + _ssh_string(namespace)
         + _ssh_string(b"")
         + _ssh_string(HASH_ALGORITHM)
         + _ssh_string(signature_blob)

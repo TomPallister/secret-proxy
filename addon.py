@@ -39,6 +39,7 @@ from urllib.parse import urlsplit
 from mitmproxy import http
 
 import approvals
+import audit
 import awsops
 import clientgrants
 import sigv4
@@ -296,9 +297,11 @@ def _approval_needed(flow: http.HTTPFlow, request) -> None:
     remembered = approvals.default_broker().session_decision(request.key)
     if remembered == "allow":
         log.info("secret_proxy: APPROVAL allow (session) %s", request.summary())
+        audit_approval(request, True, choice="session")
         return
     if remembered == "deny":
         log.warning("secret_proxy: APPROVAL deny (session) %s", request.summary())
+        audit_approval(request, False, approvals.RULE_DENIED, choice="session")
         raise ApprovalRefused(approvals.RULE_DENIED)
     pending = flow.metadata.setdefault(APPROVAL_PENDING, [])
     if all(item.key != request.key for item in pending):
@@ -423,6 +426,7 @@ def _client_may_login(flow: http.HTTPFlow, kind: str) -> bool:
 
 
 def _client_denied(flow: http.HTTPFlow, what: str) -> None:
+    flow.metadata[_AUDIT_REASON] = "client-not-granted"
     log.warning("secret_proxy: BLOCKED %s %s - client '%s' is not granted %s",
                 flow.request.method, flow.request.host, _client_label(flow), what)
 
@@ -430,11 +434,208 @@ def _client_denied(flow: http.HTTPFlow, what: str) -> None:
 def _client_refusal(flow: http.HTTPFlow, what: str) -> bool:
     """403 for a proxy route or answer the client is not granted."""
     _client_denied(flow, what)
+    flow.metadata.pop(_AUDIT_REASON, None)
+    _audit(flow, "grant", "refused", reason="client-not-granted", secret=_known_secret(what))
     flow.response = http.Response.make(
         403, json.dumps({"error": "secret_proxy_client_not_granted"}).encode(),
         {"content-type": "application/json", "cache-control": "no-store"},
     )
     return True
+
+
+# --- Audit log (audit.py, issue #6) ------------------------------------------
+# Off by default: _audit_log stays None unless the manifest enables it, and then
+# every helper below is a no-op. Callers pass only fixed codes, names and
+# request metadata; audit.sanitize drops anything else and strips query
+# strings. A decision that grants something (an injection, an AWS signature,
+# a signature, a login) must be recorded first: when it cannot be, the request
+# is refused (AuditUnavailable) rather than performed unrecorded.
+_audit_log = None
+AUDIT_DIR = os.environ.get("SECRET_PROXY_AUDIT_DIR", "")
+_AUDIT_ORIGIN = "secret_proxy_audit_origin"
+_AUDIT_REASON = "secret_proxy_audit_reason"
+_AUDIT_USES = "secret_proxy_audit_uses"
+
+
+class AuditUnavailable(Exception):
+    """The audit log could not record a decision that grants access."""
+
+    def __init__(self):
+        super().__init__("the audit log could not record this decision")
+
+
+def _audit_signing_key(name: str):
+    def provide() -> str:
+        generation = _capture_generation()
+        with _bind_generation(generation):
+            return _resolve(name)
+    return provide
+
+
+def configure_audit(manifest, directory=None, instance=None, signer=None) -> None:
+    """Open the audit log when (and only when) the manifest enables it.
+
+    Raises when it is enabled but cannot be opened: the proxy must not run
+    with an audit log it was told to keep but cannot write.
+    """
+    global _audit_log
+    close_audit()
+    settings = getattr(manifest, "audit", None)
+    if settings is None:
+        return
+    directory = directory or AUDIT_DIR
+    if not directory:
+        raise audit.AuditError("audit is enabled but no audit directory is configured")
+    instance = instance or os.environ.get("SECRET_PROXY_INSTANCE_ID", "")
+    if signer is None and settings.get("signingKey"):
+        signer = audit.SshSigner(_audit_signing_key(settings["signingKey"]))
+    writer = audit.AuditLog(directory, settings, instance, signer=signer)
+    writer.open()
+    _audit_log = writer
+    if writer.key_status == "signed":
+        log.info("secret_proxy: audit log enabled (signing key %s)", writer.key_fingerprint)
+    else:
+        log.warning("secret_proxy: audit log enabled WITHOUT a usable signing key (%s); seals are unsigned",
+                    writer.key_status)
+
+
+def close_audit(reason: str = "stop") -> None:
+    """Seal and close the audit log on a clean stop (mitmproxy ``done``)."""
+    global _audit_log
+    writer, _audit_log = _audit_log, None
+    if writer is not None:
+        writer.close(reason)
+
+
+def _audit_origin(flow: http.HTTPFlow):
+    """Host, port and path as the client sent them (before any URL rewrite)."""
+    origin = flow.metadata.get(_AUDIT_ORIGIN)
+    if origin is not None:
+        return origin
+    return flow.request.host, flow.request.port, flow.request.path
+
+
+def _audit(flow, event: str, decision: str, **fields) -> bool:
+    """Record one decision; True when written (or when auditing is off)."""
+    writer = _audit_log
+    if writer is None:
+        return True
+    try:
+        values = {}
+        if flow is not None:
+            host, port, path = _audit_origin(flow)
+            values = {"client": _client_label(flow), "host": host, "port": port,
+                      "method": flow.request.method, "path": path}
+        values.update(fields)
+        if not writer.record(event, decision, values):
+            log.error("secret_proxy: audit log write failed; refusing what it cannot record")
+            return False
+        return True
+    except Exception:  # noqa: BLE001 - never let auditing break a hook
+        log.error("secret_proxy: audit log write failed; refusing what it cannot record")
+        return False
+
+
+def _audit_grant(flow, event: str, decision: str, **fields) -> None:
+    """Record a decision that grants something, or refuse it."""
+    if not _audit(flow, event, decision, **fields):
+        raise AuditUnavailable()
+
+
+def _audit_unavailable_response(flow: http.HTTPFlow) -> bool:
+    flow.response = http.Response.make(
+        503, json.dumps({"error": "secret_proxy_audit_unavailable"}).encode(),
+        {"content-type": "application/json", "cache-control": "no-store"},
+    )
+    return True
+
+
+def _known_secret(name) -> str | None:
+    """*name* when it is a manifest secret, so client-typed text is never logged."""
+    try:
+        _current_manifest().secret(name)
+    except Exception:  # noqa: BLE001
+        return None
+    return name
+
+
+def _use_fields(entry: str) -> dict:
+    """Audit fields for one ``<sink><-<CANONICAL>`` injection log item."""
+    sink, _, canonical = entry.rpartition("<-")
+    if sink == "Basic":
+        kind, name = "basic-password", None
+    elif sink.startswith("?"):
+        kind, name = "query", sink[1:]
+    elif sink.startswith("body:"):
+        kind, name = "form", sink[5:]
+    else:
+        kind, name = "header", sink
+    return {"secret": canonical, "placement": kind, "field": name}
+
+
+def _audit_attempt(flow: http.HTTPFlow, entry: str) -> None:
+    """Note a use about to be resolved; recorded once the request is decided."""
+    if _audit_log is not None:
+        flow.metadata.setdefault(_AUDIT_USES, []).append(entry)
+
+
+def _audit_commit_uses(flow: http.HTTPFlow) -> None:
+    """Record injections that are about to go upstream (raises AuditUnavailable)."""
+    for entry in dict.fromkeys(flow.metadata.pop(_AUDIT_USES, None) or ()):
+        _audit_grant(flow, "inject", "injected", **_use_fields(entry))
+
+
+def _audit_injection_failure(flow: http.HTTPFlow, injected, error: Exception) -> None:
+    if _audit_log is None:
+        return
+    attempted = flow.metadata.pop(_AUDIT_USES, None) or ()
+    reason = flow.metadata.pop(_AUDIT_REASON, None)
+    rule = None
+    secret = None
+    if isinstance(error, ApprovalRefused):
+        reason, rule = "approval-refused", error.rule
+    elif isinstance(error, PolicyViolation):
+        reason = reason or "placement-not-allowed"
+        secret = _known_secret(error.name)
+    elif isinstance(error, AuditUnavailable):
+        reason = "audit-unavailable"
+    elif isinstance(error, SecretReferenceError):
+        reason = "invalid-reference"
+    elif isinstance(error, OAuthTokenError):
+        reason = "token-unavailable"
+    else:
+        reason = "injection-failed"
+    # A policy decision is "refused"; a lookup or internal error is "failed".
+    decision = "refused" if reason in (
+        "approval-refused", "placement-not-allowed", "client-not-granted", "invalid-reference") else "failed"
+    uses = [] if secret else [_use_fields(entry) for entry in dict.fromkeys(list(injected) + list(attempted))]
+    for fields in uses or [{"secret": secret}]:
+        _audit(flow, "inject", decision, reason=reason, rule=rule, error=type(error).__name__, **fields)
+
+
+def audit_connect_refusal(host, port, rule) -> None:
+    """An upstream connection refused in server_connect (no flow there)."""
+    _audit(None, "egress", "refused", host=host, port=port, rule=rule)
+
+
+def audit_approval(request, allowed: bool, rule: str = "", choice: str = "") -> None:
+    """An approval outcome; *request* is an approvals.ApprovalRequest."""
+    if _audit_log is None:
+        return
+    info = request.describe() if request is not None else {}
+    host, port = info.get("host"), None
+    if info.get("kind") == "egress" and host and host.rpartition(":")[2].isdigit():
+        host, _, number = host.rpartition(":")
+        port = int(number)
+    placement, field = info.get("placement"), None
+    if placement and " " in placement:
+        placement, field = placement.split(" ", 1)
+    _audit(None, "approval", "allowed" if allowed else "denied",
+           kind=info.get("kind"), client=info.get("client"), method=info.get("method"),
+           host=host, port=port, path=info.get("path"), secret=info.get("secret"),
+           placement=placement, field=field, account=info.get("account"),
+           role=info.get("role"), service=info.get("service"), operation=info.get("operation"),
+           rule=info.get("rule"), reason=rule or None, choice=choice or None)
 
 
 def _placement_allowed(
@@ -916,6 +1117,7 @@ def _apply_use(
     )
     _approval_gate(flow)  # never resolve a secret that still needs approval
     injected.append(f"{log_sink}<-{canonical}")
+    _audit_attempt(flow, injected[-1])
     resolved_value = _resolve(canonical)
     return value[:match.start()] + resolved_value + value[match.end():]
 
@@ -1038,6 +1240,7 @@ def _plan_request_metadata(flow: http.HTTPFlow) -> dict:
         )
         _approval_gate(flow)
         planned.append(f"Basic<-{canonical}")
+        _audit_attempt(flow, planned[-1])
         resolved_password = (
             password[:match.start()] + _resolve(canonical) + password[match.end():]
         )
@@ -1202,6 +1405,10 @@ def _inject_request_metadata(flow: http.HTTPFlow, injected: list[str]) -> dict:
 def _set_injection_error(flow: http.HTTPFlow, injected: list[str], error: Exception) -> None:
     """Set the safe response used when metadata injection fails."""
     host = flow.request.host
+    _audit_injection_failure(flow, injected, error)
+    if isinstance(error, AuditUnavailable):
+        _audit_unavailable_response(flow)
+        return
     if isinstance(error, ApprovalRefused):
         log.warning("secret_proxy: BLOCKED %s %s - %s", flow.request.method, host, error.rule)
         flow.response = http.Response.make(
@@ -1326,6 +1533,7 @@ def _checkmarx_exchange_response(flow: http.HTTPFlow) -> bool:
         "token_type": "Bearer",
         "not-before-policy": 0,
     }
+    _audit_grant(flow, "exchange", "answered", provider="checkmarx", secret=CHECKMARX_ACCESS_TOKEN)
     flow.response = http.Response.make(
         200,
         json.dumps(body).encode("utf-8"),
@@ -1384,6 +1592,7 @@ def _chatgpt_login_route(flow: http.HTTPFlow) -> bool:
     provider = bound.providers.chatgpt
     if path.endswith("/start"):
         value = {"url": provider.start()}
+        _audit(flow, "login", "started", provider="chatgpt")
     else:
         body = flow.request.content or b""
         if len(body) > 8192:
@@ -1392,10 +1601,13 @@ def _chatgpt_login_route(flow: http.HTTPFlow) -> bool:
         try:
             value = provider.finish(body.decode("utf-8"))
         except (UnicodeDecodeError, ChatGPTAuthError) as error:
+            _audit(flow, "login", "failed", provider="chatgpt", reason="login-failed",
+                   error=type(error).__name__)
             value = {"error": "login_failed"}
             flow.response = http.Response.make(400, json.dumps(value).encode(),
                                                {"content-type": "application/json", "cache-control": "no-store"})
             return True
+        _audit_grant(flow, "login", "completed", provider="chatgpt")
     flow.response = http.Response.make(200, json.dumps(value).encode(),
                                        {"content-type": "application/json", "cache-control": "no-store"})
     return True
@@ -1427,6 +1639,7 @@ def _github_client_login_blocked(flow: http.HTTPFlow) -> bool:
             continue
         if githubdevice.form_or_query_mentions(flow.request, login.client_id):
             log.warning("secret_proxy: BLOCKED %s %s%s - client-side %s login", flow.request.method, host, path, login.kind)
+            _audit(flow, "login", "refused", provider=login.cli_name, reason="client-side-login")
             return _json_response(flow, 403, login.error)
     return False
 
@@ -1456,13 +1669,16 @@ def _copilot_exchange_response(flow: http.HTTPFlow) -> bool:
     ):
         log.warning("secret_proxy: BLOCKED %s %s - Copilot exchange without the login reference",
                     flow.request.method, flow.request.host)
+        _audit(flow, "exchange", "refused", provider="github-copilot", reason="not-the-login-reference")
         return _json_response(flow, 403, login.error)
     provider = _github_provider(login)
     try:
         value = provider.exchange_answer()
     except (copilotcreds.CopilotAuthError, githubdevice.GitHubDeviceError):
         log.warning("secret_proxy: GET %s - Copilot exchange refused: login required", flow.request.host)
+        _audit(flow, "exchange", "refused", provider="github-copilot", reason="login-required")
         return _json_response(flow, 403, login.error)
+    _audit_grant(flow, "exchange", "answered", provider="github-copilot", secret=copilotcreds.CANONICAL)
     log.info("secret_proxy: GET %s - answered the Copilot token exchange with a sealed token", flow.request.host)
     return _json_response(flow, 200, value)
 
@@ -1499,13 +1715,16 @@ def _github_login_route(flow: http.HTTPFlow) -> bool:
             if action == "start":
                 value = provider.start()
                 log.info("secret_proxy: started proxy-owned GitHub %s login", login.kind)
+                _audit(flow, "login", "started", provider=login.cli_name)
                 return _json_response(flow, 200, value)
             result = provider.poll()
         except githubdevice.GitHubDeviceError as error:
             log.warning("secret_proxy: GitHub %s login failed (%s)", login.kind, error.reason)
+            _audit(flow, "login", "failed", provider=login.cli_name, reason=error.reason)
             return _json_response(flow, 200, {"status": "failed", "reason": error.reason})
         if result is None:
             return _json_response(flow, 200, {"status": "pending", "retryAfter": provider.device.retry_after()})
+        _audit_grant(flow, "login", "completed", provider=login.cli_name)
         log.info("secret_proxy: completed proxy-owned GitHub %s login", login.kind)
         payload = {"credential": result} if login.kind == "copilot" else result
         return _json_response(flow, 200, {"status": "complete", **payload})
@@ -1542,19 +1761,24 @@ def _git_signing_route(flow: http.HTTPFlow) -> bool:
     try:
         _current_manifest().canonical_name(GIT_SIGNING_SSH_KEY)
     except (AttributeError, KeyError, ValueError):
+        _audit(flow, "sign", "refused", reason="not-configured")
         return _git_signing_response(flow, 403, "git_signing_not_configured")
     grant = _client_grant(flow)
     if grant is not None and not grant.may_sign():
         _client_denied(flow, "git signing")
+        flow.metadata.pop(_AUDIT_REASON, None)
+        _audit(flow, "sign", "refused", reason="client-not-granted")
         return _git_signing_response(flow, 403, "secret_proxy_client_not_granted")
     payload = flow.request.content or b""
     if len(payload) > gitsign.MAX_PAYLOAD_BYTES:
+        _audit(flow, "sign", "refused", reason="object-too-large")
         return _git_signing_response(flow, 413, "object_too_large")
     expected = flow.request.headers.get(GIT_SIGNING_KEY_HEADER) or None
     try:
         kind = gitsign.object_kind(payload)
     except gitsign.GitSignError as error:
         log.warning("secret_proxy: POST %s%s - refused: %s", SENTINEL_HOST, GIT_SIGNING_PATH, error)
+        _audit(flow, "sign", "refused", reason="not-a-git-object")
         return _git_signing_response(flow, 400, str(error))
     try:
         private_key = _resolve(GIT_SIGNING_SSH_KEY)
@@ -1563,12 +1787,16 @@ def _git_signing_route(flow: http.HTTPFlow) -> bool:
             "secret_proxy: POST %s%s - signing key unavailable (%s)",
             SENTINEL_HOST, GIT_SIGNING_PATH, type(error).__name__,
         )
+        _audit(flow, "sign", "failed", reason="signing-key-unavailable", error=type(error).__name__)
         return _git_signing_response(flow, 502, "signing_key_unavailable")
     try:
         signature = gitsign.sign(private_key, payload, expected)
     except gitsign.GitSignError as error:
         log.warning("secret_proxy: POST %s%s - refused: %s", SENTINEL_HOST, GIT_SIGNING_PATH, error)
+        _audit(flow, "sign", "refused", reason="signing-refused", object=kind)
         return _git_signing_response(flow, 400, str(error))
+    if not _audit(flow, "sign", "signed", object=kind, secret=GIT_SIGNING_SSH_KEY):
+        return _audit_unavailable_response(flow)
     flow.response = http.Response.make(
         200,
         signature.encode("ascii"),
@@ -1600,6 +1828,7 @@ def _request_locked(flow: http.HTTPFlow) -> None:
 
     try:
         if flow.response is not None:
+            flow.metadata.pop(_AUDIT_USES, None)
             return  # a hook (e.g. requestheaders re-sign error) already responded
         if flow.request.stream:
             flow.metadata.pop("secret_proxy_metadata_original", None)
@@ -1615,6 +1844,7 @@ def _request_locked(flow: http.HTTPFlow) -> None:
             except (AttributeError, KeyError):
                 codex_proxy_enabled = False
             if codex_proxy_enabled:
+                _audit(flow, "login", "refused", provider="chatgpt", reason="client-side-login")
                 flow.response = http.Response.make(403, b'{"error":"use_chatgpt_login"}',
                                                    {"content-type": "application/json"})
                 return
@@ -1643,6 +1873,7 @@ def _request_locked(flow: http.HTTPFlow) -> None:
             if configured:
                 auth = sealedjwt.unseal(flow.request.headers.get("authorization", ""))
                 if auth != "Bearer " + sealedjwt.MARKER + "CHATGPT_ACCESS_TOKEN":
+                    _audit(flow, "login", "refused", provider="chatgpt", reason="not-the-login-reference")
                     flow.response = http.Response.make(403, b'{"error":"use_chatgpt_login"}',
                                                        {"content-type": "application/json"})
                     return
@@ -1653,6 +1884,9 @@ def _request_locked(flow: http.HTTPFlow) -> None:
             name = flow.request.path_components[0] if flow.request.path_components else ""
             canonical = _canonical_ref(name)
             scheme, target_host, port, path_with_query = _sentinel_resolve(canonical, flow)
+            # The destination URL is the secret: audit the sentinel request only.
+            flow.metadata[_AUDIT_ORIGIN] = (flow.request.host, flow.request.port, flow.request.path)
+            _audit_grant(flow, "inject", "injected", secret=canonical, placement="url-rewrite")
             flow.request.scheme = scheme
             flow.request.host = target_host
             flow.request.port = port
@@ -1691,11 +1925,14 @@ def _request_locked(flow: http.HTTPFlow) -> None:
         if _is_aws_sigv4_ours(flow):
             _resign_aws(flow)
             if flow.response is not None:
+                flow.metadata.pop(_AUDIT_USES, None)
                 _restore_metadata_snapshot(flow)
             else:
+                _audit_commit_uses(flow)
                 flow.metadata.pop("secret_proxy_metadata_original", None)
             return
 
+        _audit_commit_uses(flow)
         flow.metadata.pop("secret_proxy_metadata_original", None)
     except ApprovalRequired:
         # Held for approval; the re-run must see the same hook state.
@@ -1731,6 +1968,7 @@ def _require_https(flow: http.HTTPFlow) -> bool:
         flow.request.method,
         flow.request.host,
     )
+    _audit(flow, "transport", "refused", reason="https-required")
     flow.response = http.Response.make(
         403,
         b'{"error":"secret_proxy_https_required"}',
@@ -1968,6 +2206,9 @@ def _resign_presigned(flow: http.HTTPFlow) -> None:
         host=flow.request.host,
         **_kw,
     )
+    credential = q.get("X-Amz-Credential", "").split("/")
+    _audit_grant(flow, "aws", "allowed", account=account, role=role,
+                 service=credential[3] if len(credential) == 5 else None, reason="presigned-url")
     for k, v in new.items():
         flow.request.query[k] = v
     flow.request.stream = True  # body (if any) is UNSIGNED-PAYLOAD; stream unchanged
@@ -2293,6 +2534,8 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
         body=body,
         **_kw,
     )
+    _audit_grant(flow, "aws", "allowed", account=account, role=role, service=op.service,
+                 operation=op.operation, rule=decision.rule, overridden=decision.overridden or None)
     flow.request.headers["Authorization"] = res["authorization"]
     flow.request.headers["x-amz-security-token"] = res["x-amz-security-token"]
     flow.metadata["secret_proxy_aws"] = f"{account}/{role}"
@@ -2301,12 +2544,18 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
 
 def _aws_error(flow: http.HTTPFlow, e: Exception) -> None:
     if isinstance(e, AwsOperationDenied):
+        _audit(flow, "aws", "denied", account=e.account, role=e.role, service=e.op.service,
+               operation=e.op.operation, rule=e.decision.rule)
         _aws_denied_response(flow, e)
+        return
+    if isinstance(e, AuditUnavailable):
+        _audit_unavailable_response(flow)
         return
     # AwsCredsError carries a fixed, secret-free reason. Credential-vending
     # failures answer 403 rather than 502: AWS SDKs retry 5xx, and each retry
     # used to be another Okta login attempt towards a lockout.
     reason = getattr(e, "reason", None) if type(e).__name__ == "AwsCredsError" else None
+    _audit(flow, "aws", "failed", reason=reason, error=type(e).__name__)
     log.error(
         "secret_proxy: AWS re-sign failed for %s %s (exception=%s%s)",
         flow.request.method,
@@ -2325,6 +2574,19 @@ def _aws_error(flow: http.HTTPFlow, e: Exception) -> None:
 
 
 def _requestheaders_locked(flow: http.HTTPFlow) -> None:
+    _requestheaders_inner(flow)
+    if flow.response is not None:
+        flow.metadata.pop(_AUDIT_USES, None)
+    elif flow.request.stream and flow.metadata.get(_AUDIT_USES):
+        # Streamed now: request() will not see this flow again.
+        try:
+            _audit_commit_uses(flow)
+        except AuditUnavailable as error:
+            _restore_metadata_snapshot(flow)
+            _set_injection_error(flow, [], error)
+
+
+def _requestheaders_inner(flow: http.HTTPFlow) -> None:
     """Re-sign AWS SigV4 requests that carry x-amz-content-sha256 (all S3) BEFORE
     the body is read, then STREAM the body — so multi-GB uploads never buffer in
     the proxy. A signed aws-chunked upload is re-framed on the fly
@@ -2360,6 +2622,7 @@ def _requestheaders_locked(flow: http.HTTPFlow) -> None:
         and not is_aws_sigv4
         and flow.request.method.upper() not in ("GET", "HEAD")
     ):
+        _audit(flow, "inject", "refused", reason="streamed-body-unsupported")
         flow.response = http.Response.make(
             502,
             json.dumps({

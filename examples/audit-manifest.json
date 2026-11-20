@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "audit": {
+    "enabled": true,
+    "signingKey": "AUDIT_SIGNING_SSH_KEY",
+    "maxFileBytes": 4194304,
+    "maxTotalBytes": 67108864,
+    "maxAgeDays": 90
+  },
+  "secrets": {
+    "GITHUB_TOKEN": {
+      "placements": [{"kind": "header", "hosts": ["api.github.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "HEAD"]}]
+    },
+    "AUDIT_SIGNING_SSH_KEY": {"internalOnly": true, "valueField": "sshPrivateKey"}
+  }
+}

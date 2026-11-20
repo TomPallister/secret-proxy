@@ -6,6 +6,7 @@ one bounded capability bundle on stdin. No live legacy container is ever retired
 from __future__ import annotations
 
 import argparse
+import base64
 from dataclasses import dataclass
 import hashlib
 import json
@@ -36,7 +37,7 @@ BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
                'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
                'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py',
-               'approvals.py')
+               'approvals.py', 'audit.py')
 
 
 class HostError(Exception):
@@ -390,6 +391,41 @@ def approvals_session(deployment: Deployment):
     client_module.approvals_loop(client, approver)
 
 
+def audit_export_command(deployment: Deployment, image: str) -> list:
+    """A throwaway, offline container that only reads the audit files.
+
+    The proxy's volume is mounted read-only; no capability, network or policy
+    mount is given. It works whether or not the proxy is running.
+    """
+    if re.fullmatch(r'sha256:[0-9a-f]{64}', image) is None:
+        raise HostError('An exact local image ID is required')
+    return ['run', '--rm', '--network=none', '--read-only', '--cap-drop=ALL',
+            '--security-opt=no-new-privileges', '--pids-limit=64',
+            '--userns=keep-id:uid=1000,gid=1000',
+            '--volume', f'{deployment.name}-ca:/data:ro',
+            '--entrypoint=/opt/secret-proxy/.venv/bin/python', image,
+            '/opt/secret-proxy/audit.py', 'export', '--dir', '/data/audit']
+
+
+def audit_export(deployment: Deployment, out=None):
+    """Write this instance's audit files to stdout (validated export records)."""
+    import audit
+    try:
+        record = json.loads(private_read(deployment.private / 'image.json', 4096))
+    except FileNotFoundError:
+        raise HostError('No prepared image for this instance; start it once first') from None
+    result = engine(deployment, *audit_export_command(deployment, record.get('image', '')), timeout=300)
+    data = checked(result, 'audit export')
+    try:
+        files = audit.parse_export(data)
+    except audit.AuditError as error:
+        raise HostError('Invalid audit export: ' + str(error)) from None
+    out = out or sys.stdout.buffer
+    for name, content in files:
+        out.write(json.dumps({'name': name, 'data': base64.b64encode(content).decode('ascii')}).encode('ascii') + b'\n')
+    out.flush()
+
+
 def validate_bootstrap_config(config: dict):
     if not isinstance(config, dict) or set(config) != {'account', 'vault', 'item', 'runtimeVault'}:
         raise HostError('Invalid bootstrap configuration')
@@ -475,7 +511,7 @@ def relay_exec(argv: list, bundle: dict):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['up', 'prepare', 'serve', 'stop', 'approvals'])
+    parser.add_argument('command', choices=['up', 'prepare', 'serve', 'stop', 'approvals', 'audit-export'])
     parser.add_argument('instance')
     parser.add_argument('--bootstrap', type=Path)
     parser.add_argument('--op', type=Path, help='Absolute desktop-integrated op executable (up only)')
@@ -502,7 +538,7 @@ def main():
         relay_exec(as_secagent('serve', args.instance), bundle)
         raise AssertionError('exec unexpectedly returned')
     if os.getuid() != pwd.getpwnam('secagent').pw_uid:
-        if args.command not in ('stop', 'approvals'):
+        if args.command not in ('stop', 'approvals', 'audit-export'):
             raise HostError('This operation must run as secagent')
         checked(subprocess.run(['/usr/bin/sudo', '-v'], timeout=120), 'sudo authentication')
         if args.command == 'approvals':
@@ -527,6 +563,8 @@ def main():
             approvals_session(deployment)
         except KeyboardInterrupt:
             return 130
+    elif args.command == 'audit-export':
+        audit_export(deployment)
     else:
         stop_instance(deployment)
     return 0

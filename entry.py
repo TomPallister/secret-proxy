@@ -70,6 +70,11 @@ def _allow_hosts(manifest=None) -> list[str]:
     return list(dict.fromkeys(patterns))
 
 
+def done() -> None:
+    """Clean stop (SIGTERM/SIGINT): seal and sign the audit log, if enabled."""
+    addon.close_audit("stop")
+
+
 def load(loader) -> None:
     """Restrict MITM processing to manifest and AWS signing destinations."""
     global _egress_policy
@@ -96,6 +101,14 @@ def load(loader) -> None:
     except Exception as error:
         message = "secret_proxy: invalid AWS operation policy; refusing to start"
         detail = str(error) if isinstance(error, addon.awsops.AwsPolicyError) else type(error).__name__
+        addon.log.error("%s (%s)", message, detail)
+        raise OptionsError(message) from error
+    try:
+        # Opt-in audit log; with no enabled "audit" section nothing is created.
+        addon.configure_audit(manifest)
+    except Exception as error:
+        message = "secret_proxy: the audit log is enabled but could not be opened; refusing to start"
+        detail = str(error) if isinstance(error, addon.audit.AuditError) else type(error).__name__
         addon.log.error("%s (%s)", message, detail)
         raise OptionsError(message) from error
     _egress_policy = policy
@@ -167,6 +180,7 @@ def _refusal_response(flow, refusal) -> None:
         "secret_proxy: BLOCKED %s %s:%s - egress %s",
         flow.request.method, flow.request.host, flow.request.port, refusal.rule,
     )
+    addon._audit(flow, "egress", "refused", rule=refusal.rule)
     flow.response = http.Response.make(
         refusal.status, json.dumps(body).encode(),
         {"content-type": "application/json", "cache-control": "no-store"},
@@ -211,6 +225,7 @@ async def server_connect(data) -> None:
     server = data.server
     if server.via is not None:
         server.error = "secret-proxy egress refused (upstream-proxy)"
+        addon.audit_connect_refusal(None, None, "upstream-proxy")
         return
     host, port = server.address
     normalized = egress.normalize_host(host)
@@ -224,6 +239,7 @@ async def server_connect(data) -> None:
             addon.log.warning(
                 "secret_proxy: BLOCKED connect %s:%s - egress %s", host, port, decision.rule,
             )
+            addon.audit_connect_refusal(host, port, decision.rule)
             server.error = f"secret-proxy egress refused ({decision.rule})"
             return
         addresses = decision.addresses
@@ -337,6 +353,7 @@ def _wake_approvers() -> None:
 
 
 def _log_outcome(request, outcome) -> None:
+    addon.audit_approval(request, outcome.allowed, outcome.rule, outcome.choice)
     if outcome.allowed:
         addon.log.info("secret_proxy: APPROVAL allow (%s) %s", outcome.choice or "-", request.summary())
     else:
@@ -473,6 +490,7 @@ async def _approval_route(flow, poll_seconds: float = None) -> bool:
     if not presented or not hmac.compare_digest(digest, _approver_digest):
         addon.log.warning("secret_proxy: BLOCKED %s %s%s - approver capability required",
                           flow.request.method, egress.SENTINEL_HOST, path)
+        addon._audit(flow, "approval", "refused", reason="approver-required")
         return _control_response(flow, 403, {"error": "approver_required"})
     instance = os.environ.get("SECRET_PROXY_INSTANCE_ID", "")
     if re.fullmatch(r"[0-9a-f]{32}", instance) is None:

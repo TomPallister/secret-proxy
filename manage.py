@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 
+import audit
 import capolicy
 from client import ClientError, ProxyClient, check_client_name, private_read
 from clientgrants import DEFAULT_CLIENT
@@ -239,6 +240,47 @@ def untrust_ca(settings: dict, keychain: Keychain):
     print('Removed the proxy CA trust entry' if removed else 'No proxy CA trust entry found; nothing changed')
 
 
+def export_audit_files(settings: dict, run=subprocess.run) -> list:
+    """Copy the audit files out of the proxy's private volume (read-only).
+
+    host.py asks for sudo and reads them as the proxy account, through a
+    throwaway offline container. Only validated audit files come back.
+    """
+    result = run([PYTHON, str(ROOT / 'current/host.py'), 'audit-export', settings['instance']],
+                 stdout=subprocess.PIPE, timeout=900)
+    if result.returncode:
+        raise ClientError('Audit export failed; nothing was written')
+    try:
+        return audit.parse_export(result.stdout)
+    except audit.AuditError as error:
+        raise ClientError('Invalid audit export: ' + str(error)) from None
+
+
+def audit_command(settings: dict, action: str, public_key=None, paths=(), destination=None,
+                  run=subprocess.run) -> int:
+    if action == 'export':
+        files = export_audit_files(settings, run)
+        if not files:
+            print('No audit files: the audit log is off, or nothing has been recorded yet')
+            return 0
+        try:
+            target = audit.write_export(files, destination)
+        except FileExistsError:
+            raise ClientError('The destination already exists; choose a new directory') from None
+        print(f'Exported {len(files)} audit file(s) to {target}. '
+              'Check them with: secret-proxy audit verify --public-key <file> ' + str(target))
+        return 0
+    if not paths:
+        files = export_audit_files(settings, run)
+        if not files:
+            print('No audit files: the audit log is off, or nothing has been recorded yet')
+            return 1
+        with tempfile.TemporaryDirectory(prefix='secret-proxy-audit-') as tmp:
+            target = audit.write_export(files, Path(tmp) / 'audit')
+            return audit.verify_command(public_key, [str(target)])
+    return audit.verify_command(public_key, list(paths))
+
+
 def execute(settings: dict, command: str, argv=(), provider: str | None = None,
             client_name: str = DEFAULT_CLIENT):
     instance = settings['instance']
@@ -311,7 +353,21 @@ def main(argv=None):
     run = commands.add_parser('run')
     run.add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
     run.add_argument('argv', nargs=argparse.REMAINDER)
+    audit_parser = commands.add_parser('audit', help='Export or verify the opt-in audit log')
+    audit_actions = audit_parser.add_subparsers(dest='action', required=True)
+    exporter = audit_actions.add_parser('export', help='Copy the audit files into a new directory')
+    exporter.add_argument('destination', type=Path)
+    verifier = audit_actions.add_parser('verify', help='Check the hash chain and seals against a pinned key')
+    verifier.add_argument('--public-key', required=True, type=Path,
+                          help='The signing key\'s OpenSSH public key, obtained independently')
+    verifier.add_argument('paths', nargs='*', help='Exported files or directories (default: export now)')
     args = parser.parse_args(argv)
+    if args.command == 'audit':
+        # Verifying copies needs no installed instance; exporting does.
+        if args.action == 'verify' and args.paths:
+            sys.exit(audit_command({}, 'verify', args.public_key, args.paths))
+        sys.exit(audit_command(load_settings(args.config), args.action, getattr(args, 'public_key', None),
+                               getattr(args, 'paths', ()), getattr(args, 'destination', None)))
     execute(load_settings(args.config), args.command, getattr(args, 'argv', ()), getattr(args, 'provider', None),
             getattr(args, 'client', DEFAULT_CLIENT))
 
