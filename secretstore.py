@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 from pathlib import Path
 from typing import Mapping, Protocol
 
+import approvals
 from egress import EgressPolicy
 import clientgrants
 
@@ -63,6 +64,19 @@ class SecretPlacement:
     username: str | None = None
     methods: list[str] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
+    # "prompt": a matching request is held until a person approves it.
+    approval: str | None = None
+
+
+@dataclass(frozen=True)
+class PlacementMatch:
+    """The placement that decided a request, and whether it needs approval."""
+
+    index: int
+    approval: str | None
+
+    def rule(self, secret_name: str) -> str:
+        return f"{secret_name}.placements[{self.index}]"
 
 
 @dataclass
@@ -130,7 +144,7 @@ class SecretManifest:
         provider = "1password"
         with open(path) as f:
             data = json.load(f, object_pairs_hook=_unique_object)
-        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients"}:
+        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients", "approvals"}:
             raise ValueError("invalid manifest root")
         if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 3:
             raise ValueError("schemaVersion must be exactly integer 3")
@@ -152,6 +166,8 @@ class SecretManifest:
         # Optional; absent means open egress (address checks still apply).
         # Raises EgressConfigError.
         egress = EgressPolicy.from_config(data.get("egress"))
+        # Optional approval timing; the default is a 120 s timeout.
+        approval_settings = approvals.validate_settings(data.get("approvals"))
 
         def validate_string_list(
             name: str, field_name: str, value: object, *, nonempty: bool = False
@@ -249,7 +265,7 @@ class SecretManifest:
                     }:
                         raise ValueError(f"{prefix}.kind is not supported")
 
-                    common_fields = {"kind", "hosts", "methods", "paths"}
+                    common_fields = {"kind", "hosts", "methods", "paths", "approval"}
                     kind_fields = {
                         "header": {"name", "template"},
                         "basic-password": {"username"},
@@ -300,6 +316,10 @@ class SecretManifest:
                         ):
                             raise ValueError(f"{prefix}.paths contains an invalid path pattern")
 
+                    approval = placement_spec.get("approval")
+                    if "approval" in placement_spec and approval != "prompt":
+                        raise ValueError(f'{prefix}.approval must be "prompt"')
+
                     placement_name = placement_spec.get("name")
                     template = placement_spec.get("template")
                     username = placement_spec.get("username")
@@ -343,6 +363,7 @@ class SecretManifest:
                         username=username,
                         methods=list(methods),
                         paths=list(paths),
+                        approval=approval,
                     ))
 
             if "derivedFrom" in spec:
@@ -423,6 +444,7 @@ class SecretManifest:
         manifest = cls(provider, accounts, secrets)
         manifest.checkmarx_realm = realm
         manifest._egress = egress
+        manifest._approval_settings = approval_settings
         manifest.github_logins = _github_logins(data.get("githubLogins"), secrets)
         enabled_logins = [kind for kind, on in (
             ("chatgpt", "CHATGPT_ACCESS_TOKEN" in secrets and secrets["CHATGPT_ACCESS_TOKEN"].runtime_only),
@@ -438,6 +460,19 @@ class SecretManifest:
         """Return the egress policy; manifest interception hosts are allowed."""
         policy = getattr(self, "_egress", None) or EgressPolicy()
         return policy.with_interception_hosts(self.interception_hosts())
+
+    def approval_settings(self) -> dict:
+        """Approval timeout and prompt rate (defaults when the section is absent)."""
+        value = getattr(self, "_approval_settings", None)
+        return dict(value) if value is not None else approvals.validate_settings(None)
+
+    def uses_approval(self) -> bool:
+        """Whether any placement asks for approval (for startup diagnostics)."""
+        return any(
+            placement.approval is not None
+            for secret in self._secrets.values()
+            for placement in secret.placements
+        )
 
     def github_login(self, kind: str) -> dict | None:
         """Settings for an enabled proxy-owned GitHub login, or None when off."""
@@ -526,19 +561,44 @@ class SecretManifest:
         username: str | None = None,
     ) -> bool:
         """Return whether a complete request context matches one placement."""
-        secret = self._secrets.get(secret_name)
-        if secret is None:
-            raise KeyError(f"Unknown secret: '{secret_name}'")
-        if secret.internal_only or not isinstance(host, str):
-            return False
+        return self.match_placement(
+            secret_name, kind=kind, host=host, method=method, path=path,
+            name=name, template=template, username=username,
+        ) is not None
 
-        return any(
-            self._placement_matches(
-                secret, placement, kind=kind, host=host, method=method, path=path,
-                name=name, template=template, username=username,
-            )
-            for placement in secret.placements
+    def match_placement(
+        self,
+        secret_name: str,
+        *,
+        kind: str,
+        host: str,
+        method: str,
+        path: str,
+        name: str | None = None,
+        template: str | None = None,
+        username: str | None = None,
+        allowed: frozenset | set | None = None,
+    ) -> PlacementMatch | None:
+        """Return the placement that matches a complete request context.
+
+        *allowed* restricts the candidates to placement indices a scoped
+        client is granted. When several placements match, one that requires
+        approval wins, so a broader placement without approval cannot bypass
+        an approval rule.
+        """
+        indices = self.placement_indices(
+            secret_name, kind=kind, host=host, method=method, path=path,
+            name=name, template=template, username=username,
         )
+        if allowed is not None:
+            indices = tuple(index for index in indices if index in allowed)
+        if not indices:
+            return None
+        placements = self._secrets[secret_name].placements
+        for index in indices:
+            if placements[index].approval is not None:
+                return PlacementMatch(index, placements[index].approval)
+        return PlacementMatch(indices[0], None)
 
     def _placement_matches(
         self,
@@ -623,6 +683,7 @@ class SecretManifest:
             username=placement.username,
             methods=list(placement.methods),
             paths=list(placement.paths),
+            approval=placement.approval,
         )
 
     def secret(self, name: str) -> SecretInfo:

@@ -38,6 +38,7 @@ from urllib.parse import urlsplit
 
 from mitmproxy import http
 
+import approvals
 import awsops
 import clientgrants
 import sigv4
@@ -247,6 +248,104 @@ class PolicyViolation(Exception):
         )
 
 
+# --- Approval rules (issue #3) ---------------------------------------------
+# A placement with "approval": "prompt", an AWS "approve" rule or an egress
+# allowlist miss with "allowlistMiss": "approve" holds the request. The checks
+# below only *collect* what needs approval; an approval gate placed before any
+# secret is resolved (and before any AWS credential is minted) then stops the
+# hook with ApprovalRequired. entry.py holds the flow, asks the approver and
+# re-runs the hook with the granted keys. Nothing is forwarded meanwhile.
+APPROVAL_PENDING = "secret_proxy_approval_pending"
+APPROVAL_GRANTS = "secret_proxy_approval_grants"
+APPROVAL_HANDLER = "secret_proxy_approval_handler"
+
+
+class ApprovalRequired(BaseException):
+    """A gate found requests that need a person's answer.
+
+    Deliberately a BaseException: the hooks below turn every ordinary Exception
+    into a response, and this one must reach _run_hook untouched. It is raised
+    only before any secret is resolved, so nothing needs undoing but metadata.
+    """
+
+
+class ApprovalRefused(Exception):
+    """A session decision (or the approver) refused this request."""
+
+    def __init__(self, rule: str):
+        super().__init__(rule)
+        self.rule = rule
+
+
+def _requester(flow: http.HTTPFlow):
+    """The authenticated client name (flow_client), for prompts and session keys.
+
+    Part of every approval key, so one client's "allow for session" never
+    covers another client.
+    """
+    try:
+        return flow_client(flow)
+    except Exception:  # noqa: BLE001 - a description must never fail a request
+        return None
+
+
+def _approval_needed(flow: http.HTTPFlow, request) -> None:
+    """Record that *request* needs approval unless already decided."""
+    if request.key in flow.metadata.get(APPROVAL_GRANTS, ()):
+        return
+    remembered = approvals.default_broker().session_decision(request.key)
+    if remembered == "allow":
+        log.info("secret_proxy: APPROVAL allow (session) %s", request.summary())
+        return
+    if remembered == "deny":
+        log.warning("secret_proxy: APPROVAL deny (session) %s", request.summary())
+        raise ApprovalRefused(approvals.RULE_DENIED)
+    pending = flow.metadata.setdefault(APPROVAL_PENDING, [])
+    if all(item.key != request.key for item in pending):
+        pending.append(request)
+
+
+def _approval_gate(flow: http.HTTPFlow) -> None:
+    """Stop before any secret is resolved while an approval is outstanding."""
+    if flow.metadata.get(APPROVAL_PENDING):
+        raise ApprovalRequired()
+
+
+def approval_pending(flow: http.HTTPFlow) -> list:
+    """Requests the last hook pass is waiting on (entry.py), and clear them."""
+    return list(flow.metadata.pop(APPROVAL_PENDING, None) or ())
+
+
+def approval_grant(flow: http.HTTPFlow, keys) -> None:
+    """Allow these exact keys for the rest of this flow only (allow once)."""
+    granted = set(flow.metadata.get(APPROVAL_GRANTS, ()))
+    granted.update(keys)
+    flow.metadata[APPROVAL_GRANTS] = frozenset(granted)
+
+
+def _approval_refused_body(rule: str) -> bytes:
+    return json.dumps({
+        "error": "secret_proxy_approval_denied",
+        "rule": rule,
+        "detail": f"secret-proxy refused this request ({rule})",
+    }).encode()
+
+
+def approval_refusal(flow: http.HTTPFlow, request, rule: str) -> None:
+    """The requester's error: only the rule, never the prompt details."""
+    info = request.describe() if request is not None else {}
+    if info.get("kind") == "aws" and _is_aws_sigv4(flow):
+        op = awsops.AwsOperation(info.get("service", awsops.UNKNOWN),
+                                 info.get("operation", awsops.UNKNOWN), _aws_protocol(flow))
+        decision = awsops.Decision(awsops.DENY, f"approval refused ({rule})", rule)
+        _aws_denied_response(flow, AwsOperationDenied(op, decision, None, None))
+        return
+    flow.response = http.Response.make(
+        403, _approval_refused_body(rule),
+        {"content-type": "application/json", "cache-control": "no-store"},
+    )
+
+
 def _canonical_ref(ref: str) -> str:
     """Return the manifest's canonical name for *ref*, failing closed.
 
@@ -348,12 +447,27 @@ def _placement_allowed(
     username: str | None = None,
     host: str | None = None,
     path: str | None = None,
+    approval: bool = True,
 ) -> bool:
-    """Return whether one complete use matches a manifest placement."""
+    """Return whether one complete use matches a manifest placement.
+
+    When the matching placement asks for approval, the use is recorded as
+    pending (or refused by a session decision); the caller's gate stops before
+    the secret is resolved.
+    """
     manifest = _current_manifest()
     if manifest is None:
         return False
     target = host if host is not None else (flow.request.host or "")
+    context = dict(
+        kind=kind,
+        host=target,
+        method=flow.request.method or "",
+        path=path if path is not None else (flow.request.path or "/"),
+        name=name,
+        template=template,
+        username=username,
+    )
     try:
         grant = _client_grant(flow)
         if grant is not None and not grant.may_use_secret(canonical):
@@ -361,25 +475,32 @@ def _placement_allowed(
             return False
         if not _pinned_host_allows(canonical, target):
             return False
-        context = dict(
-            kind=kind,
-            host=target,
-            method=flow.request.method or "",
-            path=path if path is not None else (flow.request.path or "/"),
-            name=name,
-            template=template,
-            username=username,
-        )
+        # The client grant is checked before approval: a request outside the
+        # client's grants is refused, never offered for approval.
         granted = None if grant is None else grant.granted_placements(canonical)
-        if granted is None:
-            return bool(manifest.placement_allowed(canonical, **context))
-        # The client may use only some placements: one of those must match.
-        if not granted.intersection(manifest.placement_indices(canonical, **context)):
+        matcher = getattr(manifest, "match_placement", None)
+        if matcher is None:  # a manifest without approval support (test fakes)
+            if granted is None:
+                return bool(manifest.placement_allowed(canonical, **context))
+            if not granted.intersection(manifest.placement_indices(canonical, **context)):
+                _client_denied(flow, canonical + " in this placement")
+                return False
+            return True
+        match = matcher(canonical, allowed=granted, **context)
+        if match is None and granted is not None and manifest.placement_allowed(canonical, **context):
+            # The client may use only some placements: one of those must match.
             _client_denied(flow, canonical + " in this placement")
-            return False
-        return True
     except Exception:  # noqa: BLE001 - policy failures must fail closed
         return False
+    if match is None:
+        return False
+    if approval and match.approval is not None:
+        _approval_needed(flow, approvals.placement_request(
+            secret=canonical, kind=kind, name=name, host=target,
+            method=context["method"], path=context["path"],
+            rule=match.rule(canonical), client=_requester(flow),
+        ))
+    return True
 
 
 def _sentinel_resolve(ref: str, flow: http.HTTPFlow) -> tuple[str, str, int, str]:
@@ -400,18 +521,32 @@ def _sentinel_resolve(ref: str, flow: http.HTTPFlow) -> tuple[str, str, int, str
                 _client_denied(flow, canonical)
                 raise PolicyViolation(canonical, SENTINEL_HOST)
             granted = grant.granted_placements(canonical)
-        eligible = bool(info and any(
-            placement.kind == "url-rewrite"
+        candidates = [
+            (index, placement)
+            for index, placement in enumerate(info.placements if info else ())
+            if placement.kind == "url-rewrite"
             and (not placement.methods or method in placement.methods)
             and (granted is None or index in granted)
-            for index, placement in enumerate(info.placements)
-        ))
+        ]
+        eligible = bool(candidates)
+        needs_approval = next(
+            (index for index, placement in candidates
+             if getattr(placement, "approval", None) is not None), None)
     except PolicyViolation:
         raise
     except Exception:  # noqa: BLE001 - policy failures must fail closed
         eligible = False
     if not eligible:
         raise PolicyViolation(canonical, SENTINEL_HOST)
+    if needs_approval is not None:
+        # The destination is itself the secret, so the approval is asked
+        # before it is resolved: the prompt names the sentinel, not the URL.
+        _approval_needed(flow, approvals.placement_request(
+            secret=canonical, kind="url-rewrite", name=None, host=SENTINEL_HOST,
+            method=method, path=flow.request.path, client=_requester(flow),
+            rule=f"{canonical}.placements[{needs_approval}]",
+        ))
+    _approval_gate(flow)
 
     url = _resolve(canonical)
     try:
@@ -430,6 +565,7 @@ def _sentinel_resolve(ref: str, flow: http.HTTPFlow) -> tuple[str, str, int, str
         kind="url-rewrite",
         host=resolved_host,
         path=target_path,
+        approval=False,  # already approved above, before resolution
     ):
         raise PolicyViolation(canonical, resolved_host)
 
@@ -778,6 +914,7 @@ def _apply_use(
     canonical, _template, match = _validate_use(
         value, flow, kind=kind, name=name, username=username,
     )
+    _approval_gate(flow)  # never resolve a secret that still needs approval
     injected.append(f"{log_sink}<-{canonical}")
     resolved_value = _resolve(canonical)
     return value[:match.start()] + resolved_value + value[match.end():]
@@ -899,6 +1036,7 @@ def _plan_request_metadata(flow: http.HTTPFlow) -> dict:
         canonical, _template, match = _validate_use(
             password, flow, kind="basic-password", username=username,
         )
+        _approval_gate(flow)
         planned.append(f"Basic<-{canonical}")
         resolved_password = (
             password[:match.start()] + _resolve(canonical) + password[match.end():]
@@ -1045,6 +1183,7 @@ def _restore_metadata_snapshot(flow: http.HTTPFlow) -> None:
 def _inject_request_metadata(flow: http.HTTPFlow, injected: list[str]) -> dict:
     """Preflight, plan, and atomically substitute metadata references."""
     _preflight_request(flow, include_body=False)
+    _approval_gate(flow)
     plan = _plan_request_metadata(flow)
     if plan["headers"] or plan["query"]:
         flow.metadata.setdefault("secret_proxy_metadata_original", _metadata_snapshot(flow))
@@ -1063,6 +1202,13 @@ def _inject_request_metadata(flow: http.HTTPFlow, injected: list[str]) -> dict:
 def _set_injection_error(flow: http.HTTPFlow, injected: list[str], error: Exception) -> None:
     """Set the safe response used when metadata injection fails."""
     host = flow.request.host
+    if isinstance(error, ApprovalRefused):
+        log.warning("secret_proxy: BLOCKED %s %s - %s", flow.request.method, host, error.rule)
+        flow.response = http.Response.make(
+            403, _approval_refused_body(error.rule),
+            {"content-type": "application/json", "cache-control": "no-store"},
+        )
+        return
     if isinstance(error, PolicyViolation):
         log.warning(
             f"secret_proxy: BLOCKED {flow.request.method} {host} - name '{error.name}' "
@@ -1523,6 +1669,9 @@ def _request_locked(flow: http.HTTPFlow) -> None:
             flow.metadata.pop("secret_proxy_metadata_original", None)
             return
         _preflight_request(flow, include_body=True)
+        if _is_aws_sigv4_ours(flow):
+            _aws_approval_precheck(flow, flow.request.raw_content)
+        _approval_gate(flow)
         metadata_plan = _plan_request_metadata(flow)
         body_plan = _plan_request_body(flow, metadata_plan)
 
@@ -1548,6 +1697,13 @@ def _request_locked(flow: http.HTTPFlow) -> None:
             return
 
         flow.metadata.pop("secret_proxy_metadata_original", None)
+    except ApprovalRequired:
+        # Held for approval; the re-run must see the same hook state.
+        if injected:
+            flow.metadata["secret_proxy_metadata_injected"] = tuple(injected)
+        if metadata_logged:
+            flow.metadata["secret_proxy_metadata_logged"] = True
+        raise
     except PolicyViolation as e:
         _restore_metadata_snapshot(flow)
         _set_injection_error(flow, injected, e)
@@ -1619,7 +1775,15 @@ def _run_hook(flow: http.HTTPFlow, handler) -> None:
         _set_injection_error(flow, [], e)
         return
     with _bind_generation(generation):
-        handler(flow)
+        try:
+            handler(flow)
+        except ApprovalRequired:
+            # Nothing was resolved; undo any metadata change and hold the flow.
+            _restore_metadata_snapshot(flow)
+            if not flow.metadata.get(APPROVAL_HANDLER):
+                # No runtime adapter will ask anyone: refuse, never forward.
+                pending = approval_pending(flow)
+                approval_refusal(flow, pending[0] if pending else None, approvals.RULE_REQUIRED)
 
 
 def request(flow: http.HTTPFlow) -> None:
@@ -1932,10 +2096,29 @@ def _aws_selected_target(flow: http.HTTPFlow, default_target) -> tuple:
     return account, role
 
 
-def _aws_policy_check(flow: http.HTTPFlow, body):
+def _aws_protocol(flow: http.HTTPFlow) -> str:
+    try:
+        return awsops.classify(_aws_request_view(flow, None)).protocol
+    except Exception:  # noqa: BLE001
+        return awsops.PROTOCOL_UNKNOWN
+
+
+def _aws_approval_precheck(flow: http.HTTPFlow, body) -> None:
+    """Collect an AWS approval before any other secret is resolved.
+
+    A denial is left for the real check, which reports it in the usual way.
+    """
+    try:
+        _aws_policy_check(flow, body, quiet=True)
+    except AwsOperationDenied:
+        pass
+
+
+def _aws_policy_check(flow: http.HTTPFlow, body, quiet: bool = False):
     """Identify the AWS operation and enforce the policy, before any creds work.
 
-    Returns (operation, decision, account, role) when allowed; raises
+    Returns (operation, decision, account, role) when allowed or awaiting
+    approval (the caller's gate stops before minting); raises
     AwsOperationDenied when denied. *body* is None when unavailable.
     """
     try:
@@ -1968,13 +2151,26 @@ def _aws_policy_check(flow: http.HTTPFlow, body):
     # A scoped client's grant is checked first: no override can widen it.
     denied = _aws_client_denial(flow, account, role, op)
     if denied is not None:
-        log.warning("secret_proxy: AWS DENY %s %s (%s)", who, op.label, denied.reason)
+        if not quiet:
+            log.warning("secret_proxy: AWS DENY %s %s (%s)", who, op.label, denied.reason)
         raise AwsOperationDenied(op, denied, account, role)
     decision = policy.evaluate(op, account, role)
+    if decision.needs_approval:
+        try:
+            _approval_needed(flow, approvals.aws_request(
+                account=account, role=role, service=op.service, operation=op.operation,
+                rule=decision.rule, host=flow.request.host or "", method=flow.request.method or "",
+                path=flow.request.path or "/", client=_requester(flow),
+            ))
+        except ApprovalRefused as refused:
+            denied = awsops.Decision(awsops.DENY, f"approval refused ({refused.rule})", refused.rule)
+            raise AwsOperationDenied(op, denied, account, role) from None
+        return op, decision, account, role
     if not decision.allowed:
-        log.warning(
-            "secret_proxy: AWS DENY %s %s (%s; rule=%s)", who, op.label, decision.reason, decision.rule,
-        )
+        if not quiet:
+            log.warning(
+                "secret_proxy: AWS DENY %s %s (%s; rule=%s)", who, op.label, decision.reason, decision.rule,
+            )
         raise AwsOperationDenied(op, decision, account, role)
     if decision.overridden:
         log.warning("secret_proxy: AWS ALLOW (override) %s %s", who, op.label)
@@ -2063,6 +2259,7 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
         return None
     # The operation decision precedes the provider, any STS mint and re-signing.
     op, decision, policy_account, policy_role = _aws_policy_check(flow, body)
+    _approval_gate(flow)  # an "approve" rule: nothing is minted until answered
     provider = _get_aws_provider()
     if provider is None:
         log.warning(f"secret_proxy: {flow.request.host} AWS SigV4 but no creds provider (aws-okta.json missing) - passthrough")
@@ -2193,6 +2390,13 @@ def _requestheaders_locked(flow: http.HTTPFlow) -> None:
     if is_aws_sigv4 and payload_hash is not None and not defer_for_body:
         must_finish_now = True
 
+    if must_finish_now:
+        # Approvals are collected before any reference is resolved or any AWS
+        # credential minted, and before a streaming body starts to flow.
+        _collect_streaming_approvals(
+            flow, aws=is_aws_ours and payload_hash is not None and not defer_for_body,
+        )
+
     if must_finish_now and _metadata_has_secret_reference(flow):
         try:
             _inject_request_metadata(flow, injected)
@@ -2234,6 +2438,25 @@ def _requestheaders_locked(flow: http.HTTPFlow) -> None:
     else:
         flow.request.stream = True  # seed already re-signed; stream body unchanged
     log.info(f"secret_proxy: {flow.request.method} {flow.request.host} - AWS re-signed (streaming) as {flow.metadata.get('secret_proxy_aws')} {flow.metadata.get('secret_proxy_aws_operation', '')}")
+
+
+def _collect_streaming_approvals(flow: http.HTTPFlow, *, aws: bool) -> None:
+    """Gate a request that is finished in requestheaders (body not read yet).
+
+    A preflight error is not reported here: the real pass below raises it
+    again, so nobody is asked to approve a request that would be refused.
+    """
+    if _metadata_has_secret_reference(flow):
+        try:
+            _preflight_request(flow, include_body=False)
+        except ApprovalRequired:
+            raise
+        except Exception:  # noqa: BLE001 - reported by the injection pass
+            flow.metadata.pop(APPROVAL_PENDING, None)
+            return
+    if aws:
+        _aws_approval_precheck(flow, None)
+    _approval_gate(flow)
 
 
 def requestheaders(flow: http.HTTPFlow) -> None:

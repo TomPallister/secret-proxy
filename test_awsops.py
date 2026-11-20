@@ -378,7 +378,7 @@ class PolicyFileTests(unittest.TestCase):
             b'{"version": 1, "version": 1, "rules": []}',
         ]
         rule_mutations = [
-            {**good_rule, "action": "approve"}, {**good_rule, "action": "Allow"},
+            {**good_rule, "action": "approved"}, {**good_rule, "action": "Allow"},
             {**good_rule, "service": "S3"}, {**good_rule, "service": "s3.x"}, {**good_rule, "service": ""},
             {**good_rule, "operations": []}, {**good_rule, "operations": "DeleteBucket"},
             {**good_rule, "operations": ["Delete[Bucket]"]}, {**good_rule, "operations": ["a.b"]},

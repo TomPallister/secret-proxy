@@ -35,7 +35,8 @@ BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
                'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
-               'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py')
+               'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py',
+               'approvals.py')
 
 
 class HostError(Exception):
@@ -283,6 +284,16 @@ def serve(deployment: Deployment):
     clients = client_tokens(deployment, capability)
     if clients:
         bundle['client_tokens'] = clients
+    # A fresh approver-only capability every boot (issue #3). It stays in
+    # secagent's private directory: no client token is ever an approver, so a
+    # requesting client cannot answer its own approval prompt.
+    approver_file = deployment.private / 'approver-token'
+    approver = secrets.token_hex(24)
+    if approver == capability or approver in clients.values():
+        raise HostError('Approver capability collided with a client capability')
+    atomic(approver_file, (approver + '\n').encode(), 0o600)
+    bundle['approver_token'] = approver
+    approver = ''
     ready = deployment.shared / 'ready.json'
     ready.unlink(missing_ok=True)
     child = subprocess.Popen(container_command(deployment, image, gateway), env=engine_env(), stdin=subprocess.PIPE)
@@ -331,6 +342,7 @@ def serve(deployment: Deployment):
         raise HostError('Candidate failed readiness')
     finally:
         ready.unlink(missing_ok=True)
+        approver_file.unlink(missing_ok=True)
         if relay_id:
             try:
                 checked(engine(deployment, 'rm', '-f', relay_id), 'candidate relay cleanup')
@@ -363,6 +375,19 @@ def stop_instance(deployment):
             raise HostError('Invalid candidate identity')
         # Pin the exact instance before stopping; never act on the VPN name/ID.
         checked(engine(deployment, 'rm', '-f', identifier, timeout=30), 'candidate stop')
+
+
+def approvals_session(deployment: Deployment):
+    """Answer approval prompts as secagent; the approver capability stays here."""
+    import client as client_module
+    if not os.isatty(0):
+        raise HostError('Approvals need an attached terminal')
+    try:
+        approver = private_read(deployment.private / 'approver-token', 49).decode('ascii').strip()
+    except FileNotFoundError:
+        raise HostError('The proxy is not running, or predates approvals; start it first') from None
+    client = ProxyClient({'sharedDir': str(deployment.shared), 'port': deployment.port})
+    client_module.approvals_loop(client, approver)
 
 
 def validate_bootstrap_config(config: dict):
@@ -450,7 +475,7 @@ def relay_exec(argv: list, bundle: dict):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['up', 'prepare', 'serve', 'stop'])
+    parser.add_argument('command', choices=['up', 'prepare', 'serve', 'stop', 'approvals'])
     parser.add_argument('instance')
     parser.add_argument('--bootstrap', type=Path)
     parser.add_argument('--op', type=Path, help='Absolute desktop-integrated op executable (up only)')
@@ -477,14 +502,31 @@ def main():
         relay_exec(as_secagent('serve', args.instance), bundle)
         raise AssertionError('exec unexpectedly returned')
     if os.getuid() != pwd.getpwnam('secagent').pw_uid:
-        if args.command != 'stop':
+        if args.command not in ('stop', 'approvals'):
             raise HostError('This operation must run as secagent')
         checked(subprocess.run(['/usr/bin/sudo', '-v'], timeout=120), 'sudo authentication')
-        return subprocess.run(as_secagent('stop', args.instance)).returncode
+        if args.command == 'approvals':
+            # Ctrl-C also reaches the secagent child, which denies the prompt
+            # on screen before it exits; give it time instead of killing it.
+            child = subprocess.Popen(as_secagent(args.command, args.instance))
+            try:
+                return child.wait()
+            except KeyboardInterrupt:
+                try:
+                    return child.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    return child.wait()
+        return subprocess.run(as_secagent(args.command, args.instance)).returncode
     if args.command == 'prepare':
         prepare(deployment)
     elif args.command == 'serve':
         return serve(deployment)
+    elif args.command == 'approvals':
+        try:
+            approvals_session(deployment)
+        except KeyboardInterrupt:
+            return 130
     else:
         stop_instance(deployment)
     return 0

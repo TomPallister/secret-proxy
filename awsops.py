@@ -22,11 +22,12 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, unquote_to_bytes
 
-# Decision actions. "approve" is reserved for the approval-rules feature and is
-# deliberately not accepted by the validator yet.
+# Decision actions. "approve" holds the request until a person answers; a deny
+# rule always wins over it and can never be approved.
 ALLOW = "allow"
 DENY = "deny"
-ACTIONS = (ALLOW, DENY)
+APPROVE = "approve"
+ACTIONS = (ALLOW, DENY, APPROVE)
 
 UNKNOWN = "Unknown"            # missing, malformed, ambiguous or unverifiable
 UNCLASSIFIED = "Unclassified"  # well-formed REST request with no named operation
@@ -116,7 +117,7 @@ class AwsOperation:
 
 @dataclass(frozen=True)
 class Decision:
-    action: str            # "allow" | "deny" ("approve" reserved)
+    action: str            # "allow" | "deny" | "approve"
     reason: str            # fixed text, safe to log and to return
     rule: str = ""         # which rule decided, for logs
     overridden: bool = False
@@ -124,6 +125,10 @@ class Decision:
     @property
     def allowed(self) -> bool:
         return self.action == ALLOW
+
+    @property
+    def needs_approval(self) -> bool:
+        return self.action == APPROVE
 
 
 # --- identification ---------------------------------------------------------
@@ -549,7 +554,7 @@ def parse_policy(document: object) -> Tuple[Rule, ...]:
             raise AwsPolicyError(f"{where}: action, service and operations are required")
         action = rule["action"]
         if action not in ACTIONS:
-            raise AwsPolicyError(f"{where}: action must be allow or deny")
+            raise AwsPolicyError(f"{where}: action must be allow, deny or approve")
         service = rule["service"]
         if not isinstance(service, str) or _SERVICE_GLOB_RE.fullmatch(service) is None:
             raise AwsPolicyError(f"{where}: service must be a glob over [a-z0-9-*?]")
@@ -608,8 +613,10 @@ class AwsOperationPolicy:
 
     Order: a matching deny rule denies (built-in rules always apply and cannot be
     removed by the file); a matching override for the exact account and role
-    then allows it. Otherwise, when allow rules exist for the service, the
-    operation must match one of them. Everything else is allowed.
+    then allows it. A matching approve rule then asks a person, so a deny rule
+    can never be approved but an overridden operation can still require
+    approval. Otherwise, when allow rules exist for the service, the operation
+    must match one of them. Everything else is allowed.
     """
 
     def __init__(self, rules: Sequence[Rule] = (), overrides: Sequence[Override] = ()):
@@ -620,8 +627,11 @@ class AwsOperationPolicy:
                  role: Optional[str] = None) -> Decision:
         override = next((o for o in self.overrides if o.matches(op, account, role)), None)
         deny = next((r for r in self.rules if r.action == DENY and r.matches(op)), None)
+        approve = next((r for r in self.rules if r.action == APPROVE and r.matches(op)), None)
         if deny is not None:
             if override is not None:
+                if approve is not None:
+                    return Decision(APPROVE, "the operation requires approval", approve.source, True)
                 return Decision(ALLOW, "explicit role override", "operation_overrides", True)
             if op.operation == UNKNOWN:
                 reason = f"the operation could not be identified safely ({op.reason or 'unknown'})"
@@ -630,6 +640,8 @@ class AwsOperationPolicy:
             else:
                 reason = f"the operation is denied by {deny.source}"
             return Decision(DENY, reason, deny.source)
+        if approve is not None:
+            return Decision(APPROVE, "the operation requires approval", approve.source)
         allows = [r for r in self.rules if r.action == ALLOW
                   and fnmatch.fnmatchcase(op.service.lower(), r.service.lower())]
         if allows:

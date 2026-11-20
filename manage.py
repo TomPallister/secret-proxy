@@ -273,6 +273,12 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None,
     elif command == 'login':
         extra = [] if provider in (None, 'chatgpt') else ['--provider', provider]
         os.execv(PYTHON, [PYTHON, client, '--config', config, *scoped, 'login', *extra])
+    elif command == 'approvals':
+        if not os.isatty(0) or not os.isatty(1):
+            raise ClientError('Approvals need an attached terminal')
+        # host.py asks for sudo, then answers prompts as secagent: the
+        # approver capability is never readable by this user or its clients.
+        os.execv(PYTHON, [PYTHON, host, 'approvals', instance])
     elif command == 'trust-ca':
         trust_ca(selected_client(settings), settings, Keychain())
     elif command == 'untrust-ca':
@@ -294,7 +300,7 @@ def main(argv=None):
                         help='Private metadata file, never a token file')
     commands = parser.add_subparsers(dest='command', required=True)
     client_help = 'Scoped client whose token to use (default: default)'
-    for name in ('start', 'stop', 'trust-ca', 'untrust-ca'):
+    for name in ('start', 'stop', 'trust-ca', 'untrust-ca', 'approvals'):
         commands.add_parser(name)
     commands.add_parser('status').add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
     for name in ('login', 'auth-status'):

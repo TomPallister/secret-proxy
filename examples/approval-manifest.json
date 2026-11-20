@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "approvals": {"timeoutSeconds": 120, "maxPromptsPerMinute": 10},
+  "egress": {
+    "mode": "allowlist",
+    "allow": ["*.example.com"],
+    "allowlistMiss": "approve"
+  },
+  "secrets": {
+    "EXAMPLE_API_TOKEN": {
+      "placements": [
+        {"kind": "header", "hosts": ["api.example.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "HEAD"]},
+        {"kind": "header", "hosts": ["api.example.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["POST", "PUT", "PATCH", "DELETE"], "approval": "prompt"}
+      ]
+    }
+  }
+}

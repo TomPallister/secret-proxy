@@ -59,7 +59,7 @@ def read_bootstrap(fd: int, timeout: float = 30) -> dict:
         return result
     obj = json.loads(data, object_pairs_hook=unique)
     if not isinstance(obj, dict) or not {"op_token", "proxy_token"} <= set(obj) \
-            or set(obj) - {"op_token", "proxy_token", "client_tokens"}:
+            or set(obj) - {"op_token", "proxy_token", "client_tokens", "approver_token"}:
         raise ValueError("invalid bootstrap fields")
     op = obj["op_token"]
     if not isinstance(op, str) or not op or not op.isascii() or any(c.isspace() or ord(c) < 33 for c in op):
@@ -78,6 +78,13 @@ def read_bootstrap(fd: int, timeout: float = 30) -> dict:
                 or token in seen):
             raise ValueError("invalid client capabilities")
         seen.add(token)
+    # Optional: the approver-only capability for approval prompts (issue #3).
+    # It must differ from every client token: no client may approve itself.
+    approver = obj.get("approver_token")
+    if approver is not None and (not isinstance(approver, str)
+                                 or re.fullmatch(r"[0-9a-f]{48}", approver) is None
+                                 or approver in seen):
+        raise ValueError("invalid approver capability")
     return obj
 
 
@@ -115,6 +122,10 @@ def command(config: Path, state: Path, auth: Path, port: int, capabilities: dict
         "OP_SERVICE_ACCOUNT_TOKEN": capabilities["op_token"],
         "SECRET_PROXY_INSTANCE_ID": secrets.token_hex(16),
     }
+    if capabilities.get("approver_token"):
+        # Only a digest: the proxy can check an answer but not make one.
+        env["SECRET_PROXY_APPROVER_DIGEST"] = hashlib.sha256(
+            capabilities["approver_token"].encode("ascii")).hexdigest()
     return args, env
 
 

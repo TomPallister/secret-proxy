@@ -113,33 +113,40 @@ class ProxyClient:
         self.client = check_client_name(client)
         self.env = client_env(config, client)
 
-    def call(self, path: str, body: bytes | None = None, *, tls: bool = True) -> dict:
+    def request(self, path: str, body: bytes | None = None, *, tls: bool = True,
+                headers: dict | None = None, timeout: float = 45) -> tuple:
+        """One sentinel request; returns (status, body). Never follows redirects."""
         # Explicit CONNECT; never honour ambient proxy/no_proxy or redirects.
         parsed = urllib.parse.urlsplit(self.env['HTTPS_PROXY'])
         auth = base64.b64encode(f'{parsed.username}:{parsed.password}'.encode()).decode()
         if tls:
             context = ssl.create_default_context()
             context.load_verify_locations(self.env['SSL_CERT_FILE'])
-            connection = http.client.HTTPSConnection('127.0.0.1', self.config['port'], context=context, timeout=45)
+            connection = http.client.HTTPSConnection('127.0.0.1', self.config['port'], context=context, timeout=timeout)
             connection.set_tunnel(HOST, 443, headers={'Proxy-Authorization': 'Basic ' + auth})
             target = path
-            headers = {'Content-Type': 'text/plain'}
+            sent = {'Content-Type': 'text/plain'}
         else:
             connection = http.client.HTTPConnection('127.0.0.1', self.config['port'], timeout=5)
             target = 'http://' + HOST + path
-            headers = {'Proxy-Authorization': 'Basic ' + auth, 'Content-Type': 'text/plain'}
+            sent = {'Proxy-Authorization': 'Basic ' + auth, 'Content-Type': 'text/plain'}
+        sent.update(headers or {})
         try:
-            connection.request('POST' if body is not None else 'GET', target, body=body, headers=headers)
+            connection.request('POST' if body is not None else 'GET', target, body=body, headers=sent)
             response = connection.getresponse()
-            data = response.read(65537)
-            if response.status != 200 or len(data) > 65536:
-                raise ClientError('Proxy request failed; check readiness or login state')
-            result = json.loads(data)
-            if not isinstance(result, dict):
-                raise ClientError('Invalid proxy response')
-            return result
+            # Callers refuse a body over 65536 bytes.
+            return response.status, response.read(65537)
         finally:
             connection.close()
+
+    def call(self, path: str, body: bytes | None = None, *, tls: bool = True) -> dict:
+        status, data = self.request(path, body, tls=tls)
+        if status != 200 or len(data) > 65536:
+            raise ClientError('Proxy request failed; check readiness or login state')
+        result = json.loads(data)
+        if not isinstance(result, dict):
+            raise ClientError('Invalid proxy response')
+        return result
 
     def check_ready(self):
         expected = json.loads(private_read(Path(self.config['sharedDir']) / 'ready.json', 4096))
@@ -313,6 +320,128 @@ def device_login(client: ProxyClient, prefix: str) -> dict:
         # The proxy itself waits up to 10 seconds for GitHub's poll interval.
         time.sleep(min(max(retry - 10, 0), 60))
     raise ClientError('Login timed out')
+
+
+# --- Approval prompts (issue #3) ---------------------------------------------
+APPROVER_HEADER = 'X-Secret-Proxy-Approver'
+INSTANCE_HEADER = 'X-Secret-Proxy-Instance'
+APPROVAL_CHOICES = {'1': 'deny-once', '2': 'allow-once', '3': 'allow-session', '4': 'deny-session'}
+APPROVAL_FIELDS = ('client', 'kind', 'method', 'host', 'path', 'secret', 'placement',
+                   'account', 'role', 'service', 'operation', 'rule')
+APPROVAL_KINDS = ('secret', 'aws', 'egress')
+MIN_ANSWER_DELAY = 1.0
+
+
+def printable(value: object) -> str:
+    """Never let a description move the cursor or change the terminal."""
+    return ''.join(c if 32 <= ord(c) < 127 else '?' for c in str(value))[:200]
+
+
+def validate_prompt(value: object, instance: str) -> dict:
+    try:
+        if not isinstance(value, dict) or set(value) != {'instance', 'id', 'request', 'expiresIn', 'answerAfter'}:
+            raise ValueError()
+        if value['instance'] != instance or re.fullmatch(r'[0-9a-f]{32}', value['id']) is None:
+            raise ValueError()
+        request = value['request']
+        if (not isinstance(request, dict) or set(request) - set(APPROVAL_FIELDS)
+                or request.get('kind') not in APPROVAL_KINDS
+                or not all(isinstance(item, str) and len(item) <= 512 for item in request.values())):
+            raise ValueError()
+        if type(value['expiresIn']) is not int or not 0 <= value['expiresIn'] <= 3600:
+            raise ValueError()
+        if type(value['answerAfter']) not in (int, float) or not 0 <= value['answerAfter'] <= 60:
+            raise ValueError()
+        return value
+    except (ValueError, TypeError):
+        raise ClientError('Invalid approval prompt from the proxy') from None
+
+
+def describe_prompt(prompt: dict) -> str:
+    request = prompt['request']
+    titles = {'secret': 'A request wants to use a secret', 'aws': 'An AWS operation needs approval',
+              'egress': 'A connection to an unlisted host needs approval'}
+    lines = ['', titles[request['kind']] + ':']
+    for name in APPROVAL_FIELDS:
+        if name != 'kind' and name in request:
+            lines.append(f'  {name:<10} {printable(request[name])}')
+    lines.append(f'Expires in {prompt["expiresIn"]} s. Choose:')
+    lines.append('  1 deny once   2 allow once   3 allow for this proxy session   4 deny for this proxy session')
+    return '\n'.join(lines)
+
+
+def read_choice(fd: int, delay: float, timeout: float, sleep=time.sleep) -> str | None:
+    """Wait *delay*, discard anything typed ahead, then read one line."""
+    sleep(max(delay, MIN_ANSWER_DELAY))
+    if os.isatty(fd):
+        termios.tcflush(fd, termios.TCIFLUSH)
+    deadline = time.monotonic() + max(timeout - delay, 0)
+    data = bytearray()
+    with selectors.SelectSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                return None
+            chunk = os.read(fd, 64)
+            if not chunk:
+                return data.decode('ascii', 'replace').strip() if data else None
+            data.extend(chunk)
+            if b'\n' in data or b'\r' in data or len(data) > 64:
+                return data.splitlines()[0].decode('ascii', 'replace').strip() if data.strip() else ''
+
+
+def approvals_loop(client: ProxyClient, approver: str, *, fd: int = 0, out=None,
+                   reader=read_choice, rounds: int | None = None) -> None:
+    """Long-poll the proxy and answer one prompt at a time."""
+    out = out or sys.stderr
+    if re.fullmatch(r'[0-9a-f]{48}', approver) is None:
+        raise ClientError('Invalid approver capability')
+    client.check_ready()
+    instance = json.loads(private_read(Path(client.config['sharedDir']) / 'ready.json', 4096))['instance']
+    headers = {APPROVER_HEADER: approver, INSTANCE_HEADER: instance}
+    print('Waiting for approval requests. Ctrl-C to stop; with nobody listening, requests are denied.',
+          file=out, flush=True)
+    while rounds is None or rounds > 0:
+        if rounds is not None:
+            rounds -= 1
+        status, data = client.request('/approvals/next', headers=headers, timeout=40)
+        if status == 204:
+            continue
+        if status == 409:
+            raise ClientError('The proxy restarted; run approvals again')
+        if status != 200 or len(data) > 65536:
+            raise ClientError('The approval endpoint refused this approver')
+        prompt = validate_prompt(json.loads(data), instance)
+        print(describe_prompt(prompt), file=out, flush=True)
+        print('Choice: ', end='', file=out, flush=True)
+        try:
+            answer = reader(fd, float(prompt['answerAfter']), float(prompt['expiresIn']))
+        except KeyboardInterrupt:
+            client.request('/approvals/' + prompt['id'], json.dumps({'choice': 'deny-once'}).encode(),
+                           headers=headers, timeout=10)
+            print('\nDenied; stopped.', file=out, flush=True)
+            raise
+        if answer is None:
+            print('\nNo answer in time; the proxy denies it.', file=out, flush=True)
+            continue
+        choice = APPROVAL_CHOICES.get(answer)
+        if choice is None:
+            # A typo is not a yes: deny this request.
+            print('Not one of 1-4; denying once.', file=out, flush=True)
+            choice = 'deny-once'
+        status, data = client.request('/approvals/' + prompt['id'], json.dumps({'choice': choice}).encode(),
+                                      headers=headers, timeout=10)
+        try:
+            result = json.loads(data) if status == 200 and len(data) <= 65536 else {}
+        except ValueError:
+            result = {}
+        if result.get('instance') != instance or result.get('id') != prompt['id']:
+            print('The proxy did not accept that answer (expired or replaced); it is denied.', file=out, flush=True)
+        elif result.get('result') == 'allowed':
+            print('Allowed (' + choice + ').', file=out, flush=True)
+        else:
+            print('Denied (' + printable(result.get('rule') or choice) + ').', file=out, flush=True)
 
 
 def main():

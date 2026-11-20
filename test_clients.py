@@ -584,7 +584,8 @@ class HostTokenTests(unittest.TestCase):
 
     def test_serve_without_clients_sends_todays_bundle(self):
         self.write_manifest(None)
-        self.assertEqual(set(self.run_serve()), {"op_token", "proxy_token"})
+        # approver_token is the approvals capability (#3); it is never published.
+        self.assertEqual(set(self.run_serve()), {"op_token", "proxy_token", "approver_token"})
         self.assertEqual(sorted(p.name for p in self.deployment.shared.iterdir()),
                          ["bundle.pem", "ca.pem", "proxy-token"])  # ready.json is removed on exit
 

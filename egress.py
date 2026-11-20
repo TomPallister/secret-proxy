@@ -31,6 +31,9 @@ from typing import Callable, Iterable, Optional, Sequence, Tuple, Union
 SENTINEL_HOST = "secret" + "ref.invalid"
 
 MODES = ("open", "allowlist")
+ALLOWLIST_MISS = ("deny", "approve")
+# The rule named when an allowlist miss is held for approval (issue #3).
+APPROVAL_RULE = "egress-allowlist"
 MAX_PATTERNS = 256
 MAX_CIDRS = 64
 _LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -102,6 +105,9 @@ class Refusal:
 @dataclass(frozen=True)
 class Allowed:
     addresses: Tuple[str, ...]
+    # Set when the addresses passed but the host itself needs a person's
+    # approval (an allowlist miss with allowlistMiss "approve").
+    approval: Optional[str] = None
 
 
 Decision = Union[Allowed, Refusal]
@@ -288,8 +294,9 @@ class EgressPolicy:
 
     def __init__(self, mode: str = "open", allow: Sequence[HostPattern] = (),
                  deny: Sequence[HostPattern] = (), allowed_cidrs: Sequence[IPNetwork] = (),
-                 interception_hosts: Sequence[str] = ()):
+                 interception_hosts: Sequence[str] = (), allowlist_miss: str = "deny"):
         self.mode = mode
+        self.allowlist_miss = allowlist_miss
         self.allow = tuple(allow)
         self.deny = tuple(deny)
         self.allowed_cidrs = tuple(allowed_cidrs)
@@ -302,12 +309,17 @@ class EgressPolicy:
             return cls()
         if not isinstance(value, dict):
             raise EgressConfigError("egress must be a JSON object")
-        unknown = set(value) - {"mode", "allow", "deny", "allowPrivateCidrs"}
+        unknown = set(value) - {"mode", "allow", "deny", "allowPrivateCidrs", "allowlistMiss"}
         if unknown:
             raise EgressConfigError("egress has unknown fields: " + ", ".join(sorted(map(str, unknown))))
         mode = value.get("mode", "open")
         if mode not in MODES:
             raise EgressConfigError('egress.mode must be "open" or "allowlist"')
+        miss = value.get("allowlistMiss", "deny")
+        if miss not in ALLOWLIST_MISS:
+            raise EgressConfigError('egress.allowlistMiss must be "deny" or "approve"')
+        if mode == "open" and "allowlistMiss" in value:
+            raise EgressConfigError('egress.allowlistMiss has no effect in mode "open"; set mode "allowlist"')
 
         def patterns(field: str):
             raw = value.get(field, [])
@@ -332,10 +344,11 @@ class EgressPolicy:
         cidrs = [_cidr(item, "egress.allowPrivateCidrs") for item in raw_cidrs]
         if len(set(cidrs)) != len(cidrs):
             raise EgressConfigError("egress.allowPrivateCidrs contains duplicates")
-        return cls(mode, allow, deny, cidrs)
+        return cls(mode, allow, deny, cidrs, allowlist_miss=miss)
 
     def with_interception_hosts(self, hosts: Iterable[str]) -> "EgressPolicy":
-        return EgressPolicy(self.mode, self.allow, self.deny, self.allowed_cidrs, tuple(hosts))
+        return EgressPolicy(self.mode, self.allow, self.deny, self.allowed_cidrs, tuple(hosts),
+                            self.allowlist_miss)
 
     # -- host-name decision -------------------------------------------------
     def host_refusal(self, host: str) -> Optional[str]:
@@ -355,10 +368,15 @@ class EgressPolicy:
         return self._allowlist_miss(host)
 
     def _allowlist_miss(self, host: str) -> Optional[str]:
-        # Hook point for the approval flow (issue #3): an allowlist miss could
-        # be routed to a pending approval here instead of an immediate refusal.
-        # Until that exists every miss is refused.
-        return "egress-allowlist"
+        # Always a refusal rule: with allowlistMiss "approve", check() turns
+        # this one rule into an approval after the addresses have passed.
+        return APPROVAL_RULE
+
+    def approval_rule(self, host: str) -> Optional[str]:
+        """The rule needing approval for a normalized host, or None."""
+        if self.allowlist_miss != "approve":
+            return None
+        return APPROVAL_RULE if self.host_refusal(host) == APPROVAL_RULE else None
 
     # -- full decision ------------------------------------------------------
     def check(self, host: object, port: int, resolver: Resolver) -> Decision:
@@ -377,6 +395,11 @@ class EgressPolicy:
             if rule is not None:
                 return Refusal(rule)
         rule = self.host_refusal(normalized)
+        approval = None
+        if rule == APPROVAL_RULE and self.allowlist_miss == "approve":
+            # Deny lists, metadata names and address rules were checked first
+            # and still refuse; only a plain allowlist miss can be approved.
+            approval, rule = rule, None
         if rule is not None:
             return Refusal(rule)
         if literal:
@@ -395,7 +418,7 @@ class EgressPolicy:
                 checked.append(address)
         if not checked:
             return UNRESOLVED
-        return Allowed(tuple(checked))
+        return Allowed(tuple(checked), approval)
 
 
 def system_resolver(host: str, port: int) -> Sequence[str]:
