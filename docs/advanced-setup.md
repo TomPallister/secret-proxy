@@ -23,6 +23,19 @@ Supply a private directory containing:
 - Optional `client-environment.json`: tool variables containing canonical
   references and non-secret settings. No real credentials. Loader/interpreter
   environment overrides are refused.
+- Optional `ca.json`: exactly `{"mode": "name-constrained"}`. The proxy then
+  generates its own CA with critical name constraints covering only its
+  interception hosts (exact names, the fixed suffix after a wildcard's last `*`,
+  the internal sentinel, `amazonaws.com` with AWS, `auth.openai.com` with
+  ChatGPT), excluding every IPv4/IPv6 address. Installation refuses a host
+  pattern without a fixed suffix of at least two labels (e.g. `*.com`). New
+  setups enable this by default; without the file mitmproxy's own unconstrained
+  CA is used exactly as before. Existing instances keep their CA: opting in is a
+  policy change (a new candidate, or an operator-placed root-owned file), and the
+  first constrained start retires the old CA into `retired/` in its volume.
+  Removing `ca.json` later is refused at start while a constrained CA is present.
+  A client that CONNECTs to an IP address instead of a name gets a certificate
+  with an IP address, which constrained verifiers reject.
 - `bootstrap.json` (desktop-side only): account/vault/item metadata for the
   Login item holding the scoped service-account token. This file contains
   **no token** and is not copied into the proxy configuration.

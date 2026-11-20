@@ -70,8 +70,16 @@ engineering evidence, not a penetration test or a security certification.
 - **Other GitHub OAuth apps.** Blocking a client's own device flow covers only
   the OAuth client IDs of the proxy-owned logins that are enabled. A client with
   network access to GitHub can still sign in with a different app.
-- **Narrow CA authority.** Intercepting only configured hosts does not constrain
-  the authority of a trusted root CA. The launcher does not install global trust.
+- **Narrow CA authority by default.** Intercepting only configured hosts does not
+  constrain the authority of a trusted root CA. The launcher never installs global
+  trust. An opt-in `ca.json` makes the proxy CA name-constrained (critical, DNS
+  names only, every IP address excluded); `trust-ca` refuses any other CA. Its
+  authority still covers whole subtrees: `api.github.com` permits names below it,
+  and a wildcard permits its whole fixed suffix (`*.amazonaws.com` permits all of
+  `amazonaws.com`), and enabling a GitHub login permits all of its domain
+  (`github.com`). Whoever can read the CA key (secagent, root) can impersonate
+  those names to every application trusting it. Name constraints are enforced by
+  macOS, Go, OpenSSL/LibreSSL and curl; an application with its own verifier might not.
 - **An atomic VPN kill switch.** Interface/container watchdogs are secondary.
   The external VPN owner must enforce fail-closed routes; no live VPN acceptance
   is claimed merely because the disposable namespace tests pass.

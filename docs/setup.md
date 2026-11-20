@@ -42,9 +42,11 @@ two vault names and a Login item title. Defaults are:
 | `Secret Proxy Bootstrap` Login item | Stores that token for desktop-approved startup |
 
 Choose the read-only GitHub example for the first test. ChatGPT/Codex is optional.
+Keep the default **name-constrained CA** unless you have a reason not to: it lets
+`secret-proxy trust-ca` make macOS Go tools such as `gh` work later.
 **Do not enter credentials into these prompts.** They only ask for names.
 
-The helper creates three private files, without reading 1Password:
+The helper creates three or four private files, without reading 1Password:
 
 ```text
 ~/.config/secret-proxy/
@@ -52,6 +54,7 @@ The helper creates three private files, without reading 1Password:
     manifest.json            # which credentials may go to which requests
     bootstrap.json           # where desktop startup finds its service-account token
     client-environment.json  # placeholders for client programs, not real secrets
+    ca.json                  # optional: name-constrained proxy CA
 ```
 
 Nothing is installed or started. Files are mode 0600; directories are 0700.

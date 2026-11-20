@@ -118,19 +118,47 @@ proxy adds the real token as the Basic password where the manifest allows it.
 After a proxy restart, run `secret-proxy login github` again. The existing
 vault-stored `GITHUB_TOKEN` integration is separate and unchanged.
 
-On macOS, gh is a Go program and ignores `SSL_CERT_FILE`, so it cannot trust the
-proxy certificate yet. It works in Linux containers that trust the proxy CA. On
-macOS it needs the planned `secret-proxy trust-ca` command (a separate change);
-do not disable TLS verification instead.
+On macOS, gh is a Go program and ignores `SSL_CERT_FILE`. Opt the instance into
+a name-constrained CA and run `secret-proxy trust-ca` once (see
+[compatibility limits](#compatibility-limits)); do not disable TLS verification
+instead. In Linux containers that trust the proxy CA, gh works without it.
 
 ## Compatibility limits
 
 Applications must honour the supplied proxy and CA settings. Curl and accepted
 Node/Pi paths do. **Arbitrary applications are not automatically supported.**
 
-In particular, macOS Go programs such as `gh` may not use `SSL_CERT_FILE`.
-Do not disable TLS verification to make them work. They need an explicit trust
-integration that is outside this quickstart.
+In particular, macOS Go programs such as `gh`, `op` and `terraform` ignore
+`SSL_CERT_FILE` and only use the system trust store, so they fail with
+`x509: certificate is not trusted`. Do not disable TLS verification or unset the
+proxy variables. Instead, trust a **name-constrained** proxy CA for SSL:
+
+```sh
+secret-proxy trust-ca     # one password/Touch ID prompt; no admin rights
+secret-proxy run -- gh api user
+secret-proxy untrust-ca   # undo
+```
+
+`trust-ca` needs a ready proxy. It checks that the published CA is this
+instance's, is self-signed and carries critical name constraints (DNS names only,
+all IP addresses excluded), and that it serves the proxy's own TLS. It then adds
+it to your login keychain with an SSL-only `trustRoot` user trust setting, after
+removing older CAs of the same instance. Unconstrained CAs are refused.
+
+What it grants: every application you run (not only `secret-proxy run`
+commands) accepts certificates from that CA for the permitted names, and macOS
+rejects the CA's certificates for any other name. Permitted names are the
+manifest hosts, their whole wildcard suffixes, the internal `secre` + `tref.invalid`
+name, `amazonaws.com` with AWS signing and `auth.openai.com` with ChatGPT.
+`trust-ca` prints the list. Programs outside `secret-proxy run` still go direct
+to the real servers; the trust only matters for traffic through the proxy, or
+for someone holding the CA key.
+
+Both commands are idempotent. `untrust-ca` does not need a running proxy and
+leaves other instances' entries alone. Run it before removing an installation;
+there is no uninstaller to do it for you. When the configured hosts change, the
+proxy creates a new CA at startup: run `trust-ca` again, which replaces the entry.
+`op` reads its vault directly, not through the proxy; nothing here changes that.
 
 Containers need a route to the host proxy and the public CA in their own trust
 store; `secret-proxy run` does not create or secure a container network. Existing

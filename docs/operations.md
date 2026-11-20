@@ -23,6 +23,23 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    foreground controllers to finish. It preserves volumes, trust, capability,
    policy and client auth. A new start requires browser login again.
 
+## Name-constrained CA and macOS trust
+
+With `ca.json` (see [advanced configuration](advanced-setup.md)) the proxy owns
+its CA. At each start it keeps the CA when its constraints still match the
+configured hosts; otherwise it moves the old CA files to `retired/` in the CA
+volume and creates a new one, printing the permitted names. Consumers then need
+the new public CA: restart container consumers and rerun `secret-proxy trust-ca`.
+The proxy also renews the CA 30 days before it expires.
+
+- `secret-proxy trust-ca`: trust this instance's constrained CA for SSL in your
+  login keychain (user trust settings, one authentication prompt).
+- `secret-proxy untrust-ca`: remove that trust entry and certificate. Run it
+  before deleting an instance.
+
+Neither command restarts the proxy or changes its CA. Inspect what is trusted with
+`security dump-trust-settings` (user domain). See [clients](clients.md).
+
 ## Optional authentication diagnostics
 
 `secret-proxy auth-status` reads `/chatgpt/status` over authenticated TLS and

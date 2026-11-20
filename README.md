@@ -59,6 +59,10 @@ allows.
 The proxy does not run as a background service. Use `stop` explicitly rather
 than assuming that closing its terminal stopped it.
 
+macOS Go tools such as `gh` ignore `SSL_CERT_FILE`. With a name-constrained CA
+(the setup default), `secret-proxy trust-ca` trusts it for your configured hosts
+only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
+
 ## What it supports
 
 - API keys in headers, query parameters, forms and HTTP Basic authentication.
