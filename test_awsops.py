@@ -44,7 +44,9 @@ def query_req(service, body, host=None, extra=(), query=""):
     return req("POST", host, query=query, headers=(FORM,) + tuple(extra), body=body, service=service)
 
 
-POLICY = AwsOperationPolicy()
+# A default install: setup writes the starter policy file.
+POLICY = AwsOperationPolicy(awsops.parse_policy(awsops.STARTER_POLICY))
+NO_FILE = AwsOperationPolicy()
 # An operator who wants every unidentifiable request denied adds this rule.
 STRICT = AwsOperationPolicy(awsops.parse_policy({"version": 1, "rules": [
     {"action": "deny", "service": "*", "operations": ["Unknown"]}]}))
@@ -266,7 +268,7 @@ class DefaultDenyListTests(unittest.TestCase):
             with self.subTest(request=request.headers[-1:], host=request.host, path=request.path):
                 op, decision = decide(request)
                 self.assertEqual(decision.action, "deny", op)
-                self.assertIn("credentials or secret values", decision.reason)
+                self.assertIn("aws-policy.json rule 1", decision.reason)
 
     def test_unidentifiable_secrets_manager_requests_are_denied(self):
         cases = [
@@ -327,6 +329,54 @@ class DefaultDenyListTests(unittest.TestCase):
                                 (req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn"), "deny")):
             with self.subTest(path=request.path, body=request.body):
                 self.assertEqual(policy.evaluate(classify(request), ACCOUNT, ROLE).action, action)
+
+
+class SsmResponseRuleTests(unittest.TestCase):
+    def test_decrypting_reads_are_allowed_but_marked_for_a_response_check(self):
+        for body in (b'{"Name":"x","WithDecryption":true}', b'{"Name":"x"', None):
+            with self.subTest(body=body):
+                decision = POLICY.evaluate(classify(json_req("ssm", "AmazonSSM.GetParameter", body)), ACCOUNT, ROLE)
+                self.assertEqual((decision.action, decision.inspect_response), ("allow", "aws-policy.json rule 2"))
+        unknown = classify(json_req("ssm", "AmazonSSM.GetParameter", extra=(("X-Amz-Target", "AmazonSSM.X"),)))
+        self.assertEqual(unknown.operation, "Unknown")
+        self.assertEqual(POLICY.evaluate(unknown, ACCOUNT, ROLE).inspect_response, "aws-policy.json rule 2")
+
+    def test_non_decrypting_and_other_reads_are_not_checked(self):
+        for request in (json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":false}'),
+                        json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x"}'),
+                        json_req("ssm", "AmazonSSM.DescribeParameters")):
+            with self.subTest(headers=request.headers[-1:], body=request.body):
+                decision = POLICY.evaluate(classify(request), ACCOUNT, ROLE)
+                self.assertEqual((decision.action, decision.inspect_response), ("allow", ""))
+
+    def test_override_skips_the_check(self):
+        policy = AwsOperationPolicy(awsops.parse_policy(awsops.STARTER_POLICY), awsops.parse_overrides([
+            {"account": ACCOUNT, "role": "Deployer", "service": "ssm", "operations": ["GetParameter"]}]))
+        op = classify(json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":true}'))
+        self.assertEqual(policy.evaluate(op, ACCOUNT, "Deployer").inspect_response, "")
+        self.assertEqual(policy.evaluate(op, ACCOUNT, ROLE).inspect_response, "aws-policy.json rule 2")
+
+    def test_response_detection(self):
+        detect = awsops.response_has_secure_string
+        self.assertTrue(detect(b'{"Parameter":{"Type":"SecureString","Value":"v"}}'))
+        self.assertTrue(detect(b'{"Parameters":[{"Type":"String","Value":"a"},{"Type":"securestring","Value":"b"}]}'))
+        self.assertFalse(detect(b'{"Parameter":{"Type":"String","Value":"v"}}'))
+        self.assertFalse(detect(b'{"Parameters":[{"Type":"SecureString"}]}'))  # no value returned
+        self.assertFalse(detect(b'{}'))
+        for bad in (b"", b"not json", b"\xff"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                detect(bad)
+
+    def test_when_is_validated(self):
+        for rule in ({"action": "deny", "service": "ssm", "operations": ["GetParameter"], "when": "other"},
+                     {"action": "allow", "service": "ssm", "operations": ["GetParameter"],
+                      "when": "secureStringReturned"},
+                     {"action": "approve", "service": "ssm", "operations": ["GetParameter"],
+                      "when": "secureStringReturned"},
+                     {"action": "deny", "service": "*", "operations": ["GetParameter"],
+                      "when": "secureStringReturned"}):
+            with self.subTest(rule=rule), self.assertRaises(AwsPolicyError):
+                awsops.parse_policy({"version": 1, "rules": [rule]})
 
 
 class SsmDecryptionTests(unittest.TestCase):
@@ -395,12 +445,29 @@ class PolicyFileTests(unittest.TestCase):
         _op, decision = decide(query_req("sts", b"Action=GetCallerIdentity"), policy=policy)
         self.assertEqual(decision.action, "allow")
 
-    def test_file_cannot_remove_or_allow_the_built_in_deny_list(self):
-        policy = self.policy([{"action": "allow", "service": "secretsmanager", "operations": ["*"]}])
-        _op, decision = decide(json_req("secretsmanager", "secretsmanager.GetSecretValue"), policy=policy)
+    def test_file_cannot_remove_the_built_in_safety_rule(self):
+        # An unverifiable target service is refused even when the file allows everything.
+        policy = self.policy([{"action": "allow", "service": "*", "operations": ["*"]}])
+        _op, decision = decide(req("POST", "secretsmanager.eu-west-1.amazonaws.com", "/", service="sts"),
+                               policy=policy)
         self.assertEqual(decision.action, "deny")
-        _op, decision = decide(json_req("secretsmanager", "secretsmanager.ListSecrets"), policy=policy)
+        _op, decision = decide(json_req("secretsmanager", "secretsmanager.GetSecretValue"), policy=policy)
         self.assertEqual(decision.action, "allow")
+
+    def test_without_a_policy_file_only_the_safety_rule_applies(self):
+        for request in (json_req("secretsmanager", "secretsmanager.GetSecretValue"),
+                        json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":true}'),
+                        query_req("sts", b"Action=AssumeRole")):
+            with self.subTest(headers=request.headers[-1:]):
+                decision = NO_FILE.evaluate(classify(request), ACCOUNT, ROLE)
+                self.assertEqual((decision.action, decision.inspect_response), ("allow", ""))
+        _op, decision = decide(req("POST", "secretsmanager.eu-west-1.amazonaws.com", "/", service="sts"),
+                               policy=NO_FILE)
+        self.assertEqual(decision.action, "deny")
+
+    def test_example_file_is_the_starter_policy(self):
+        example = json.loads((Path(__file__).parent / "examples/aws-policy.json").read_text())
+        self.assertEqual(example, awsops.STARTER_POLICY)
 
     def test_invalid_documents_fail(self):
         good_rule = {"action": "deny", "service": "s3", "operations": ["DeleteBucket"]}
@@ -436,7 +503,8 @@ class OverrideTests(unittest.TestCase):
                 "operations": ["GetSecretValue"], "comment": "deploy tooling"}
 
     def test_exact_role_override_allows_only_that_role(self):
-        policy = AwsOperationPolicy((), awsops.parse_overrides([self.OVERRIDE]))
+        policy = AwsOperationPolicy(awsops.parse_policy(awsops.STARTER_POLICY),
+                                    awsops.parse_overrides([self.OVERRIDE]))
         request = json_req("secretsmanager", "secretsmanager.GetSecretValue")
         decision = policy.evaluate(classify(request), ACCOUNT, "Deployer")
         self.assertEqual((decision.action, decision.overridden), ("allow", True))
@@ -489,7 +557,7 @@ class CompatibilityTests(unittest.TestCase):
             "r=awsops.AwsRequest('POST','secretsmanager.us-east-1.amazonaws.com','/','',(('Authorization',"
             "'AWS4-HMAC-SHA256 Credential=a/20260101/us-east-1/secretsmanager/aws4_request, SignedHeaders=host, Signature=x'),"
             "('X-Amz-Target','secretsmanager.GetSecretValue')),b'{}')\n"
-            "print(awsops.AwsOperationPolicy().evaluate(awsops.classify(r)).action)\n"
+            "print(awsops.AwsOperationPolicy(awsops.parse_policy(awsops.STARTER_POLICY)).evaluate(awsops.classify(r)).action)\n"
         )
         result = subprocess.run([python, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); exec(sys.argv[2])",
                                  str(Path(__file__).parent), script],

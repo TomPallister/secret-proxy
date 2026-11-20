@@ -293,6 +293,11 @@ def responseheaders(flow) -> None:
     addon.responseheaders(flow)
 
 
+def response(flow) -> None:
+    """Check buffered AWS responses that a policy rule marked for checking."""
+    addon.response(flow)
+
+
 async def requestheaders(flow) -> None:
     """Run streaming AWS re-signing away from mitmproxy's event loop."""
     # Plain HTTP has no CONNECT; refuse before any credential work.

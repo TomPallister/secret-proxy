@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import awsops
 import sigv4
 from test_injection import AddonTestCase, FakeManifest, FakeResolver, make_flow
 
@@ -55,6 +56,8 @@ class AwsPolicyAddonTestCase(AddonTestCase):
             patcher = patch.object(self.addon, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # A default install: setup writes the starter policy file.
+        self.policy_file.write_text(json.dumps(awsops.STARTER_POLICY))
         cache = patch.object(self.addon, "_aws_policy_cache", None)
         cache.start()
         self.addCleanup(cache.stop)
@@ -129,6 +132,138 @@ class AwsPolicyAddonTestCase(AddonTestCase):
         self.assertEqual(flow.request.headers["x-amz-security-token"], "fixture-session-token")
         if label:
             self.assertIn(label, self.log.getvalue())
+
+
+class SsmResponseCheckTests(AwsPolicyAddonTestCase):
+    """Parameter Store: the call goes through; a decrypted SecureString in the response is refused."""
+
+    SECRET_VALUE = "fixture-securestring-plaintext-7c1d"
+
+    def ssm_read(self, operation="GetParameter", decrypt=True):
+        body = json.dumps({"Name": "/app/db", "WithDecryption": decrypt}).encode()
+        flow = self.run_hooks(self.json_flow("ssm", "AmazonSSM." + operation, body))
+        self.assertResigned(flow, "ssm:" + operation)
+        return flow
+
+    def respond(self, flow, document, status=200, length=True, encoding=None):
+        from mitmproxy import http
+        import gzip
+        body = json.dumps(document).encode()
+        headers = {"content-type": "application/x-amz-json-1.1"}
+        if encoding == "gzip":
+            body = gzip.compress(body)
+            headers["content-encoding"] = "gzip"
+        if length:
+            headers["content-length"] = str(len(body))
+        flow.response = http.Response.make(status, body, headers)
+        if not length:
+            del flow.response.headers["content-length"]
+        self.addon.responseheaders(flow)
+        if flow.error is None:
+            self.assertFalse(flow.response.stream, "a checked response must be buffered")
+            self.addon.response(flow)
+        return flow
+
+    def parameter(self, kind, value=None):
+        return {"Name": "/app/db", "Type": kind, "Value": value or self.SECRET_VALUE, "Version": 1}
+
+    def assertRefused(self, flow, label="ssm:GetParameter"):
+        self.assertEqual(flow.response.status_code, 403)
+        self.assertIn(b"AccessDeniedException", flow.response.content)
+        self.assertIn(b"secret-proxy blocked " + label.encode(), flow.response.content)
+        self.assertNotIn(self.SECRET_VALUE.encode(), flow.response.content)
+        self.assertNotIn(self.SECRET_VALUE, self.log.getvalue())
+
+    def test_decrypted_secure_string_is_refused(self):
+        flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("SecureString")})
+        self.assertRefused(flow)
+        self.assertIn("the response contains a SecureString value", self.log.getvalue())
+
+    def test_plain_string_passes_even_when_decrypting(self):
+        flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("String", "plain-value")})
+        self.assertEqual(flow.response.status_code, 200)
+        self.assertIn(b"plain-value", flow.response.content)
+
+    def test_every_read_shape_is_checked(self):
+        for operation, document in (
+            ("GetParameters", {"Parameters": [self.parameter("String", "a"), self.parameter("SecureString")],
+                               "InvalidParameters": []}),
+            ("GetParametersByPath", {"Parameters": [self.parameter("SecureString")], "NextToken": "t"}),
+            ("GetParameterHistory", {"Parameters": [dict(self.parameter("securestring"), KeyId="alias/x")]}),
+        ):
+            with self.subTest(operation=operation):
+                self.provider.calls.clear()
+                self.assertRefused(self.respond(self.ssm_read(operation), document), "ssm:" + operation)
+
+    def test_without_decryption_the_response_is_not_checked(self):
+        flow = self.ssm_read(decrypt=False)
+        self.assertNotIn(self.addon.AWS_RESPONSE_CHECK, flow.metadata)
+
+    def respond_raw(self, flow):
+        from mitmproxy import http
+        flow.response = http.Response.make(200, b"{}", {"content-type": "application/x-amz-json-1.1"})
+        return flow
+
+    def test_unchecked_responses_still_stream(self):
+        flow = self.respond_raw(self.ssm_read(decrypt=False))
+        self.addon.responseheaders(flow)
+        self.assertTrue(flow.response.stream)
+
+    def test_gzip_encoded_response_is_decoded_and_checked(self):
+        flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("SecureString")}, encoding="gzip")
+        self.assertRefused(flow)
+
+    def test_unreadable_response_is_refused(self):
+        from mitmproxy import http
+        flow = self.ssm_read()
+        flow.response = http.Response.make(200, b"not json", {"content-length": "8"})
+        self.addon.responseheaders(flow)
+        self.addon.response(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        self.assertIn("the response could not be checked", self.log.getvalue())
+
+    def test_response_without_a_length_is_buffered_and_checked(self):
+        # HTTP/2 responses may omit Content-Length.
+        flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("SecureString")}, length=False)
+        self.assertIsNone(flow.error)
+        self.assertRefused(flow)
+        self.provider.calls.clear()
+        flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("String", "plain")}, length=False)
+        self.assertEqual(flow.response.status_code, 200)
+
+    def test_oversized_buffered_body_is_refused(self):
+        flow = self.respond(self.ssm_read(), {"pad": "x" * (awsops.RESPONSE_LIMIT + 1)}, length=False)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_stated_length_over_the_limit_is_killed(self):
+        flow = self.ssm_read()
+        from mitmproxy import http
+        flow.response = http.Response.make(200, b"{}")
+        flow.response.headers["content-length"] = str(awsops.RESPONSE_LIMIT + 1)
+        self.addon.responseheaders(flow)
+        self.assertIsNotNone(flow.error)
+
+    def test_error_responses_pass(self):
+        flow = self.respond(self.ssm_read(), {"__type": "ParameterNotFound"}, status=400)
+        self.assertEqual(flow.response.status_code, 400)
+
+    def test_role_override_skips_the_check(self):
+        self.okta_file.write_text(json.dumps({"default_account": ACCOUNT, "default_role": "ReadOnly",
+            "operation_overrides": [{"account": ACCOUNT, "role": "ReadOnly", "service": "ssm",
+                                     "operations": ["GetParameter"]}]}))
+        flow = self.ssm_read()
+        self.assertNotIn(self.addon.AWS_RESPONSE_CHECK, flow.metadata)
+
+    def test_no_policy_file_means_no_check(self):
+        self.policy_file.unlink()
+        flow = self.ssm_read()
+        self.assertNotIn(self.addon.AWS_RESPONSE_CHECK, flow.metadata)
+
+    def test_entry_wires_the_response_hook(self):
+        import entry
+        with patch.object(self.addon, "response") as hook:
+            entry.response("flow")
+        hook.assert_called_once_with("flow")
 
 
 class BufferedPathTests(AwsPolicyAddonTestCase):
@@ -217,7 +352,7 @@ class BufferedPathTests(AwsPolicyAddonTestCase):
         flow = self.run_hooks(self.json_flow("secretsmanager", "secretsmanager.GetSecretValue"))
         body = json.loads(flow.response.content)
         self.assertEqual(body["__type"], "AccessDeniedException")
-        self.assertIn("built-in deny list", body["message"])
+        self.assertIn("aws-policy.json rule 1", body["message"])
         self.assertEqual(flow.response.headers["content-type"], "application/x-amz-json-1.1")
 
     def test_rpcv2_cbor_error_shape(self):

@@ -31,6 +31,7 @@ import h2.connection
 import h2.events
 
 sys.path.insert(0, str(Path.cwd() if __file__ == '<stdin>' else Path(__file__).resolve().parents[1]))
+import awsops
 import runtime
 import gitsign
 
@@ -133,6 +134,8 @@ def main():
             'default_app_url': 'https://example.okta.com/home/amazon_aws/example/1',
             'default_account': '123456789012', 'default_role': 'ReadOnly', 'allowed_roles': ['ReadOnly'],
             'OKTA_USERNAME': 'OKTA_USERNAME', 'OKTA_PASSWORD': 'OKTA_PASSWORD', 'OKTA_SECRET': 'OKTA_SECRET'}))
+        # The starter policy setup writes: Secrets Manager reads are refused.
+        (root / 'aws-policy.json').write_text(json.dumps(awsops.STARTER_POLICY))
         fixture = root / 'fixture_entry.py'
         fixture.write_text('''import json
 from pathlib import Path

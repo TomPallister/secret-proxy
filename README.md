@@ -67,9 +67,9 @@ only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
 
 - API keys in headers, query parameters, forms and HTTP Basic authentication.
 - Proxy-managed OAuth for supported services, including ChatGPT/Codex and GitHub Copilot.
-- AWS request signing using Okta/SAML credentials. Secrets Manager reads
-  (`GetSecretValue`, `BatchGetSecretValue`) are refused by default; you can add
-  your own rules. See the [AWS operation policy](docs/operations.md#aws-operation-policy).
+- AWS request signing using Okta/SAML credentials. `aws-policy.json` decides which
+  AWS calls are refused; the starter file blocks Secrets Manager reads and
+  decrypted Parameter Store `SecureString` values ([details](docs/operations.md#aws-operation-policy)).
 - Git commit/tag signing without handing the client a private key.
 - Optional [scoped clients](docs/advanced-setup.md#scoped-clients): separate
   tokens that may use only the secrets, AWS roles and logins they are granted.
@@ -84,8 +84,8 @@ it does not enable every integration automatically.
 ## What it does not promise
 
 A client can still **use the access you grant it**. This protects proxy-held
-credentials; apart from the Secrets Manager rule and any AWS rules you add, it
-does not prevent allowed APIs from returning or creating other credentials. It is not a sandbox for arbitrary malicious software.
+credentials; apart from the AWS rules in `aws-policy.json`, it does not prevent
+allowed APIs from returning or creating other credentials. It is not a sandbox for arbitrary malicious software.
 
 The Mac installer puts the proxy in a separate non-admin account and VM.
 Root/admin access and your private policy remain trusted. Applications must

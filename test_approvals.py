@@ -281,6 +281,7 @@ class ConfigurationTests(unittest.TestCase):
             {"action": "approve", "service": "secretsmanager", "operations": ["GetSecretValue"]},
             {"action": "approve", "service": "ec2", "operations": ["Run*"]},
             {"action": "allow", "service": "ec2", "operations": ["Describe*"]},
+            {"action": "deny", "service": "secretsmanager", "operations": ["GetSecretValue"]},
         ]}).encode())
         overrides = awsops.parse_overrides([{"account": ACCOUNT, "role": "Admin",
                                              "service": "secretsmanager", "operations": ["GetSecretValue"]}])
@@ -293,7 +294,7 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(decide("iam", "CreateRole").rule, "aws-policy.json rule 1")
         self.assertEqual(decide("iam", "CreateUser").action, awsops.DENY, "deny beats approve")
         self.assertEqual(decide("secretsmanager", "GetSecretValue").action, awsops.DENY,
-                         "an approve rule cannot open a built-in deny")
+                         "an approve rule cannot open a deny rule")
         overridden = decide("secretsmanager", "GetSecretValue", role="Admin")
         self.assertEqual((overridden.action, overridden.overridden), (awsops.APPROVE, True))
         self.assertEqual(decide("ec2", "RunInstances").action, awsops.APPROVE)

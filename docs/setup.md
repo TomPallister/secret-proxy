@@ -55,6 +55,7 @@ The helper creates three or four private files, without reading 1Password:
     bootstrap.json           # where desktop startup finds its service-account token
     client-environment.json  # placeholders for client programs, not real secrets
     ca.json                  # optional: name-constrained proxy CA
+    aws-policy.json          # which AWS calls are refused (used only with AWS signing)
 ```
 
 Nothing is installed or started. Files are mode 0600; directories are 0700.

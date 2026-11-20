@@ -3,40 +3,26 @@
   "rules": [
     {
       "action": "deny",
-      "service": "sts",
+      "service": "secretsmanager",
       "operations": [
-        "Assume*",
-        "Get*Token"
+        "GetSecretValue",
+        "BatchGetSecretValue",
+        "Unknown"
       ],
-      "comment": "Example: stop clients minting their own STS credentials."
+      "comment": "Secrets Manager values. Unknown: a request whose operation can't be identified."
     },
     {
       "action": "deny",
-      "service": "dynamodb",
+      "service": "ssm",
       "operations": [
-        "Scan",
-        "BatchGetItem"
+        "GetParameter",
+        "GetParameters",
+        "GetParametersByPath",
+        "GetParameterHistory",
+        "Unknown"
       ],
-      "comment": "Extra deny rules apply on top of the built-in Secrets Manager rule, which cannot be removed here."
-    },
-    {
-      "action": "allow",
-      "service": "ec2",
-      "operations": [
-        "Describe*",
-        "GetConsoleOutput"
-      ],
-      "comment": "An allow rule turns this service into allow-list mode: other ec2 operations are denied."
-    },
-    {
-      "action": "approve",
-      "service": "iam",
-      "operations": [
-        "Create*",
-        "Put*",
-        "Attach*"
-      ],
-      "comment": "Held until a person answers `secret-proxy approvals`. A deny rule always wins over approve."
+      "when": "secureStringReturned",
+      "comment": "Parameter Store: the call goes through; a response holding a decrypted SecureString is refused. Plain String parameters are unaffected."
     }
   ]
 }

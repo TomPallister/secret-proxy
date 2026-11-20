@@ -86,62 +86,75 @@ investigate a failure.
 ## AWS operation policy
 
 The proxy checks every AWS request that carries its dummy credentials **before**
-it mints or uses STS credentials. By default it refuses only reads of stored
-Secrets Manager values:
-
-| Service | Denied by default |
-|---|---|
-| `secretsmanager` | `GetSecretValue`, `BatchGetSecretValue`, and any Secrets Manager request whose operation can't be identified |
-| any | a request whose target service can't be verified (its signature's service doesn't match the host) |
-
-Everything else, including `ListSecrets` and `DescribeSecret`, is allowed. This
-applies even with no policy file. Other calls can also return credentials or
-secrets (STS `AssumeRole`, SSM `GetParameter` with decryption, IAM
-`CreateAccessKey`, KMS `Decrypt`, Lambda and ECS configuration with environment
-variables); add rules for them in `aws-policy.json` if you want them refused or
-held for approval.
-
-The operation comes from the request itself: `X-Amz-Target` (JSON protocols), the
-`Action` form or query value (Query protocols), the `/service/…/operation/…` path
-(RPC v2) or the method and path (REST, Lambda and CodeArtifact only; other REST
-requests are `Unclassified`). The service comes from the signature's credential
-scope and must match the host. Anything missing, duplicated, conflicting,
-encoded, non-UTF-8, over 16 MiB when the body is needed, or carrying more than one
-protocol's operation field is `Unknown`. Unknown Secrets Manager requests are
-denied by default; to deny Unknown requests for other services, list `Unknown` in
-a rule's operations (`"service": "*", "operations": ["Unknown"]` for all).
-
-A denied call gets HTTP 403 with code `AccessDeniedException` and a message such
-as `secret-proxy blocked secretsmanager:GetSecretValue: …`, in the protocol's own JSON, XML or
-CBOR shape. The proxy terminal shows one line with the account, role, service,
-operation and decision. Bodies and responses are never logged. Presigned URLs are
-out of scope and behave as before.
-
-### Optional `aws-policy.json`
-
-Add rules next to the manifest. The built-in Secrets Manager rule always applies;
-the file can add deny, allow and approve rules, never remove the built-in rule:
+it mints or uses STS credentials. What to block is configured in one file,
+`aws-policy.json`, next to the manifest. `./setup.sh init` writes this starter
+file (also `examples/aws-policy.json`):
 
 ```json
 {
   "version": 1,
   "rules": [
-    {"action": "deny", "service": "dynamodb", "operations": ["Scan"]},
-    {"action": "allow", "service": "ec2", "operations": ["Describe*"]}
+    {"action": "deny", "service": "secretsmanager",
+     "operations": ["GetSecretValue", "BatchGetSecretValue", "Unknown"]},
+    {"action": "deny", "service": "ssm",
+     "operations": ["GetParameter", "GetParameters", "GetParametersByPath", "GetParameterHistory", "Unknown"],
+     "when": "secureStringReturned"}
   ]
 }
 ```
 
-`service` is a lower-case glob over `[a-z0-9-*?]`; `operations` are globs over
-`[A-Za-z0-9_*?]`, matched without regard to case. Once a service has an allow
-rule, its other operations (including `Unknown` and `Unclassified`) are denied.
-An invalid file stops the proxy from starting and names the bad rule. See
-`examples/aws-policy.json`.
+- **Secrets Manager:** reading a stored value is refused before anything is
+  sent. `ListSecrets`, `DescribeSecret` and the rest are allowed.
+- **Parameter Store:** reads go through as normal. If the response holds a
+  decrypted `SecureString`, the proxy replaces it with a 403, so the value never
+  reaches the client. Plain `String` parameters are unaffected, including
+  Terraform's default decrypting reads of them. A read without decryption is not
+  checked: a `SecureString` then comes back still encrypted.
+
+Edit or delete the rules as you like. **With no file, nothing is blocked.** The
+only built-in rule is a safety check: a request whose signature's service doesn't
+match its host is refused, so the proxy never signs for a service it didn't check.
+
+### Writing rules
+
+```json
+{"action": "deny", "service": "sts", "operations": ["Assume*", "Get*Token"]}
+{"action": "approve", "service": "iam", "operations": ["Create*", "Attach*"]}
+{"action": "allow", "service": "ec2", "operations": ["Describe*"]}
+```
+
+- `deny` refuses the call. `approve` holds it until a person answers
+  `secret-proxy approvals`. Once a service has an `allow` rule, only the listed
+  operations are allowed for it. A deny always beats approve and allow.
+- `service` is the AWS signing name (`sts`, `kms`, `lambda`…), a lower-case glob
+  over `[a-z0-9-*?]`. `operations` are globs over `[A-Za-z0-9_*?]`, matched
+  without regard to case.
+- `"when": "secureStringReturned"` is only valid with `deny` and service `ssm`.
+  It lets the call through and checks the response instead.
+- An invalid file stops the proxy from starting and names the bad rule.
+- The file is copied into the proxy at install time, so a change takes effect at
+  the next install and restart, like any other policy change.
+
+The operation comes from the request itself: `X-Amz-Target` (JSON protocols), the
+`Action` form or query value (Query protocols), the `/service/…/operation/…` path
+(RPC v2) or the method and path (REST, Lambda and CodeArtifact only; other REST
+requests, such as S3, are `Unclassified`, so they can only be ruled on as a whole
+service). Anything missing, duplicated, conflicting, encoded, non-UTF-8, over
+16 MiB when the body is needed, or carrying more than one protocol's operation
+field is `Unknown`. List `Unknown` in a rule to cover those requests, as the
+starter file does, so a muddled request can't slip past.
+
+A refused call gets HTTP 403 with code `AccessDeniedException` and a message such
+as `secret-proxy blocked secretsmanager:GetSecretValue: …`, in the protocol's own
+JSON, XML or CBOR shape. A checked Parameter Store response that can't be read
+or is over 4 MiB is refused too. The proxy terminal shows one line
+with the account, role, service, operation and decision. Values, bodies and
+responses are never logged. Presigned URLs are not checked.
 
 ### Overrides for one role
 
-For a genuine need, allow specific operations for **one exact account and role**
-in `aws-okta.json`:
+To exempt **one exact account and role** from a deny rule or a Parameter Store
+check, add an override in `aws-okta.json`:
 
 ```json
 "operation_overrides": [

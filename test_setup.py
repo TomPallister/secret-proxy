@@ -25,7 +25,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(base.stat().st_mode & 0o777, 0o700)
             config = base / 'config'
             self.assertEqual(set(p.name for p in config.iterdir()),
-                             {'manifest.json', 'bootstrap.json', 'client-environment.json', 'ca.json'})
+                             {'manifest.json', 'bootstrap.json', 'client-environment.json', 'ca.json', 'aws-policy.json'})
             self.assertEqual(config.stat().st_mode & 0o777, 0o700)
             for p in config.iterdir():
                 self.assertEqual(p.stat().st_mode & 0o777, 0o600)

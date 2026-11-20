@@ -13,9 +13,10 @@ engineering evidence, not a penetration test or a security certification.
   presenting its name to the URL-rewrite sentinel.
 - AWS credentials are minted and requests re-signed inside the proxy, constrained
   by explicit account/role policy. Before minting, each request's operation is
-  identified and checked. By default only Secrets Manager reads of stored values
-  (and Secrets Manager requests that can't be identified) are refused; operators
-  can add their own deny, allow and approval rules.
+  identified and checked against `aws-policy.json`. The starter file refuses
+  Secrets Manager reads and Parameter Store responses holding a decrypted
+  `SecureString`. Without the file nothing is refused, apart from a request whose
+  signature's service doesn't match its host.
   Git signing returns a signature, not the key.
 - Client readiness uses authenticated TLS and an exact per-boot nonce. A stale
   readiness file must not silently select an old or unauthenticated service.
@@ -66,10 +67,10 @@ engineering evidence, not a penetration test or a security certification.
 - **Use of access.** An authorised or compromised client can perform operations
   that its configured credentials and upstream account permit. This is not a
   per-human authorisation system or a general read-only API gateway.
-- **Credentials returned by upstream APIs.** The built-in AWS rule covers only
-  Secrets Manager. Other AWS calls can return credentials or secrets and are
-  allowed unless you add rules: for example STS `AssumeRole`, SSM parameters read
-  with decryption, IAM `CreateAccessKey`, registry tokens, KMS `Decrypt`, and
+- **Credentials returned by upstream APIs.** The starter AWS policy covers only
+  Secrets Manager and Parameter Store `SecureString` values. Other AWS calls can
+  return credentials or secrets and are allowed unless you add rules: for example
+  STS `AssumeRole`, IAM `CreateAccessKey`, registry tokens, KMS `Decrypt`, and
   environment variables in Lambda or ECS configuration. Presigned URLs are not
   checked. A role override
   applies to any client that can select that role. Non-AWS vendor APIs that

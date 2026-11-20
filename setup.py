@@ -16,6 +16,7 @@ import subprocess
 import sys
 
 from egress import EgressConfigError
+import awsops
 from host import Deployment, HostError, PYTHON, ROOT, validate_bootstrap_config
 from macos_install import validate_source_config
 from client import validate_config
@@ -100,6 +101,8 @@ def initialise(base):
     save(config / 'client-environment.json', environment)
     if constrained:
         save(config / 'ca.json', {'mode': 'name-constrained'})
+    # What AWS calls to block. Only used if AWS signing is configured later; edit freely.
+    save(config / 'aws-policy.json', awsops.STARTER_POLICY)
     print('Created metadata in ' + str(config))
     print('Next: complete the 1Password steps in docs/setup.md, then run:')
     extra = '' if base == Path.home() / '.config/secret-proxy' else ' --directory ' + shlex.quote(str(base))

@@ -14,8 +14,8 @@ Supply a private directory containing:
 - Optional `aws-okta.json`: explicit approved `okta_hosts`, SAML app URLs,
   default account/role and role allowlists. No organisational defaults exist.
   Optional `operation_overrides` allow named AWS operations for one exact role.
-- Optional `aws-policy.json`: extra AWS operation deny rules and allow lists on
-  top of the built-in Secrets Manager rule. See [AWS operation policy](operations.md#aws-operation-policy)
+- Optional `aws-policy.json`: which AWS calls are refused, held for approval or
+  allowed. `./setup.sh init` writes a starter file; without one nothing is refused. See [AWS operation policy](operations.md#aws-operation-policy)
   and `examples/aws-policy.json`.
 - `checkmarxRealm` in the manifest when enabling Checkmarx.
 - Optional `clients` in the manifest: named clients, each with its own token and
@@ -382,7 +382,7 @@ grants (`examples/clients-manifest.json`):
     may select, optionally narrowed by `operations`, as `service:Operation`
     globs matched against the operation the proxy identifies (REST services
     without named operations, such as S3, identify as `s3:Unclassified`; use
-    `s3:*`). The AWS operation policy and its deny list still apply, and a role
+    `s3:*`). The rules in `aws-policy.json` still apply, and a role
     override cannot widen a client's grant. Presigned URLs are not classified,
     so only an `aws` grant without `operations` covers them.
   - `signing`: `true` to use proxy Git signing.

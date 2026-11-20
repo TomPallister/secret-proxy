@@ -47,6 +47,10 @@ CONDITION_WITH_DECRYPTION = "with-decryption"
 # The request's target service could not be verified (unreadable credential
 # scope, or a scope that does not match the host). Denied for every service.
 CONDITION_UNVERIFIED_SERVICE = "unverified-service"
+# A rule with this "when" lets the request through and checks the response:
+# a decrypted SSM SecureString value in it is refused.
+WHEN_SECURE_STRING = "secureStringReturned"
+WHENS = (WHEN_SECURE_STRING,)
 
 _SERVICE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _OPERATION_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}\Z")
@@ -124,6 +128,8 @@ class Decision:
     reason: str            # fixed text, safe to log and to return
     rule: str = ""         # which rule decided, for logs
     overridden: bool = False
+    # Source of a "secureStringReturned" rule: the response must be checked.
+    inspect_response: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -476,12 +482,17 @@ class Rule:
     operations: Tuple[str, ...]
     condition: Optional[str] = None
     source: str = "built-in"
+    when: Optional[str] = None
 
     def matches(self, op: AwsOperation) -> bool:
         if not fnmatch.fnmatchcase(op.service.lower(), self.service.lower()):
             return False
         if not any(fnmatch.fnmatchcase(op.operation.lower(), p.lower()) for p in self.operations):
             return False
+        if self.when == WHEN_SECURE_STRING:
+            # Only a decrypting read (or one we could not identify) can return
+            # a SecureString in plaintext; otherwise the value is ciphertext.
+            return op.operation == UNKNOWN or CONDITION_WITH_DECRYPTION in op.conditions
         return self.condition is None or self.condition in op.conditions
 
 
@@ -508,14 +519,52 @@ def _builtin(service: str, *operations: str, condition: Optional[str] = None) ->
     return Rule(DENY, service, tuple(operations), condition, "built-in deny list")
 
 
-# Built in: Secrets Manager reads that return a stored secret value. An
-# unidentifiable Secrets Manager request is denied too, so an ambiguous request
-# can never slip past, as is any request whose target service can't be verified.
-# Everything else is allowed unless aws-policy.json adds rules.
+# Built in: only a safety check, not policy. A request whose target service
+# can't be verified (its signature's service doesn't match the host) is denied,
+# so the proxy never signs for a service other than the one it checked. What to
+# block is configured in aws-policy.json; see STARTER_POLICY.
 DEFAULT_DENY_RULES: Tuple[Rule, ...] = (
-    _builtin("secretsmanager", "GetSecretValue", "BatchGetSecretValue", UNKNOWN),
     _builtin("*", UNKNOWN, condition=CONDITION_UNVERIFIED_SERVICE),
 )
+
+_SSM_READS = ["GetParameter", "GetParameters", "GetParametersByPath", "GetParameterHistory", UNKNOWN]
+
+# Written by `setup.sh init` and shipped as examples/aws-policy.json.
+STARTER_POLICY = {
+    "version": 1,
+    "rules": [
+        {"action": "deny", "service": "secretsmanager",
+         "operations": ["GetSecretValue", "BatchGetSecretValue", UNKNOWN],
+         "comment": "Secrets Manager values. Unknown: a request whose operation can't be identified."},
+        {"action": "deny", "service": "ssm", "operations": _SSM_READS, "when": WHEN_SECURE_STRING,
+         "comment": "Parameter Store: the call goes through; a response holding a decrypted "
+                    "SecureString is refused. Plain String parameters are unaffected."},
+    ],
+}
+
+
+RESPONSE_LIMIT = 4 * 1024 * 1024
+
+
+def response_has_secure_string(body: bytes) -> bool:
+    """True when an SSM JSON response holds a SecureString value.
+
+    Raises ValueError when the body can't be read as JSON: the caller refuses.
+    Walks the whole document, so every response shape (Parameter, Parameters,
+    history entries) is covered.
+    """
+    document = json.loads(body.decode("utf-8"))
+    stack = [document]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            kind = item.get("Type")
+            if isinstance(kind, str) and kind.lower() == "securestring" and "Value" in item:
+                return True
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
 
 
 def _check_keys(obj: dict, allowed: Iterable[str], where: str) -> None:
@@ -550,8 +599,8 @@ def parse_policy(document: object) -> Tuple[Rule, ...]:
         where = f"aws-policy.json rule {index + 1}"
         if not isinstance(rule, dict):
             raise AwsPolicyError(f"{where}: expected an object")
-        _check_keys(rule, ("action", "service", "operations", "comment"), where)
-        if set(rule) - {"comment"} != {"action", "service", "operations"}:
+        _check_keys(rule, ("action", "service", "operations", "comment", "when"), where)
+        if set(rule) - {"comment", "when"} != {"action", "service", "operations"}:
             raise AwsPolicyError(f"{where}: action, service and operations are required")
         action = rule["action"]
         if action not in ACTIONS:
@@ -561,7 +610,13 @@ def parse_policy(document: object) -> Tuple[Rule, ...]:
             raise AwsPolicyError(f"{where}: service must be a glob over [a-z0-9-*?]")
         if "comment" in rule and not isinstance(rule["comment"], str):
             raise AwsPolicyError(f"{where}: comment must be a string")
-        out.append(Rule(action, service, _operation_list(rule["operations"], where), None, where))
+        when = rule.get("when")
+        if when is not None:
+            if when not in WHENS:
+                raise AwsPolicyError(f"{where}: when must be {WHEN_SECURE_STRING}")
+            if action != DENY or service != "ssm":
+                raise AwsPolicyError(f"{where}: when {WHEN_SECURE_STRING} needs action deny and service ssm")
+        out.append(Rule(action, service, _operation_list(rule["operations"], where), None, where, when))
     return tuple(out)
 
 
@@ -610,14 +665,16 @@ def load_policy_bytes(data: bytes) -> Tuple[Rule, ...]:
 
 
 class AwsOperationPolicy:
-    """Built-in deny list + optional file rules + per-role overrides.
+    """Built-in safety rule + aws-policy.json rules + per-role overrides.
 
-    Order: a matching deny rule denies (built-in rules always apply and cannot be
-    removed by the file); a matching override for the exact account and role
-    then allows it. A matching approve rule then asks a person, so a deny rule
+    Order: a matching deny rule denies (the built-in unverified-service rule
+    always applies); a matching override for the exact account and role then
+    allows it. A matching approve rule then asks a person, so a deny rule
     can never be approved but an overridden operation can still require
     approval. Otherwise, when allow rules exist for the service, the operation
-    must match one of them. Everything else is allowed.
+    must match one of them. Everything else is allowed. A matching
+    "secureStringReturned" rule does not deny the request: it marks the
+    decision so the response is checked (skipped for an exact role override).
     """
 
     def __init__(self, rules: Sequence[Rule] = (), overrides: Sequence[Override] = ()):
@@ -626,8 +683,20 @@ class AwsOperationPolicy:
 
     def evaluate(self, op: AwsOperation, account: Optional[str] = None,
                  role: Optional[str] = None) -> Decision:
+        decision = self._evaluate_request(op, account, role)
+        if decision.action == DENY or decision.overridden:
+            return decision
+        if any(o.matches(op, account, role) for o in self.overrides):
+            return decision  # an exact role override also skips the response check
+        check = next((r for r in self.rules if r.when == WHEN_SECURE_STRING and r.matches(op)), None)
+        if check is None:
+            return decision
+        return Decision(decision.action, decision.reason, decision.rule, False, check.source)
+
+    def _evaluate_request(self, op: AwsOperation, account: Optional[str],
+                          role: Optional[str]) -> Decision:
         override = next((o for o in self.overrides if o.matches(op, account, role)), None)
-        deny = next((r for r in self.rules if r.action == DENY and r.matches(op)), None)
+        deny = next((r for r in self.rules if r.action == DENY and r.when is None and r.matches(op)), None)
         approve = next((r for r in self.rules if r.action == APPROVE and r.matches(op)), None)
         if deny is not None:
             if override is not None:
@@ -636,8 +705,6 @@ class AwsOperationPolicy:
                 return Decision(ALLOW, "explicit role override", "operation_overrides", True)
             if op.operation == UNKNOWN:
                 reason = f"the operation could not be identified safely ({op.reason or 'unknown'})"
-            elif deny.source == "built-in deny list":
-                reason = "the operation can return credentials or secret values (built-in deny list)"
             else:
                 reason = f"the operation is denied by {deny.source}"
             return Decision(DENY, reason, deny.source)

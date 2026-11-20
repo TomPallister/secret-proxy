@@ -850,7 +850,7 @@ class AwsAuditTests(AwsPolicyAddonTestCase):
         self.assertEqual((first["event"], first["decision"], first["account"], first["role"],
                           first["service"], first["operation"], first["rule"]),
                          ("aws", "denied", ACCOUNT, "ReadOnly", "secretsmanager", "GetSecretValue",
-                          "built-in deny list"))
+                          "aws-policy.json rule 1"))
         self.assertEqual((second["decision"], second["operation"]), ("allowed", "GetCallerIdentity"))
         data = all_bytes(self.dir)
         for value in ("fixture-signing-material-not-real", "fixture-session-token", BODY_VALUE, "SecretId"):

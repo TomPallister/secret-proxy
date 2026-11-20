@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from mitmproxy import http
+from mitmproxy import flow as mitmflow, http
 
 import approvals
 import audit
@@ -2028,10 +2028,54 @@ def request(flow: http.HTTPFlow) -> None:
     _run_hook(flow, _request_locked)
 
 
+AWS_RESPONSE_CHECK = "secret_proxy_aws_response_check"
+
+
 def responseheaders(flow: http.HTTPFlow) -> None:
+    if flow.metadata.get(AWS_RESPONSE_CHECK) is not None:
+        # A response that may hold a decrypted SSM SecureString is buffered and
+        # checked in response(). A stated length over the limit is killed now;
+        # HTTP/2 may omit the length, so its size is checked after buffering.
+        length = (flow.response.headers.get("content-length") or "").strip()
+        if length and (not length.isdigit() or int(length) > awsops.RESPONSE_LIMIT):
+            check = flow.metadata[AWS_RESPONSE_CHECK]
+            log.warning("secret_proxy: AWS DENY %s %s (response too large to check)",
+                        check["who"], check["label"])
+            _audit(flow, "aws", "denied", account=check["account"], role=check["role"],
+                   service=check["service"], operation=check["operation"], rule=check["rule"])
+            if flow.killable:
+                flow.kill()
+            else:
+                flow.error = mitmflow.Error(mitmflow.Error.KILLED_MESSAGE)
+            return
+        flow.response.stream = False
+        return
     # Stream the response body straight through (don't buffer) so streaming
     # APIs like Bedrock converse-stream (eventstream) work.
     flow.response.stream = True
+
+
+def response(flow: http.HTTPFlow) -> None:
+    """Refuse a checked SSM response that holds a decrypted SecureString."""
+    check = flow.metadata.get(AWS_RESPONSE_CHECK)
+    if check is None or flow.response is None:
+        return
+    if not 200 <= flow.response.status_code < 300:
+        return  # errors carry no parameter values
+    try:
+        body = flow.response.get_content(strict=True) or b""
+        if len(body) > awsops.RESPONSE_LIMIT:
+            raise ValueError("response too large to check")
+        secret = awsops.response_has_secure_string(body)
+        reason = "the response contains a SecureString value"
+    except (ValueError, UnicodeDecodeError):
+        secret, reason = True, "the response could not be checked"
+    if not secret:
+        return
+    op = awsops.AwsOperation(check["service"], check["operation"], awsops.PROTOCOL_JSON)
+    decision = awsops.Decision(awsops.DENY, reason, check["rule"])
+    log.warning("secret_proxy: AWS DENY %s %s (%s; rule=%s)", check["who"], op.label, reason, check["rule"])
+    _aws_error(flow, AwsOperationDenied(op, decision, check["account"], check["role"]))
 
 
 # --- AWS SigV4 re-signing ---------------------------------------------------
@@ -2295,10 +2339,11 @@ def aws_policy_startup_summary() -> list[str]:
     """Load and validate the AWS operation policy; return log lines (no secrets)."""
     policy, _default = _load_aws_policy()
     builtin = len(awsops.DEFAULT_DENY_RULES)
+    count = len(policy.rules) - builtin
     lines = [
-        f"secret_proxy: AWS operation policy: {builtin} built-in deny rules, "
-        f"{len(policy.rules) - builtin} rules from {AWS_POLICY_FILE.name}, "
-        f"{len(policy.overrides)} role overrides"
+        f"secret_proxy: AWS operation policy: {count} rules from {AWS_POLICY_FILE.name}"
+        + ("" if AWS_POLICY_FILE.is_file() else " (no file: nothing is blocked)")
+        + f", {len(policy.overrides)} role overrides"
     ]
     for override in policy.overrides:
         lines.append(
@@ -2541,6 +2586,10 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
     flow.request.headers["Authorization"] = res["authorization"]
     flow.request.headers["x-amz-security-token"] = res["x-amz-security-token"]
     flow.metadata["secret_proxy_aws"] = f"{account}/{role}"
+    if decision.inspect_response:
+        flow.metadata[AWS_RESPONSE_CHECK] = {
+            "who": f"{account}/{role}", "label": op.label, "account": account, "role": role,
+            "service": op.service, "operation": op.operation, "rule": decision.inspect_response}
     return res
 
 
