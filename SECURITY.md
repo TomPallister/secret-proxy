@@ -33,6 +33,13 @@ engineering evidence, not a penetration test or a security certification.
   Identity comes from proxy authentication only, never a request header; a
   refusal happens before any secret is resolved or AWS credential minted.
   Without a `clients` section there is one unrestricted token, as before.
+- Optional approval rules hold a matching request before any secret is
+  resolved, any AWS credential minted or anything forwarded. Deny rules always
+  win; no listener, a timeout, the rate limit and malformed or too-early answers
+  deny. A client's grants are checked first, so a request outside them is
+  refused, never offered. Only the proxy account's per-boot approver
+  capability (never a client token) can answer,
+  through `secret-proxy approvals`; clients receive only the denial rule.
 - ChatGPT access and rotating refresh tokens are memory-only. Restart requires
   browser sign-in again. Static secrets remain cached until invalidation/restart.
 - GitHub Copilot: the proxy runs the device flow and the Copilot token exchange.
@@ -76,6 +83,11 @@ engineering evidence, not a penetration test or a security certification.
   change the installation or act as the proxy owner. Review source and signing-key
   trust before authorising installation. A desktop-user-owned container alone is
   not equivalent to the separate-account boundary.
+- **Approval as authentication.** An approval prompt describes the request;
+  it cannot show what a body will do, so approve only what you expected. Allow
+  for session lets matching requests from the same client through until restart.
+  Someone who can run sudo (or act as the proxy account) can answer prompts.
+  The prompt shows the client name the proxy authenticated, not who started it.
 - **Independent proof of vault scope.** Bootstrap checks declared item metadata;
   only provider-side configuration determines actual service-account permissions.
   Use a read-only capability scoped to the intended runtime vault.

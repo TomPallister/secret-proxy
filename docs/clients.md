@@ -195,6 +195,12 @@ get `403` with `{"error":"secret_proxy_egress_refused","rule":"..."}`, and an
 optional allow-list can refuse other hosts the same way. The rule name says
 why; see [egress controls](advanced-setup.md#egress-controls).
 
+A request held by an [approval rule](advanced-setup.md#approval-rules) waits
+for up to the approval timeout (120 s by default) before the client sees a
+response, so allow for that in client timeouts. A refusal is a `403` with
+`{"error":"secret_proxy_approval_denied","rule":"approval-..."}` (AWS SDKs see
+an `AccessDeniedException`). The client never sees the prompt.
+
 ## Low-level client interface
 
 The daily CLI delegates to the installed client. For an explicitly registered

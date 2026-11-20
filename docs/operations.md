@@ -156,6 +156,50 @@ the exception its own role with narrow upstream permissions. Adding or changing
 either file is a private policy change: the installer refuses to overwrite an
 existing instance's policy, as for any other policy file.
 
+## Approval prompts
+
+With [approval rules](advanced-setup.md#approval-rules) configured, keep a
+terminal running:
+
+```bash
+secret-proxy approvals
+```
+
+It asks for sudo, then runs as the proxy account: the approver capability is a
+per-boot file in that account's private directory, so ordinary clients (which
+hold only the proxy capability) can never answer their own prompt. It
+long-polls the proxy over authenticated TLS, bound to the current boot nonce,
+and shows one request at a time:
+
+```
+An AWS operation needs approval:
+  method     POST
+  host       iam.amazonaws.com
+  path       /
+  account    123456789012
+  role       Admin
+  service    iam
+  operation  CreateRole
+  rule       aws-policy.json rule 3
+Expires in 119 s. Choose:
+  1 deny once   2 allow once   3 allow for this proxy session   4 deny for this proxy session
+```
+
+- Input is accepted only after a one-second pause; anything typed earlier is
+  discarded, and the proxy refuses an answer that arrives sooner.
+- Anything other than `1`–`4` denies once. No answer before the timeout denies.
+  Ctrl-C denies the request on screen and stops.
+- "For this proxy session" covers the same client, secret, host, method and
+  matched rule (AWS: account, role, service, operation and rule; egress: the
+  host), not the whole host. Session decisions are in memory only; `stop`
+  clears them.
+- With nobody listening (no `approvals` terminal for about 10 seconds), every
+  request that needs approval is denied at once.
+
+The proxy terminal logs each decision with the rule and request summary, never
+a secret value, body or query string, for example
+`APPROVAL deny (approval-timeout) aws method=POST host=iam.amazonaws.com ...`.
+
 ## Refused destinations
 
 The proxy refuses connections to loopback, link-local, metadata, multicast and

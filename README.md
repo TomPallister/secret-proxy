@@ -66,8 +66,7 @@ only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
 ## What it supports
 
 - API keys in headers, query parameters, forms and HTTP Basic authentication.
-- Proxy-managed OAuth for supported services, including ChatGPT/Codex and
-  GitHub Copilot.
+- Proxy-managed OAuth for supported services, including ChatGPT/Codex and GitHub Copilot.
 - AWS request signing using Okta/SAML credentials. Calls that return
   credentials or secrets (`GetSecretValue`, `AssumeRole`, `CreateAccessKey`…)
   are refused by default; see the [AWS operation policy](docs/operations.md#aws-operation-policy).
@@ -76,6 +75,7 @@ only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
   tokens that may use only the secrets, AWS roles and logins they are granted.
 - Refusing proxied connections to metadata, loopback and private addresses,
   with an optional host allow/deny list ([egress controls](docs/advanced-setup.md#egress-controls)).
+- Optional [approval rules](docs/advanced-setup.md#approval-rules), answered with `secret-proxy approvals`.
 
 Each integration needs an explicit policy defining **where** its credential may
 be used. The starter setup includes read-only GitHub and optional ChatGPT/Codex;

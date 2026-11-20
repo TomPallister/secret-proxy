@@ -158,6 +158,63 @@ Limits:
 - The proxy connects to the first checked address, so it does not fall back to
   later addresses when the first one fails to connect.
 
+## Approval rules
+
+Some uses are legitimate but rare and sensitive, such as a write to a
+production API or `iam:CreateRole`. An approval rule holds a matching request
+until a person answers it. All of them are off by default:
+
+- a placement field `"approval": "prompt"`;
+- an AWS rule `{"action": "approve", ...}` in `aws-policy.json`;
+- `"allowlistMiss": "approve"` in an `allowlist` egress section, for hosts
+  that are not listed.
+
+See `examples/approval-manifest.json` and `examples/aws-policy.json`. Precedence:
+
+- A [scoped client](#scoped-clients)'s grants are checked first: a request
+  outside them is refused, never offered for approval.
+- A deny rule always wins. A built-in AWS deny, a file deny rule, an egress
+  `deny` pattern, a metadata name and every refused address can never be
+  approved. A request that breaks a placement rule is refused without a prompt.
+- When several placements match, one with `"approval"` wins, so a broader
+  placement cannot bypass it. An AWS role override that allows a denied
+  operation still asks when an approve rule also matches.
+
+A held request is not forwarded, no secret is resolved for it and no AWS
+credential is minted until it is approved. Streaming uploads are held before
+their body starts to flow. Egress approvals hold the CONNECT (or plain HTTP
+request). Answer with `secret-proxy approvals`; see
+[operations](operations.md#approval-prompts).
+
+Optional timing, in `manifest.json`:
+
+```json
+"approvals": {"timeoutSeconds": 120, "maxPromptsPerMinute": 10}
+```
+
+`timeoutSeconds` (10 to 600, default 120) denies an unanswered request.
+`maxPromptsPerMinute` (1 to 60, default 10) denies new prompts above the rate.
+At most 16 requests wait at once.
+
+The requester only receives an error: HTTP 403 with
+`{"error":"secret_proxy_approval_denied","rule":"approval-denied"}` (or the
+AWS `AccessDeniedException` shape for AWS requests, or the egress refusal
+shape). Rules: `approval-denied`, `approval-timeout`, `approval-no-listener`,
+`approval-rate-limited`, `approval-queue-full`, `approval-malformed-answer`,
+`approval-answered-too-fast`, `approval-withdrawn` (the client went away) and
+`approval-required` (no runtime adapter could ask).
+
+The prompt names the authenticated client, method, host, path
+without the query string, the secret's canonical name and placement, or the AWS
+account, role, service and operation, and the matched rule. It never contains
+a secret value, header value, body or query string. For a URL-rewrite secret
+the destination is itself the secret, so the prompt names the sentinel host.
+
+A launcher that starts `runtime.py` directly enables approvals by adding an
+`approver_token` (48 lowercase hex characters, different from `proxy_token` and
+every client token) to
+the bootstrap bundle. Without it, every request that needs approval is denied.
+
 ## GitHub logins
 
 The proxy can own a GitHub Copilot login (for Pi) and a GitHub CLI login (for
