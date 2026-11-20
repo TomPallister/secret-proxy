@@ -89,11 +89,19 @@ LOGINS = {
 }
 
 
+# Added together, and only, when the manifest has a loginStore.
+STORE_FIELDS = frozenset({'stored', 'restoredFromStore'})
+
+
 def auth_status(client: ProxyClient, settings: dict, provider: str = 'chatgpt') -> dict:
     client.check_ready()
     route, fields = LOGINS[provider]
     result = client.call(route)
     expected = json.loads(private_read(SHARED_ROOT / settings['instance'] / 'ready.json', 4096))
+    if isinstance(result, dict) and STORE_FIELDS <= set(result):
+        if any(type(result[name]) is not bool for name in STORE_FIELDS):
+            raise ClientError('Invalid or stale authentication status')
+        fields = fields | STORE_FIELDS
     if (not isinstance(result, dict) or set(result) != fields
             or not isinstance(result['instance'], str) or re.fullmatch(r'[0-9a-f]{32}', result['instance']) is None
             or result['instance'] != expected['instance'] or type(result['loggedIn']) is not bool
@@ -306,7 +314,8 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None,
         pids = controller_pids(instance)
         subprocess.run([PYTHON, host, 'stop', instance], check=True)
         wait_controllers(pids)
-        print('Selected proxy stopped; CA, capability, policy and workspace retained. Start needs browser login again.')
+        print('Selected proxy stopped; CA, capability, policy and workspace retained. Start needs login again '
+              'unless the manifest has a loginStore.')
     elif command == 'status':
         selected_client(settings, client_name).check_ready()
         print('Proxy ready (authenticated instance check; vault/upstreams not tested)')
@@ -315,6 +324,10 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None,
     elif command == 'login':
         extra = [] if provider in (None, 'chatgpt') else ['--provider', provider]
         os.execv(PYTHON, [PYTHON, client, '--config', config, *scoped, 'login', *extra])
+    elif command == 'logout':
+        if provider not in LOGINS:
+            raise ClientError('Name the login to sign out of')
+        os.execv(PYTHON, [PYTHON, client, '--config', config, *scoped, 'logout', '--provider', provider])
     elif command == 'approvals':
         if not os.isatty(0) or not os.isatty(1):
             raise ClientError('Approvals need an attached terminal')
@@ -345,7 +358,7 @@ def main(argv=None):
     for name in ('start', 'stop', 'trust-ca', 'untrust-ca', 'approvals'):
         commands.add_parser(name)
     commands.add_parser('status').add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
-    for name in ('login', 'auth-status'):
+    for name in ('login', 'logout', 'auth-status'):
         sub = commands.add_parser(name)
         sub.add_argument('provider', choices=sorted(LOGINS), help='Proxy-owned login')
         sub.add_argument('--client', default=DEFAULT_CLIENT, help=client_help)

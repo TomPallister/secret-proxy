@@ -1,8 +1,11 @@
-"""Proxy-owned ChatGPT Codex browser OAuth. Tokens exist only in this process's RAM.
+"""Proxy-owned ChatGPT Codex browser OAuth. Tokens stay inside the proxy.
 
 The browser redirects to localhost:1455, which need not be listening: the user
 pastes that URL into the client shim. The PKCE verifier and token exchange stay
-inside the proxy. A proxy restart requires a new interactive login.
+inside the proxy. By default tokens exist only in this process's RAM and a
+proxy restart requires a new interactive login. With an opt-in login store
+(loginstore.py) the rotating refresh token is also kept in a read/write vault
+and the first use after a restart refreshes it once to restore the login.
 """
 
 from __future__ import annotations
@@ -10,12 +13,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import secrets
+import socket
+import ssl
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
+import loginstore
 import sealedjwt
 from oauthcreds import tls_context
 
@@ -26,8 +34,18 @@ CANONICAL = "CHATGPT_ACCESS_TOKEN"
 CLAIM = "https://api.openai.com/auth"
 
 
+log = logging.getLogger("secret_proxy.chatgpt")
+# Failures that happen before a request reaches OpenAI: a refresh token
+# offered again after one of these was never seen, so a restore may retry it.
+_UNSENT = (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)
+
+
 class ChatGPTAuthError(Exception):
-    pass
+    """*reason*: "rejected" (OpenAI refused it), "unreachable" (OpenAI never processed it) or None."""
+
+    def __init__(self, message: str = "", reason: str | None = None):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _claims(token: str) -> str:
@@ -46,9 +64,11 @@ def _claims(token: str) -> str:
 
 
 class ChatGPTCredentials:
-    def __init__(self, request=None, clock=time.time):
+    def __init__(self, request=None, clock=time.time, store=None):
         self._request = request or self._post
         self._clock = clock
+        # Optional loginstore.LoginStore; None keeps everything in RAM only.
+        self._store = loginstore.persistence(store, "chatgpt", clock)
         self._lock = threading.RLock()
         self._pending = None
         self._access = None
@@ -75,7 +95,13 @@ class ChatGPTCredentials:
             return result
         except Exception as error:
             # Never forward an upstream response body or exception (may contain a token).
-            raise ChatGPTAuthError(f"OpenAI token exchange failed ({type(error).__name__})") from None
+            reason = None
+            if isinstance(error, urllib.error.HTTPError):
+                # 429: not processed, so the token was not used. Other 4xx: refused.
+                reason = "unreachable" if error.code == 429 else "rejected" if 400 <= error.code < 500 else None
+            elif isinstance(error, urllib.error.URLError) and isinstance(error.reason, _UNSENT):
+                reason = "unreachable"
+            raise ChatGPTAuthError(f"OpenAI token exchange failed ({type(error).__name__})", reason) from None
 
     def start(self) -> str:
         with self._lock:
@@ -115,6 +141,9 @@ class ChatGPTCredentials:
             self._update(response)
             self._refresh_count = 0
             self._last_refresh_at = self._last_refresh_due_at = None
+            if self._store is not None:
+                self._store.skip_restore()
+                self._persist()
             return self._sealed_credential()
 
     def _update(self, response: dict) -> None:
@@ -134,17 +163,82 @@ class ChatGPTCredentials:
                 "refresh": sealedjwt.MARKER + CANONICAL, "accountId": self._account,
                 "expires": 4102444800000}
 
+    def _persist(self) -> None:
+        """Write the current refresh token to the store (never fails the caller)."""
+        self._store.save(self._refresh, {"account_id": self._account})
+
+    def _restore_locked(self) -> None:
+        """Restore a stored login once: one refresh with the stored refresh token."""
+        if self._store is None:
+            return
+        self._store.flush()
+        if self._refresh:
+            return
+        found = self._store.take_restore()
+        if found is None:
+            return
+        account = found.metadata.get("account_id")
+        if not account:
+            log.warning("secret_proxy: stored ChatGPT login has no account; run secret-proxy login chatgpt")
+            return
+        previous = self._account
+        self._account = account  # _update refuses a refresh for another account
+        try:
+            self._update(self._request({"grant_type": "refresh_token", "client_id": CLIENT_ID,
+                                        "refresh_token": found.value}))
+        except ChatGPTAuthError as error:
+            self._access = self._refresh = None
+            self._expires = 0
+            self._account = previous
+            if error.reason == "unreachable":
+                log.warning("secret_proxy: could not reach OpenAI to restore the stored ChatGPT login; will retry")
+                self._store.restore_later()
+            elif error.reason == "rejected":
+                log.warning("secret_proxy: stored ChatGPT login is no longer valid; run secret-proxy login chatgpt")
+            else:
+                log.warning("secret_proxy: could not restore the stored ChatGPT login; run secret-proxy login chatgpt")
+            return
+        self._store.restored = True
+        self._refresh_count = 0
+        self._last_refresh_at = self._last_refresh_due_at = None
+        log.info("secret_proxy: restored the ChatGPT login from the login vault")
+        # The refresh rotated the token: store the new one at once.
+        self._persist()
+
     def status(self) -> dict:
-        """Read-only lifecycle evidence: no tokens, claims, identities or network I/O."""
+        """Lifecycle evidence only: no tokens, claims or identities.
+
+        Without a login store there is no network I/O. With one, the first call
+        after a start may restore the stored login.
+        """
         with self._lock:
-            return {'loggedIn': bool(self._access and self._refresh),
-                    'expiresAt': int(self._expires) if self._access and self._refresh else None,
-                    'refreshCount': self._refresh_count,
-                    'lastRefreshAt': self._last_refresh_at,
-                    'lastRefreshDueAt': self._last_refresh_due_at}
+            self._restore_locked()
+            value = {'loggedIn': bool(self._access and self._refresh),
+                     'expiresAt': int(self._expires) if self._access and self._refresh else None,
+                     'refreshCount': self._refresh_count,
+                     'lastRefreshAt': self._last_refresh_at,
+                     'lastRefreshDueAt': self._last_refresh_due_at}
+            if self._store is not None:
+                value.update(self._store.status())
+            return value
+
+    def logout(self) -> dict:
+        """Forget the login in RAM and delete the stored item, if any."""
+        with self._lock:
+            self._pending = None
+            self._access = self._refresh = self._account = None
+            self._expires = 0
+            self._refresh_count = 0
+            self._last_refresh_at = self._last_refresh_due_at = None
+            if self._store is None:
+                return {"stored": False}
+            self._store.skip_restore()
+            self._store.delete()
+            return {"stored": self._store.stored}
 
     def get_token(self) -> str:
         with self._lock:
+            self._restore_locked()
             if not self._refresh:
                 raise ChatGPTAuthError("ChatGPT login required; run chatgpt-login")
             if self._clock() + 120 >= self._expires:
@@ -159,4 +253,6 @@ class ChatGPTCredentials:
                 self._refresh_count += 1
                 self._last_refresh_at = int(self._clock())
                 self._last_refresh_due_at = due_at
+                if self._store is not None:
+                    self._persist()  # each refresh rotates the stored token
             return self._access

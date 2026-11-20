@@ -13,17 +13,22 @@ exchange. The client gets only *sealed* values:
   reference in place of ``tid`` and no signature.
 
 The real Copilot token is injected only into the API host derived from its own
-``proxy-ep``. A proxy restart discards both tokens and requires a new login.
+``proxy-ep``. By default a proxy restart discards both tokens and requires a
+new login. With an opt-in login store (loginstore.py) the GitHub token is also
+kept in a read/write vault; the Copilot token is minted again from it after a
+restart and is never stored.
 """
 
 from __future__ import annotations
 
 import base64
+import logging
 import re
 import threading
 import time
 
 import githubdevice
+import loginstore
 from githubdevice import DeviceFlow, GitHubDeviceError
 
 # The public OAuth client ID of the editor flow Pi copies, stored the way Pi
@@ -51,6 +56,9 @@ _SEALED_RE = re.compile(
     r"(?<![A-Za-z0-9_.;=:-])tid=(" + re.escape(MARKER) + r"[A-Za-z0-9._-]+);exp=([0-9]{1,12})"
     r"(?:;proxy-ep=([A-Za-z0-9.-]{1,253}))?(?![A-Za-z0-9_.;=:-])"
 )
+
+
+log = logging.getLogger("secret_proxy.copilot")
 
 
 class CopilotAuthError(Exception):
@@ -114,8 +122,11 @@ def _available_models(data: dict, allow_policy_fallback: bool) -> list[str] | No
 
 
 class CopilotCredentials:
-    def __init__(self, domain: str = DEFAULT_DOMAIN, request=None, clock=time.time, sleep=time.sleep):
+    def __init__(self, domain: str = DEFAULT_DOMAIN, request=None, clock=time.time, sleep=time.sleep,
+                 store=None):
         self.domain = domain
+        # Optional loginstore.LoginStore; None keeps everything in RAM only.
+        self._store = loginstore.persistence(store, "github-copilot", clock)
         self._request = request or githubdevice.request_json
         self._clock = clock
         self.device = DeviceFlow(domain=domain, client_id=CLIENT_ID, scopes=SCOPES,
@@ -152,6 +163,9 @@ class CopilotCredentials:
                 raise GitHubDeviceError("unavailable", "GitHub did not issue a Copilot token for this account") from None
             self._refresh_count = 0
             self._last_refresh_at = None
+            if self._store is not None:
+                self._store.skip_restore()
+                self._store.save(self._github, {"domain": self.domain})
             credential = self._sealed_credential()
             models = self._catalog()
         if models:
@@ -207,9 +221,62 @@ class CopilotCredentials:
             credential["enterpriseUrl"] = self.domain
         return credential
 
+    def _restore_locked(self) -> None:
+        """Restore a stored GitHub token once; then mint a Copilot token from it."""
+        if self._store is None:
+            return
+        self._store.flush()
+        if self._github:
+            if not self._token and self._clock() >= self._retry_at:
+                self._mint_restored()
+            return
+        found = self._store.take_restore()
+        if found is None:
+            return
+        if found.metadata.get("domain") != self.domain:
+            log.warning("secret_proxy: stored GitHub Copilot login is for another domain; "
+                        "run secret-proxy login github-copilot")
+            return
+        if not _TOKEN_RE.fullmatch(found.value):
+            log.warning("secret_proxy: stored GitHub Copilot login is not usable; run secret-proxy login github-copilot")
+            return
+        self._github = found.value
+        self._store.restored = True
+        self._refresh_count = 0
+        self._last_refresh_at = None
+        self._mint_restored()
+
+    def _mint_restored(self) -> None:
+        try:
+            self._exchange()
+        except (CopilotAuthError, GitHubDeviceError):
+            if not self._github:  # GitHub answered 401: the stored token is dead
+                self._store.restored = False
+                log.warning("secret_proxy: stored GitHub Copilot login is no longer valid; "
+                            "run secret-proxy login github-copilot")
+            else:
+                self._retry_at = self._clock() + RETRY_DELAY
+                log.warning("secret_proxy: could not mint a Copilot token from the stored login; will retry")
+            return
+        log.info("secret_proxy: restored the GitHub Copilot login from the login vault")
+
+    def logout(self) -> dict:
+        """Forget the login in RAM and delete the stored item, if any."""
+        self.device.cancel()
+        with self._lock:
+            self._clear()
+            self._refresh_count = 0
+            self._last_refresh_at = None
+            if self._store is None:
+                return {"stored": False}
+            self._store.skip_restore()
+            self._store.delete()
+            return {"stored": self._store.stored}
+
     def api_host(self) -> str | None:
         """The one host the real token may be sent to, or None when logged out."""
         with self._lock:
+            self._restore_locked()
             if not self._token:
                 return None
             return api_host(token_fields(self._token)[1], self.domain)
@@ -217,6 +284,10 @@ class CopilotCredentials:
     def get_token(self) -> str:
         """Return a valid Copilot token, refreshing once (under the lock) when due."""
         with self._lock:
+            self._restore_locked()
+            if self._github and not self._token:
+                # Restored, but no Copilot token could be minted yet.
+                raise CopilotAuthError("Copilot token refresh failed; retry shortly")
             if not self._github or not self._token:
                 raise CopilotAuthError("GitHub Copilot login required; run secret-proxy login github-copilot")
             now = self._clock()
@@ -249,10 +320,15 @@ class CopilotCredentials:
                     "endpoints": {"api": "https://" + api_host(proxy_ep, self.domain)}}
 
     def status(self) -> dict:
-        """Lifecycle evidence only: no tokens, identities or network I/O."""
+        """Lifecycle evidence only: no tokens or identities. With a login store,
+        the first call after a start may restore the stored login."""
         with self._lock:
+            self._restore_locked()
             logged_in = bool(self._github and self._token)
-            return {"loggedIn": logged_in,
-                    "expiresAt": int(self._expires_at) if logged_in else None,
-                    "refreshCount": self._refresh_count,
-                    "lastRefreshAt": self._last_refresh_at}
+            value = {"loggedIn": logged_in,
+                     "expiresAt": int(self._expires_at) if logged_in else None,
+                     "refreshCount": self._refresh_count,
+                     "lastRefreshAt": self._last_refresh_at}
+            if self._store is not None:
+                value.update(self._store.status())
+            return value

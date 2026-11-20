@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "loginStore": {"vault": "Logins"},
+  "githubLogins": {
+    "copilot": {"domain": "github.com"},
+    "cli": {"domain": "github.com", "scopes": ["repo", "read:org", "gist"]}
+  },
+  "secrets": {
+    "CHATGPT_ACCESS_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [{"kind": "header", "hosts": ["chatgpt.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["POST"], "paths": ["/backend-api/codex/responses"]}]
+    },
+    "GITHUB_COPILOT_SESSION_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [{"kind": "header", "hosts": ["api.githubcopilot.com", "api.*.githubcopilot.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "POST"]}]
+    },
+    "GH_CLI_OAUTH_TOKEN": {
+      "runtimeOnly": true,
+      "placements": [{"kind": "header", "hosts": ["api.github.com"], "name": "authorization", "template": "token {secret}", "methods": ["GET", "HEAD"]}]
+    }
+  }
+}

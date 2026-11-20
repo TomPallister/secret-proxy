@@ -14,6 +14,7 @@
 !githubdevice.py
 !copilotcreds.py
 !ghclicreds.py
+!loginstore.py
 !sealedjwt.py
 !gitsign.py
 !egress.py

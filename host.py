@@ -25,6 +25,7 @@ from client import private_read, ProxyClient
 from networking import NetworkPolicy, NetworkError, resolve_gateway, check_gateway, relay_command
 from runtime import read_bootstrap
 import clientgrants
+import secretstore
 from secretstore import SecretManifest
 
 ROOT = Path('/opt/secret-proxy')
@@ -35,7 +36,7 @@ SA_HOME = Path('/Users/secagent')
 BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
-               'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
+               'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
                'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py',
                'approvals.py', 'audit.py')
 
@@ -220,6 +221,15 @@ def prepare(deployment: Deployment):
     print('Candidate image prepared; no credentials consumed and no existing container changed.', flush=True)
 
 
+def check_login_vault(deployment: Deployment, declared):
+    """Refuse to start unless the bootstrap and manifest agree on the login vault."""
+    manifest = SecretManifest.load(deployment.private / 'config/manifest.json')
+    try:
+        secretstore.check_login_vault(manifest, declared)
+    except secretstore.LoginStoreConfigError as error:
+        raise HostError(str(error)) from None
+
+
 def client_tokens(deployment: Deployment, default_token: str) -> dict:
     """One persistent private token per named manifest client (issue #2).
 
@@ -282,6 +292,7 @@ def serve(deployment: Deployment):
     if re.fullmatch(r'[0-9a-f]{48}', capability) is None:
         raise HostError('Invalid instance proxy capability')
     bundle['proxy_token'] = capability
+    check_login_vault(deployment, bundle.get('login_vault'))
     clients = client_tokens(deployment, capability)
     if clients:
         bundle['client_tokens'] = clients
@@ -426,13 +437,19 @@ def audit_export(deployment: Deployment, out=None):
     out.flush()
 
 
+BOOTSTRAP_KEYS = frozenset({'account', 'vault', 'item', 'runtimeVault'})
+
+
 def validate_bootstrap_config(config: dict):
-    if not isinstance(config, dict) or set(config) != {'account', 'vault', 'item', 'runtimeVault'}:
+    # loginVault is optional: the read/write vault of an opt-in manifest loginStore.
+    if not isinstance(config, dict) or not BOOTSTRAP_KEYS <= set(config) or set(config) - BOOTSTRAP_KEYS - {'loginVault'}:
         raise HostError('Invalid bootstrap configuration')
     if any(not isinstance(v, str) or not v or v.startswith('-') or any(ord(c) < 32 for c in v) for v in config.values()):
         raise HostError('Invalid bootstrap metadata')
     if re.fullmatch(r'[a-z0-9-]+\.1password\.(?:com|eu|ca)', config['account']) is None or config['vault'] == config['runtimeVault']:
         raise HostError('Invalid bootstrap account/vault boundary')
+    if 'loginVault' in config and config['loginVault'] in (config['vault'], config['runtimeVault']):
+        raise HostError('The login vault must differ from the bootstrap and runtime vaults')
 
 
 def validate_bootstrap_item(config: dict, item: dict) -> str:
@@ -449,6 +466,15 @@ def validate_bootstrap_item(config: dict, item: dict) -> str:
         matches = [f for f in fields if f.get('label') == label]
         if len(matches) != 1 or matches[0].get('value') != expected:
             raise HostError('Bootstrap provenance mismatch')
+    # With a login store the same service account may also write one login
+    # vault. The item must name exactly that vault; without one, it must not
+    # claim any write access the configuration does not know about.
+    matches = [f for f in fields if f.get('label') == 'login_vault']
+    if 'loginVault' in config:
+        if len(matches) != 1 or matches[0].get('value') != config['loginVault']:
+            raise HostError('Bootstrap provenance mismatch: login_vault must name the configured login vault')
+    elif matches:
+        raise HostError('Bootstrap provenance mismatch: login_vault is set but bootstrap.json has no loginVault')
     values = [f for f in fields if f.get('id') == 'password' and f.get('purpose') == 'PASSWORD' and f.get('type') == 'CONCEALED']
     if len(values) != 1:
         raise HostError('Missing bootstrap capability')
@@ -535,6 +561,8 @@ def main():
                                 env=bootstrap_env(str(Path.home())), capture_output=True, timeout=180)
         capability = validate_bootstrap_item(config, json.loads(checked(result, 'desktop bootstrap')))
         bundle = {'op_token': capability, 'proxy_token': '0' * 48}
+        if 'loginVault' in config:
+            bundle['login_vault'] = config['loginVault']
         relay_exec(as_secagent('serve', args.instance), bundle)
         raise AssertionError('exec unexpectedly returned')
     if os.getuid() != pwd.getpwnam('secagent').pw_uid:

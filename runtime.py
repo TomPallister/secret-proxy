@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 
-from secretstore import SecretManifest
+from secretstore import LoginStoreConfigError, SecretManifest, check_login_vault
 import clientgrants
 from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
@@ -60,7 +60,7 @@ def read_bootstrap(fd: int, timeout: float = 30) -> dict:
         return result
     obj = json.loads(data, object_pairs_hook=unique)
     if not isinstance(obj, dict) or not {"op_token", "proxy_token"} <= set(obj) \
-            or set(obj) - {"op_token", "proxy_token", "client_tokens", "approver_token"}:
+            or set(obj) - {"op_token", "proxy_token", "client_tokens", "approver_token", "login_vault"}:
         raise ValueError("invalid bootstrap fields")
     op = obj["op_token"]
     if not isinstance(op, str) or not op or not op.isascii() or any(c.isspace() or ord(c) < 33 for c in op):
@@ -86,6 +86,11 @@ def read_bootstrap(fd: int, timeout: float = 30) -> dict:
                                  or re.fullmatch(r"[0-9a-f]{48}", approver) is None
                                  or approver in seen):
         raise ValueError("invalid approver capability")
+    # Optional: the login vault the bootstrap item declares (loginStore).
+    login_vault = obj.get("login_vault")
+    if login_vault is not None and (not isinstance(login_vault, str) or not login_vault.strip()
+                                    or any(ord(c) < 32 for c in login_vault)):
+        raise ValueError("invalid login vault")
     return obj
 
 
@@ -245,6 +250,8 @@ def main():
     import constrainedca
     ca_domains = constrainedca.plan(config, args.ca_label)
     capabilities = read_bootstrap(sys.stdin.fileno())
+    # The service account may write only the login vault the manifest uses.
+    check_login_vault(manifest, capabilities.get("login_vault"))
     os.umask(0o077)
     args.state_dir.mkdir(parents=True, exist_ok=True)
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -299,7 +306,8 @@ if __name__ == "__main__":
         # Provider/JSON errors must not echo any capability or callback content.
         # AWS policy, egress, CA policy and client errors contain only policy text, so show them.
         detail = (str(error) if isinstance(error, (AwsPolicyError, EgressConfigError, CAPolicyError,
-                                                   clientgrants.ClientConfigError, AuditConfigError))
+                                                   clientgrants.ClientConfigError, AuditConfigError,
+                                                   LoginStoreConfigError))
                   else type(error).__name__)
         print("secret-proxy runtime failed: " + detail, file=sys.stderr)
         sys.exit(1)

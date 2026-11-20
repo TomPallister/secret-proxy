@@ -25,6 +25,7 @@ Design (see secret-proxy/README.md):
 """
 
 import base64
+import hmac
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from auth0creds import Auth0ManagementTokenProvider
 from chatgptcreds import ChatGPTCredentials, ChatGPTAuthError
 import copilotcreds
 import ghclicreds
+import loginstore
 import githubdevice
 from oauthcreds import FormTokenProvider, FormTokenSpec, OAuthTokenError
 import gitsign
@@ -95,12 +97,14 @@ _generation_local = threading.local()
 class _ProviderState:
     """Per-generation cache for providers derived from a secret resolver."""
 
-    def __init__(self, google=None, aws=None, aws_tried=False):
+    def __init__(self, google=None, aws=None, aws_tried=False, login_store=None):
         self.lock = threading.RLock()
         self.google = google
         self.auth0 = None
         self.form_tokens = {}
-        self.chatgpt = ChatGPTCredentials()
+        # Optional read/write vault for proxy-owned logins (manifest loginStore).
+        self.login_store = login_store
+        self.chatgpt = ChatGPTCredentials(store=login_store)
         # Proxy-owned GitHub logins, created on first use from the manifest.
         self.github = {}
         self.aws = aws
@@ -202,6 +206,7 @@ def _load_secret_store() -> None:
             manifest_env = dict(os.environ)
             manifest = SecretManifest.load(SECRETS_FILE, env=manifest_env)
             resolver = SecretResolver.from_environment(manifest, env=os.environ)
+            login_store = _login_store_for(manifest)
         except Exception as e:  # noqa: BLE001 - fail closed rather than retain stale policy
             _manifest = None
             _resolver = None
@@ -216,13 +221,22 @@ def _load_secret_store() -> None:
         # Publish one complete generation only after both objects are ready.
         _manifest = manifest
         _resolver = resolver
-        _store_generation = _StoreGeneration(manifest, resolver, _ProviderState())
+        _store_generation = _StoreGeneration(manifest, resolver, _ProviderState(login_store=login_store))
         # Legacy mirrors remain for direct callers and existing tests.
         _google_provider_singleton = None
         _aws_provider = None
         _aws_provider_tried = False
         _manifest_mtime = mtime
         log.info(f"secret_proxy: loaded secret store from {SECRETS_FILE}")
+
+
+def _login_store_for(manifest):
+    """The manifest's opt-in login vault, using the same service account; else None."""
+    vault = manifest.login_vault() if hasattr(manifest, "login_vault") else None
+    if vault is None:
+        return None
+    return loginstore.LoginStore(vault, os.environ.get("OP_SERVICE_ACCOUNT_TOKEN", ""),
+                                 runtime_env=os.environ)
 
 
 class SecretReferenceError(Exception):
@@ -936,11 +950,12 @@ class _GitHubLogin:
 _GITHUB_LOGINS = (
     _GitHubLogin("copilot", copilotcreds.CANONICAL, "/github-copilot",
                  b'{"error":"use_github_copilot_login"}', copilotcreds.CLIENT_ID,
-                 lambda settings: copilotcreds.CopilotCredentials(domain=settings["domain"]),
+                 lambda settings, store: copilotcreds.CopilotCredentials(domain=settings["domain"], store=store),
                  "github-copilot"),
     _GitHubLogin("cli", ghclicreds.CANONICAL, "/github",
                  b'{"error":"use_gh_login"}', ghclicreds.CLIENT_ID,
-                 lambda settings: ghclicreds.GhCliCredentials(domain=settings["domain"], scopes=settings["scopes"]),
+                 lambda settings, store: ghclicreds.GhCliCredentials(domain=settings["domain"],
+                                                                      scopes=settings["scopes"], store=store),
                  "github"),
 )
 
@@ -973,7 +988,7 @@ def _github_provider(login: _GitHubLogin):
     with state.lock:
         provider = state.github.get(login.kind)
         if provider is None:
-            provider = state.github[login.kind] = login.factory(settings)
+            provider = state.github[login.kind] = login.factory(settings, state.login_store)
         return provider
 
 
@@ -1731,6 +1746,55 @@ def _github_login_route(flow: http.HTTPFlow) -> bool:
     return False
 
 
+LOGOUT_INSTANCE_HEADER = "x-secret-proxy-instance"
+
+
+def _logout_route(flow: http.HTTPFlow) -> bool:
+    """Sign out of a proxy-owned login: clear RAM and delete any stored item.
+
+    POST only, by a client granted that login, naming this boot's instance in
+    a header so a stale client cannot act on a restarted proxy. The response
+    is credential-free: whether a stored login remains.
+    """
+    if (flow.request.host or "").lower() != SENTINEL_HOST:
+        return False
+    path = flow.request.path or ""
+    providers = {"/chatgpt/logout": "chatgpt"}
+    providers.update({login.prefix + "/logout": login.cli_name for login in _GITHUB_LOGINS})
+    kind = providers.get(path.split("?", 1)[0])
+    if kind is None:
+        return False
+    if path not in providers:
+        return _json_response(flow, 400, {"error": "bad_request"})
+    if not _client_may_login(flow, kind):
+        return _client_refusal(flow, "the " + kind + " login")
+    if kind == "chatgpt":
+        try:
+            available = _current_manifest().secret("CHATGPT_ACCESS_TOKEN").runtime_only
+        except (AttributeError, KeyError):
+            available = False
+        bound = _bound_or_global()
+        provider = bound.providers.chatgpt if available and bound is not None else None
+    else:
+        provider = _github_provider(next(login for login in _GITHUB_LOGINS if login.cli_name == kind))
+    if provider is None:
+        return _json_response(flow, 403, {"error": "not_available"})
+    if (flow.request.method or "").upper() != "POST":
+        return _json_response(flow, 405, {"error": "method_not_allowed"})
+    instance = os.environ.get("SECRET_PROXY_INSTANCE_ID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", instance) is None:
+        return _json_response(flow, 503, {"error": "unavailable"})
+    presented = flow.request.headers.get(LOGOUT_INSTANCE_HEADER, "")
+    if not hmac.compare_digest(presented.encode("utf-8", "replace"), instance.encode("ascii")):
+        return _json_response(flow, 409, {"error": "stale_instance"})
+    result = provider.logout()
+    # Signing out removes access: never refuse it because the audit log failed.
+    _audit(flow, "login", "completed", provider=kind, reason="logout")
+    log.info("secret_proxy: signed out of the proxy-owned %s login%s", kind,
+             "; the stored login could not be deleted yet" if result["stored"] else "")
+    return _json_response(flow, 200, {"instance": instance, "loggedOut": True, "stored": bool(result["stored"])})
+
+
 GIT_SIGNING_SSH_KEY = "GIT_SIGNING_SSH_KEY"
 GIT_SIGNING_PATH = "/git/sign"
 GIT_SIGNING_KEY_HEADER = "x-git-signing-key"
@@ -1853,6 +1917,8 @@ def _request_locked(flow: http.HTTPFlow) -> None:
         if _health_route(flow):
             return
         if _github_login_route(flow):
+            return
+        if _logout_route(flow):
             return
         if _copilot_exchange_response(flow):
             return

@@ -29,8 +29,10 @@ UUID_RE = re.compile(
 )
 
 VALID_VALUE_FIELDS = ("password", "sshPrivateKey")
-# Values the proxy itself obtains through a login it owns. They are held in
-# RAM only: never read from the vault, and a restart requires a new login.
+# Values the proxy itself obtains through a login it owns. They are never read
+# from the runtime vault. By default they are held in RAM only and a restart
+# requires a new login; an opt-in loginStore (loginstore.py) persists the
+# long-lived login tokens in a separate read/write vault.
 RUNTIME_ONLY_NAMES = frozenset({"CHATGPT_ACCESS_TOKEN", "GITHUB_COPILOT_SESSION_TOKEN", "GH_CLI_OAUTH_TOKEN"})
 # Proxy-owned GitHub logins: the manifest key, its runtimeOnly secret and the
 # fields each one accepts.
@@ -149,7 +151,7 @@ class SecretManifest:
         provider = "1password"
         with open(path) as f:
             data = json.load(f, object_pairs_hook=_unique_object)
-        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients", "approvals", "audit"}:
+        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients", "approvals", "audit", "loginStore"}:
             raise ValueError("invalid manifest root")
         if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 3:
             raise ValueError("schemaVersion must be exactly integer 3")
@@ -456,6 +458,8 @@ class SecretManifest:
             ("github-copilot", "copilot" in manifest.github_logins),
             ("github", "cli" in manifest.github_logins),
         ) if on]
+        # Optional and off by default: None keeps proxy-owned logins in RAM only.
+        manifest.login_store = _login_store(data.get("loginStore"), vault, enabled_logins)
         # Optional; absent means one default client with every grant (today's
         # behaviour). Raises ClientConfigError, a ValueError.
         manifest.clients = clientgrants.parse_clients(data.get("clients"), secrets, enabled_logins)
@@ -486,6 +490,11 @@ class SecretManifest:
         """Settings for an enabled proxy-owned GitHub login, or None when off."""
         value = getattr(self, "github_logins", {}).get(kind)
         return dict(value) if value is not None else None
+
+    def login_vault(self) -> str | None:
+        """The read/write vault for proxy-owned logins, or None (RAM only)."""
+        store = getattr(self, "login_store", None)
+        return store["vault"] if store is not None else None
 
     def canonical_name(self, name: str) -> str:
         """Validate and return a canonical secret name.
@@ -763,6 +772,45 @@ class SecretManifest:
             Account configuration dict
         """
         return self._accounts.get(name, {})
+
+
+class LoginStoreConfigError(ValueError):
+    """Invalid ``loginStore`` or a bootstrap that does not match it. Fixed text only."""
+
+
+def _valid_vault_name(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and not any(ord(c) < 32 for c in value)
+
+
+def _login_store(raw: object, runtime_vault: str, enabled_logins) -> dict | None:
+    """Validate ``loginStore``: a separate read/write vault for proxy-owned logins."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"vault"}:
+        raise LoginStoreConfigError("loginStore must contain only vault")
+    vault = raw["vault"]
+    if not _valid_vault_name(vault):
+        raise LoginStoreConfigError("loginStore.vault must be a nonempty string")
+    if vault == runtime_vault:
+        raise LoginStoreConfigError("loginStore.vault must differ from account.vault, which stays read-only")
+    if not enabled_logins:
+        raise LoginStoreConfigError("loginStore requires a proxy-owned login (ChatGPT, GitHub Copilot or GitHub CLI)")
+    return {"vault": vault}
+
+
+def check_login_vault(manifest: "SecretManifest", declared: object) -> None:
+    """The bootstrap item's declared login vault must match the manifest exactly.
+
+    *declared* is the vault named by the bootstrap item's ``login_vault`` field
+    (None when it has none). The service account may only be given write access
+    to a vault the manifest uses for logins, and vice versa.
+    """
+    store = getattr(manifest, "login_store", None)
+    expected = store["vault"] if store is not None else None
+    if declared != expected:
+        if expected is None:
+            raise LoginStoreConfigError("the bootstrap declares a login vault but the manifest has no loginStore")
+        raise LoginStoreConfigError("the bootstrap item does not declare the manifest's loginStore vault")
 
 
 def _github_logins(raw: object, secrets: dict) -> dict:

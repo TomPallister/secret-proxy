@@ -348,6 +348,29 @@ def device_login(client: ProxyClient, prefix: str) -> dict:
     raise ClientError('Login timed out')
 
 
+LOGOUT_ROUTES = {'chatgpt': '/chatgpt/logout', 'github-copilot': '/github-copilot/logout', 'github': '/github/logout'}
+
+
+def logout(client: ProxyClient, provider: str) -> dict:
+    """Sign out of a proxy-owned login on this boot of the proxy only."""
+    client.check_ready()
+    instance = json.loads(private_read(Path(client.config['sharedDir']) / 'ready.json', 4096))['instance']
+    status, data = client.request(LOGOUT_ROUTES[provider], b'', headers={'X-Secret-Proxy-Instance': instance})
+    if status == 409:
+        raise ClientError('The proxy restarted; run logout again')
+    if status != 200 or len(data) > 65536:
+        raise ClientError('Logout failed; check readiness and that this login is enabled')
+    try:
+        result = json.loads(data)
+    except ValueError:
+        result = None
+    if (not isinstance(result, dict) or set(result) != {'instance', 'loggedOut', 'stored'}
+            or result['instance'] != instance or result['loggedOut'] is not True
+            or type(result['stored']) is not bool):
+        raise ClientError('Invalid logout response')
+    return result
+
+
 # --- Approval prompts (issue #3) ---------------------------------------------
 APPROVER_HEADER = 'X-Secret-Proxy-Approver'
 INSTANCE_HEADER = 'X-Secret-Proxy-Instance'
@@ -483,6 +506,8 @@ def main():
     login.add_argument('--provider', choices=('chatgpt', 'github-copilot', 'github'), default='chatgpt')
     login.add_argument('--agent-dir', type=Path)
     login.add_argument('--callback-stdin', action='store_true')
+    sign_out = commands.add_parser('logout', help='Sign out of a proxy-owned login and delete it from the login vault')
+    sign_out.add_argument('--provider', choices=sorted(LOGOUT_ROUTES), required=True)
     commands.add_parser('status')
     args = parser.parse_args()
     config = json.loads(private_read(args.config, 65536))
@@ -490,6 +515,14 @@ def main():
     client.check_ready()
     if args.command == 'status':
         print('Proxy ready (authenticated instance check; vault/upstreams not tested)')
+    elif args.command == 'logout':
+        result = logout(client, args.provider)
+        if result['stored']:
+            print('Signed out in the proxy, but the stored login could not be deleted yet. '
+                  'Run logout again, or delete it from the login vault.')
+        else:
+            print('Signed out of the proxy-owned ' + args.provider + ' login; nothing is stored for it.')
+        print('Saved client references stay but no longer work until the next login.')
     elif args.command == 'run':
         argv = args.argv[1:] if args.argv[:1] == ['--'] else args.argv
         if not argv:

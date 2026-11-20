@@ -23,13 +23,13 @@ from clientgrants import ClientConfigError
 from client import private_read, validate_config
 from host import Deployment, HostError, PODMAN, PYTHON, ROOT, SA_HOME, SHARED_ROOT
 from egress import EgressConfigError
-from secretstore import SecretManifest
+from secretstore import LoginStoreConfigError, SecretManifest, check_login_vault
 
 GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
-         'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
+         'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
          'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
          'manage.py', 'secret-proxy', 'capolicy.py', 'constrainedca.py', 'approvals.py', 'audit.py')
 # Private policy copied into the instance's read-only /config (bootstrap metadata
@@ -126,6 +126,14 @@ def validate_source_config(source: Path):
             loaded = SecretManifest.load(manifest)
         except ClientConfigError as error:
             raise HostError('Invalid clients section: ' + str(error)) from None
+        except LoginStoreConfigError as error:
+            raise HostError('Invalid loginStore section: ' + str(error)) from None
+    if 'bootstrap.json' in contents:
+        # The bootstrap item must declare exactly the manifest's login vault.
+        try:
+            check_login_vault(loaded, json.loads(contents['bootstrap.json']).get('loginVault'))
+        except (LoginStoreConfigError, AttributeError) as error:
+            raise HostError('Invalid bootstrap login vault: ' + str(error)) from None
     if 'aws-okta.json' in contents:
         AwsCredsProvider._validate_config(json.loads(contents['aws-okta.json']))
     if 'aws-policy.json' in contents:
