@@ -49,15 +49,29 @@ engineering evidence, not a penetration test or a security certification.
   refused, never offered. Only the proxy account's per-boot approver
   capability (never a client token) can answer,
   through `secret-proxy approvals`; clients receive only the denial rule.
-- ChatGPT access and rotating refresh tokens are memory-only. Restart requires
-  browser sign-in again. Static secrets remain cached until invalidation/restart.
+- ChatGPT access and rotating refresh tokens are memory-only by default. Restart
+  requires browser sign-in again. Static secrets remain cached until
+  invalidation/restart.
+- Optional login store (manifest `loginStore`): the ChatGPT refresh token, the
+  Copilot GitHub token and the gh token also rest in one separate 1Password vault
+  that the same service account may write. Short-lived access and Copilot tokens
+  are never stored. Anyone who can read that vault, including your desktop
+  1Password app, can read these tokens. The runtime secrets vault stays
+  read-only. Values reach `op` only on stdin, never in argv or logs, and clients
+  still receive only references. The bootstrap item must name the login vault in
+  a `login_vault` field and the manifest, `bootstrap.json` and that field must
+  agree, or startup is refused. A stored login that GitHub or OpenAI rejects
+  leaves the proxy logged out; it is not deleted automatically. `logout` deletes
+  it (1Password keeps deleted items in Recently Deleted for 30 days).
 - GitHub Copilot: the proxy runs the device flow and the Copilot token exchange.
-  The GitHub token and Copilot token are memory-only. The client's own exchange
+  The GitHub token and Copilot token are memory-only (unless the login store
+  is on: then the GitHub token is stored, never the Copilot token). The client's own exchange
   call is answered by the proxy with a sealed token and never forwarded. The real
   Copilot token is sent only to the API host named by its own `proxy-ep` field,
   within the manifest placement. A client-side device flow using the Copilot
   OAuth client ID, or an exchange with any other bearer, is refused.
-- GitHub CLI: the proxy runs gh's device flow and keeps the OAuth token in RAM.
+- GitHub CLI: the proxy runs gh's device flow and keeps the OAuth token in RAM
+  (and, with the login store, in the login vault).
   gh receives only a reference in `GH_TOKEN`; the client refuses a configured
   `GH_TOKEN` that is not a reference. gh's own device flow is refused. The
   token can only be added where the manifest places `GH_CLI_OAUTH_TOKEN`.

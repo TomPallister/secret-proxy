@@ -46,8 +46,8 @@ secret-proxy stop
 
 For **ChatGPT/Codex in Pi**, run `secret-proxy login chatgpt` after starting the proxy.
 Follow the browser instructions and paste the callback into the terminal's
-hidden prompt. You must log in again after a restart: those OAuth tokens are
-kept in memory, not saved to disk. Other integrations do not require this login.
+hidden prompt. By default you log in again after a restart: tokens stay in memory.
+An opt-in [login vault](docs/advanced-setup.md#login-store) keeps them across restarts.
 
 For **GitHub Copilot in Pi**, enable it in your manifest and run
 `secret-proxy login github-copilot`. You approve a code on GitHub; the proxy

@@ -21,8 +21,47 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    the supplied proxy and trust settings; see [client compatibility](clients.md).
 5. `secret-proxy stop` stops only the selected instance and waits for the old
    foreground controllers to finish. It preserves volumes, trust, capability,
-   policy and client auth. A new start requires browser login again. With the
+   policy and client auth. A new start requires browser login again, unless the
+   manifest has a [login store](#stored-logins). With the
    [audit log](#audit-log) on, a stop seals and signs it.
+
+## Stored logins
+
+With `loginStore` in the manifest ([setup](advanced-setup.md#login-store)), each
+completed login is also written to the login vault: the ChatGPT refresh token,
+or the GitHub token for Copilot and gh. After a restart nothing needs to be
+done. The first use of a login, or the first `auth-status` for it, restores it:
+
+- ChatGPT: one refresh with the stored refresh token. OpenAI rotates it on every
+  refresh, so the new one is written back each time.
+- GitHub Copilot: a new Copilot token is minted from the stored GitHub token.
+- gh: the stored token is used as it is.
+
+Restore runs once per start, and the proxy never polls the vault: it reads the
+vault on restore and writes it on login, logout and each ChatGPT rotation. That
+stays within 1Password's service-account limits. If something fails, the proxy
+logs a fixed message (never a value) and carries on:
+
+| Message | What it means |
+| --- | --- |
+| `stored ChatGPT login is no longer valid; run secret-proxy login chatgpt` | OpenAI refused the stored token. The proxy is logged out; log in again (this replaces the item). |
+| `could not restore the stored ChatGPT login; run secret-proxy login chatgpt` | The refresh failed in a way that may have used the token. It is not retried. |
+| `could not reach OpenAI to restore ...; will retry` | Nothing reached OpenAI. The next use after a back-off tries again. |
+| `stored GitHub Copilot login is no longer valid` | GitHub refused the stored token; log in again. |
+| `stored GitHub CLI login was made with other settings` | The gh domain or requested scopes changed; log in again. |
+| `could not read the stored ... login (...)` | The vault could not be read. The login counts as logged out; the next use after a back-off tries again. |
+| `could not save the stored ... login (...)` | The write failed. The login keeps working in memory and the write is retried on later use, with back-off. |
+
+A rejected stored login is not deleted automatically, so you can inspect it; the
+next login replaces it. Several items with the same title are refused; delete
+the extras in 1Password.
+
+`secret-proxy logout chatgpt|github-copilot|github` signs out of that login on
+the running proxy and deletes its stored item. It needs the login's grant and the
+current boot nonce, so it never acts on a restarted proxy. If the delete fails,
+it says so; the proxy stays signed out and retries the delete on later use. Sealed
+references saved by clients stay in their files but stop working until the next
+login. 1Password keeps deleted items in Recently Deleted for 30 days.
 
 ## Scoped client tokens
 
@@ -69,6 +108,12 @@ No tokens, account IDs, identity claims or upstream error bodies are returned.
 Status does not fetch a secret, perform a token exchange, move the clock, force
 refresh or keep an idle login alive. Login resets these counters; a process
 restart resets all in-memory state. `loggedIn` is not an upstream liveness probe.
+
+With a [login store](#stored-logins), every login's status also has `stored`
+(the login vault holds this login, as of the last read or write) and
+`restoredFromStore` (this login came from the vault, not a login since start).
+The first status after a start may then restore the login, which for ChatGPT
+and Copilot is one token request.
 
 `secret-proxy auth-status github-copilot` reads `/github-copilot/status` the same
 way. It returns `instance`, `loggedIn`, `expiresAt` (the Copilot token's expiry),

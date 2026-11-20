@@ -53,7 +53,9 @@ Example bootstrap metadata:
 }
 ```
 
-Use a read-only service account scoped to the runtime vault. Store its token in
+With a [login store](#login-store), add `"loginVault"` here too. Use a read-only
+service account scoped to the runtime vault (plus write access to the login vault
+when there is one). Store its token in
 the bootstrap Login item's password field, with these text fields:
 `account_url` matching the configured account, `destination_vault` matching
 `runtimeVault`, and `permissions` equal to `read_items`. The launcher verifies
@@ -342,6 +344,60 @@ full-access policy, including uploads and Git over HTTPS, looks like this:
   Use GitHub permissions and scopes to limit writes.
 - Enabling the login adds `<domain>` to the intercepted hosts so the proxy can
   refuse gh's own device flow.
+
+## Login store
+
+Proxy-owned logins (ChatGPT, GitHub Copilot, gh) live in RAM by default, so a
+restart needs a new login. To keep them, give the proxy a **separate** vault it
+may write:
+
+```json
+{
+  "account": {"vault": "DevEnv"},
+  "loginStore": {"vault": "DevEnv Logins"}
+}
+```
+
+`examples/login-store-manifest.json` is a full example. `loginStore.vault` must
+differ from `account.vault`, and the manifest must enable at least one
+proxy-owned login. Without `loginStore`, nothing is ever written.
+
+Each login is one Login item in that vault, with the value in its password
+field and non-secret checks in text fields:
+
+| Item title | Password field | Text fields |
+| --- | --- | --- |
+| `SECRET_PROXY_LOGIN_CHATGPT` | ChatGPT refresh token (rotates) | `account_id` |
+| `SECRET_PROXY_LOGIN_GITHUB_COPILOT` | GitHub OAuth token | `domain` |
+| `SECRET_PROXY_LOGIN_GITHUB` | gh's GitHub OAuth token | `domain`, `scopes`, `requested_scopes` |
+
+The proxy creates and updates these items itself; do not create them by hand.
+Use one proxy instance per login vault: two instances sharing a vault would
+overwrite each other's ChatGPT refresh token.
+
+1Password setup:
+
+1. Create the login vault (for example **DevEnv Logins**). Keep it separate from
+   the runtime vault and from the vault holding the bootstrap item.
+2. Give the proxy's service account **Read Items** on the runtime vault and
+   **Read Items** plus **Write Items** on the login vault, nothing else. A
+   service account's vault access is fixed when it is created, so this usually
+   means a new service account; put its token in the bootstrap item's password
+   field, replacing the old one.
+3. Add a text field **`login_vault`** to the bootstrap item, set to the login
+   vault's name. Keep `destination_vault` (the runtime vault) and `permissions`
+   (`read_items`) as they are: they describe the runtime vault.
+4. Add `"loginVault": "<login vault name>"` to `bootstrap.json`.
+
+Startup refuses to run when the manifest's `loginStore.vault`, `bootstrap.json`'s
+`loginVault` and the item's `login_vault` field do not all match, and an item
+with a `login_vault` field is refused while `bootstrap.json` has none. Change all
+three together, then install the new policy and restart.
+
+Anyone who can read the login vault can read these tokens, including your own
+desktop 1Password app. Use `secret-proxy logout <provider>` to sign out and
+delete a stored login. See [stored logins](operations.md#stored-logins) for
+restore behaviour and messages.
 
 ## Scoped clients
 

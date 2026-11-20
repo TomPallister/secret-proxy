@@ -42,7 +42,8 @@ URL to contain the code.
 The proxy performs the OAuth exchange and keeps the real access/refresh tokens
 in RAM. The client saves only sealed references in the selected Pi auth file
 (mode 0600), preserving other providers. Do not run Pi's own `/login` or
-`/logout` concurrently. Restarting the proxy requires `secret-proxy login chatgpt`
+`/logout` concurrently. Without a [login store](advanced-setup.md#login-store),
+restarting the proxy requires `secret-proxy login chatgpt`
 again; your existing same-account client references can stay in place.
 
 ## Pi with GitHub Copilot
@@ -77,7 +78,9 @@ What happens:
   `proxy-ep` (`proxy.` becomes `api.`), and only where the manifest allows it.
 
 After a proxy restart the old entry stops working (the proxy answers with an
-injection error) until you run `secret-proxy login github-copilot` again.
+injection error) until you run `secret-proxy login github-copilot` again. With a
+[login store](advanced-setup.md#login-store), the saved entry keeps working: the
+proxy mints a new Copilot token from the stored GitHub token.
 Models that GitHub requires you to enable first must be enabled in your GitHub
 Copilot settings; the proxy-owned login does not change model policy.
 
@@ -115,7 +118,8 @@ For Git over HTTPS, run `gh auth setup-git` once so Git asks gh for credentials.
 gh then hands Git the reference with the user name `x-access-token`, and the
 proxy adds the real token as the Basic password where the manifest allows it.
 
-After a proxy restart, run `secret-proxy login github` again. The existing
+After a proxy restart, run `secret-proxy login github` again, unless a
+[login store](advanced-setup.md#login-store) keeps it. The existing
 vault-stored `GITHUB_TOKEN` integration is separate and unchanged.
 
 On macOS, gh is a Go program and ignores `SSL_CERT_FILE`. Opt the instance into
