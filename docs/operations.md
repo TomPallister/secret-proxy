@@ -119,8 +119,8 @@ out of scope and behave as before.
 
 ### Optional `aws-policy.json`
 
-Add rules next to the manifest. The built-in deny list always applies; the file can
-add deny rules and per-service allow lists, never remove a built-in rule:
+Add rules next to the manifest. The built-in Secrets Manager rule always applies;
+the file can add deny, allow and approve rules, never remove the built-in rule:
 
 ```json
 {
