@@ -17,7 +17,33 @@ import termios
 import time
 import urllib.parse
 
-import clientgrants
+
+def _sibling(name: str):
+    """Load a module from this file's own directory.
+
+    Consumers (host Pi, agent-container) load this file by path with
+    importlib, so its directory is not on sys.path and a plain import fails.
+    """
+    import importlib.util
+    path = Path(__file__).resolve().with_name(name + '.py')
+    module = sys.modules.get(name)
+    if module is not None and Path(getattr(module, '__file__', '') or '/').resolve() == path:
+        return module
+    # Registered before running (dataclasses need it); a different module
+    # already using the plain name is left alone.
+    key = name if module is None else '_secret_proxy_' + name
+    spec = importlib.util.spec_from_file_location(key, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[key]
+        raise
+    return module
+
+
+clientgrants = _sibling('clientgrants')
 
 MARKER = 'secret' + 'ref:'
 HOST = 'secret' + 'ref.invalid'

@@ -7,6 +7,7 @@ from pathlib import Path
 import pty
 import select
 import signal
+import sys
 import tempfile
 import termios
 import threading
@@ -252,3 +253,26 @@ class ClientTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StandaloneLoadTests(unittest.TestCase):
+    """Consumers load client.py by file path, from another directory."""
+
+    def test_loads_by_path_without_its_directory_on_sys_path(self):
+        import subprocess
+        import tempfile
+        root = Path(__file__).resolve().parent
+        script = ("import importlib.util, sys\n"
+                  "spec = importlib.util.spec_from_file_location('consumer_client', sys.argv[1])\n"
+                  "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                  "print(m.clientgrants.DEFAULT_CLIENT, callable(m.validate_config))\n")
+        pythons = [sys.executable]
+        clt = '/Library/Developer/CommandLineTools/usr/bin/python3'
+        if Path(clt).exists():
+            pythons.append(clt)
+        for python in pythons:
+            with self.subTest(python=python), tempfile.TemporaryDirectory() as cwd:
+                result = subprocess.run([python, '-I', '-c', script, str(root / 'client.py')], cwd=cwd,
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr[-500:])
+                self.assertEqual(result.stdout.strip(), 'default True')
