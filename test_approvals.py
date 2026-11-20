@@ -256,6 +256,21 @@ class ConfigurationTests(unittest.TestCase):
                                          template="Bearer {secret}")
         self.assertEqual((match.index, match.approval), (1, "prompt"))
 
+    def test_a_client_granted_only_the_broader_placement_still_needs_approval(self):
+        secrets = {"EXAMPLE_TOKEN": {"placements": [
+            {**HEADER},  # any method, no approval
+            {**HEADER, "methods": ["DELETE"], "approval": "prompt"},
+        ]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = SecretManifest.load(manifest_file(tmp, secrets))
+        context = dict(kind="header", host="api.example.com", path="/", name="authorization",
+                       template="Bearer {secret}")
+        match = manifest.match_placement("EXAMPLE_TOKEN", method="DELETE", allowed={0}, **context)
+        self.assertEqual((match.index, match.approval), (0, "prompt"))
+        match = manifest.match_placement("EXAMPLE_TOKEN", method="GET", allowed={0}, **context)
+        self.assertEqual((match.index, match.approval), (0, None))
+        self.assertIsNone(manifest.match_placement("EXAMPLE_TOKEN", method="GET", allowed={1}, **context))
+
     def test_default_manifest_is_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = SecretManifest.load(manifest_file(tmp, {"EXAMPLE_PLAIN": SECRETS["EXAMPLE_PLAIN"]}))

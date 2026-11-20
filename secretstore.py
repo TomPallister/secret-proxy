@@ -588,20 +588,25 @@ class SecretManifest:
         *allowed* restricts the candidates to placement indices a scoped
         client is granted. When several placements match, one that requires
         approval wins, so a broader placement without approval cannot bypass
-        an approval rule.
+        an approval rule. That holds for scoped clients too: a request that
+        matches any approval placement needs approval, even when the client
+        is granted only a broader placement without one.
         """
         indices = self.placement_indices(
             secret_name, kind=kind, host=host, method=method, path=path,
             name=name, template=template, username=username,
         )
+        placements = self._secrets[secret_name].placements
+        approval = next((placements[index] for index in indices if placements[index].approval is not None), None)
         if allowed is not None:
             indices = tuple(index for index in indices if index in allowed)
         if not indices:
             return None
-        placements = self._secrets[secret_name].placements
         for index in indices:
             if placements[index].approval is not None:
                 return PlacementMatch(index, placements[index].approval)
+        if approval is not None:
+            return PlacementMatch(indices[0], approval.approval)
         return PlacementMatch(indices[0], None)
 
     def _placement_matches(
