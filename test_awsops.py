@@ -45,6 +45,9 @@ def query_req(service, body, host=None, extra=(), query=""):
 
 
 POLICY = AwsOperationPolicy()
+# An operator who wants every unidentifiable request denied adds this rule.
+STRICT = AwsOperationPolicy(awsops.parse_policy({"version": 1, "rules": [
+    {"action": "deny", "service": "*", "operations": ["Unknown"]}]}))
 
 
 def decide(request, account=ACCOUNT, role=ROLE, policy=POLICY):
@@ -129,7 +132,9 @@ class UnknownTests(unittest.TestCase):
         self.assertEqual(op.operation, "Unknown", op)
         if service:
             self.assertEqual(op.service, service)
-        self.assertEqual(POLICY.evaluate(op, ACCOUNT, ROLE).action, "deny")
+        self.assertEqual(STRICT.evaluate(op, ACCOUNT, ROLE).action, "deny")
+        expected = "deny" if op.service == "secretsmanager" or "unverified-service" in op.conditions else "allow"
+        self.assertEqual(POLICY.evaluate(op, ACCOUNT, ROLE).action, expected, op)
         return op
 
     def test_duplicate_and_malformed_target(self):
@@ -244,56 +249,84 @@ class UnknownTests(unittest.TestCase):
 
 
 class DefaultDenyListTests(unittest.TestCase):
-    """Every operation named in the issue is denied by default."""
+    """Only Secrets Manager reads of stored values are denied by default."""
 
-    def test_issue_operations_are_denied(self):
+    def test_secrets_manager_reads_are_denied(self):
         cases = [
             json_req("secretsmanager", "secretsmanager.GetSecretValue"),
             json_req("secretsmanager", "secretsmanager.BatchGetSecretValue"),
-            json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":true}'),
-            json_req("ssm", "AmazonSSM.GetParameters", b'{"Names":["x"],"WithDecryption":true}'),
-            json_req("ssm", "AmazonSSM.GetParametersByPath", b'{"Path":"/","WithDecryption":true}'),
-            query_req("iam", b"Action=CreateAccessKey&Version=2010-05-08"),
-            json_req("ecr", "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken",
-                     host="api.ecr.eu-west-1.amazonaws.com"),
-            json_req("ecr-public", "SpencerFrontendService.GetAuthorizationToken",
-                     host="api.ecr-public.us-east-1.amazonaws.com"),
-            req("POST", "codeartifact.eu-west-1.amazonaws.com", "/v1/authorization-token", query="domain=d"),
-            query_req("sts", b"Action=AssumeRole&RoleArn=x&RoleSessionName=y"),
-            query_req("sts", b"Action=GetSessionToken"),
-            query_req("sts", b"Action=GetFederationToken&Name=x"),
-            query_req("sts", b"Action=AssumeRoleWithWebIdentity"),
-            query_req("sts", b"Action=AssumeRoot"),
-            req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn"),
-            req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn/configuration"),
-            json_req("kms", "TrentService.Decrypt"),
             json_req("secretsmanager", "secretsmanager.getsecretvalue"),  # case-insensitive
+            json_req("secretsmanager", "secretsmanager.GetSecretValue",
+                     host="secretsmanager-fips.us-east-1.amazonaws.com"),
+            query_req("secretsmanager", b"Action=GetSecretValue&SecretId=x"),
+            req("POST", "secretsmanager.eu-west-1.amazonaws.com", "/service/secretsmanager/operation/GetSecretValue",
+                headers=(("Smithy-Protocol", "rpc-v2-cbor"),)),
         ]
         for request in cases:
-            with self.subTest(request=request.headers[-1:], path=request.path):
+            with self.subTest(request=request.headers[-1:], host=request.host, path=request.path):
                 op, decision = decide(request)
                 self.assertEqual(decision.action, "deny", op)
                 self.assertIn("credentials or secret values", decision.reason)
 
-    def test_allowed_calls(self):
+    def test_unidentifiable_secrets_manager_requests_are_denied(self):
+        cases = [
+            json_req("secretsmanager", "secretsmanager.GetSecretValue",
+                     extra=(("X-Amz-Target", "secretsmanager.ListSecrets"),)),  # duplicate target
+            req("POST", "secretsmanager.eu-west-1.amazonaws.com", "/", body=b"{}",
+                headers=(("Content-Type", "application/x-amz-json-1.1"),)),  # no target
+            query_req("secretsmanager", b"Action=ListSecrets&Action=GetSecretValue"),
+        ]
+        for request in cases:
+            with self.subTest(request=request.headers[-2:]):
+                op, decision = decide(request)
+                self.assertEqual((op.operation, decision.action), ("Unknown", "deny"), op)
+
+    def test_unverifiable_target_service_is_denied_for_every_service(self):
+        # A credential scope that does not match the host could aim the proxy's
+        # signature at another service, so it stays denied whatever the service.
+        for service, host in (("sts", "secretsmanager.eu-west-1.amazonaws.com"),
+                              ("s3", "ec2.eu-west-1.amazonaws.com")):
+            with self.subTest(service=service):
+                op, decision = decide(req("POST", host, "/", service=service))
+                self.assertEqual((op.operation, decision.action), ("Unknown", "deny"), op)
+
+    def test_everything_else_is_allowed(self):
         cases = [
             query_req("sts", b"Action=GetCallerIdentity&Version=2011-06-15"),
             query_req("sts", b"Action=GetAccessKeyInfo&AccessKeyId=x"),
+            query_req("sts", b"Action=AssumeRole&RoleArn=x&RoleSessionName=y"),
+            query_req("sts", b"Action=GetSessionToken"),
             req("GET", "bucket.s3.eu-west-1.amazonaws.com", "/", query="list-type=2", service="s3"),
             req("PUT", "bucket.s3.eu-west-1.amazonaws.com", "/key", body=None, service="s3"),
             json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x"}'),
-            json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":false}'),
+            json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":true}'),
             json_req("secretsmanager", "secretsmanager.ListSecrets"),
             json_req("secretsmanager", "secretsmanager.DescribeSecret"),
+            query_req("iam", b"Action=CreateAccessKey&Version=2010-05-08"),
+            json_req("ecr", "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken",
+                     host="api.ecr.eu-west-1.amazonaws.com"),
             req("GET", "ec2.eu-west-1.amazonaws.com", query="Action=DescribeInstances"),
             json_req("dynamodb", "DynamoDB_20120810.DescribeTable", version="1.0"),
-            json_req("kms", "TrentService.Encrypt"),
+            json_req("kms", "TrentService.Decrypt"),
+            req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn"),
+            req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn/configuration"),
+            req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/"),
             req("POST", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn/invocations"),
         ]
         for request in cases:
             with self.subTest(path=request.path, headers=request.headers[-1:]):
                 op, decision = decide(request)
                 self.assertEqual(decision.action, "allow", (op, decision))
+
+    def test_operators_can_add_their_own_denies(self):
+        policy = AwsOperationPolicy(awsops.parse_policy({"version": 1, "rules": [
+            {"action": "deny", "service": "sts", "operations": ["Assume*", "Get*Token", "Unknown"]},
+            {"action": "deny", "service": "lambda", "operations": ["GetFunction*"]}]}))
+        for request, action in ((query_req("sts", b"Action=AssumeRole"), "deny"),
+                                (query_req("sts", b"Action=GetCallerIdentity"), "allow"),
+                                (req("GET", "lambda.eu-west-1.amazonaws.com", "/2015-03-31/functions/fn"), "deny")):
+            with self.subTest(path=request.path, body=request.body):
+                self.assertEqual(policy.evaluate(classify(request), ACCOUNT, ROLE).action, action)
 
 
 class SsmDecryptionTests(unittest.TestCase):
@@ -304,7 +337,6 @@ class SsmDecryptionTests(unittest.TestCase):
             request = query_req("ssm", body, host="ssm.eu-west-1.amazonaws.com")
         op = classify(request)
         self.assertEqual("with-decryption" in op.conditions, expected, (body, op))
-        self.assertEqual(POLICY.evaluate(op, ACCOUNT, ROLE).action, "deny" if expected else "allow")
 
     def test_with_decryption_values(self):
         self.assertDecrypting(b'{"Name":"x"}', False)
@@ -413,8 +445,6 @@ class OverrideTests(unittest.TestCase):
                 self.assertEqual(policy.evaluate(classify(request), account, role).action, "deny")
         other = json_req("secretsmanager", "secretsmanager.BatchGetSecretValue")
         self.assertEqual(policy.evaluate(classify(other), ACCOUNT, "Deployer").action, "deny")
-        sts = query_req("sts", b"Action=AssumeRole")
-        self.assertEqual(policy.evaluate(classify(sts), ACCOUNT, "Deployer").action, "deny")
 
     def test_override_also_covers_allow_lists_and_unknown(self):
         rules = awsops.load_policy_bytes(json.dumps({"version": 1, "rules": [
@@ -456,9 +486,9 @@ class CompatibilityTests(unittest.TestCase):
             self.skipTest("macOS Command Line Tools Python not installed")
         script = (
             "import awsops\n"
-            "r=awsops.AwsRequest('POST','sts.amazonaws.com','/','',(('Authorization',"
-            "'AWS4-HMAC-SHA256 Credential=a/20260101/us-east-1/sts/aws4_request, SignedHeaders=host, Signature=x'),"
-            "('Content-Type','application/x-www-form-urlencoded')),b'Action=AssumeRole')\n"
+            "r=awsops.AwsRequest('POST','secretsmanager.us-east-1.amazonaws.com','/','',(('Authorization',"
+            "'AWS4-HMAC-SHA256 Credential=a/20260101/us-east-1/secretsmanager/aws4_request, SignedHeaders=host, Signature=x'),"
+            "('X-Amz-Target','secretsmanager.GetSecretValue')),b'{}')\n"
             "print(awsops.AwsOperationPolicy().evaluate(awsops.classify(r)).action)\n"
         )
         result = subprocess.run([python, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); exec(sys.argv[2])",

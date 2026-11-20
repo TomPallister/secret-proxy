@@ -328,7 +328,7 @@ entry._resolver = fixture_resolver
         output = (root / 'runtime.log').read_text()
         assert values['API_KEY'] not in output and values['GIT_SIGNING_SSH_KEY'] not in output
         assert 'AWS DENY 123456789012/ReadOnly secretsmanager:GetSecretValue' in output
-        assert 'AWS DENY 123456789012/ReadOnly sts:AssumeRole' in output
+        assert 'AWS DENY 123456789012/ReadOnly secretsmanager:BatchGetSecretValue' in output
         assert 'BODY-MARKER' not in output
         assert copilot['github'] not in output and copilot['copilot'] not in output
         print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; proxy-owned Copilot and gh logins, sealed exchange and pinned injection; no vault or external network')
@@ -386,11 +386,13 @@ def aws_checks(request, port, proxy_auth, context):
         b'{"SecretId":"BODY-MARKER"}', host='secretsmanager.eu-west-1.amazonaws.com', target_port=443)
     assert status == 403 and json.loads(body)['__type'] == 'AccessDeniedException', (status, body)
     assert b'BODY-MARKER' not in body
-    status, headers, body = h2_request(port, proxy_auth, context, 'sts.amazonaws.com', aws_headers('sts', {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'}),
-        b'Action=AssumeRole&RoleSessionName=BODY-MARKER')
-    assert status == '403' and b'<Code>AccessDeniedException</Code>' in body, (status, body)
+    status, headers, body = h2_request(port, proxy_auth, context, 'secretsmanager.eu-west-1.amazonaws.com',
+                                       aws_headers('secretsmanager', {
+        'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': 'secretsmanager.BatchGetSecretValue'}),
+        b'{"SecretIdList":["BODY-MARKER"]}')
+    assert status == '403' and json.loads(body)['__type'] == 'AccessDeniedException', (status, body)
     assert headers.get('x-amzn-errortype') == 'AccessDeniedException'
+    assert b'BODY-MARKER' not in body
     # An allowed operation passes the policy and only then reaches credential
     # vending, which fails here because no Okta values exist.
     status, headers, body = h2_request(port, proxy_auth, context, 'sts.amazonaws.com', aws_headers('sts', {

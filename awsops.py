@@ -44,6 +44,9 @@ BODY_LIMIT = 16 * 1024 * 1024  # e.g. SES SendRawEmail (10 MB) uses awsQuery
 
 POLICY_VERSION = 1
 CONDITION_WITH_DECRYPTION = "with-decryption"
+# The request's target service could not be verified (unreadable credential
+# scope, or a scope that does not match the host). Denied for every service.
+CONDITION_UNVERIFIED_SERVICE = "unverified-service"
 
 _SERVICE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 _OPERATION_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}\Z")
@@ -347,15 +350,21 @@ def _ssm_with_decryption(protocol: str, request: AwsRequest, params: list) -> bo
     return len(values) != 1 or values[0] is not False
 
 
+def _unverified(service: str, reason: str) -> AwsOperation:
+    op = _unknown(service, reason)
+    return AwsOperation(op.service, op.operation, op.protocol, op.reason, op.needs_body,
+                        frozenset({CONDITION_UNVERIFIED_SERVICE}))
+
+
 def classify(request: AwsRequest) -> AwsOperation:
     """Identify the service and operation of a dummy-signed AWS request."""
     method = (request.method or "").upper()
     scope = credential_scope(request)
     if scope is None:
-        return _unknown(UNKNOWN, "unreadable SigV4 credential scope")
+        return _unverified(UNKNOWN, "unreadable SigV4 credential scope")
     _region, service = scope
     if not service_matches_host(service, request.host):
-        return _unknown(service, "credential scope service does not match the host")
+        return _unverified(service, "credential scope service does not match the host")
 
     signals = []  # (protocol, operation or None, reason)
     needs_body = False
@@ -499,21 +508,13 @@ def _builtin(service: str, *operations: str, condition: Optional[str] = None) ->
     return Rule(DENY, service, tuple(operations), condition, "built-in deny list")
 
 
-# Operations that return a credential or a secret value to the caller.
+# Built in: Secrets Manager reads that return a stored secret value. An
+# unidentifiable Secrets Manager request is denied too, so an ambiguous request
+# can never slip past, as is any request whose target service can't be verified.
+# Everything else is allowed unless aws-policy.json adds rules.
 DEFAULT_DENY_RULES: Tuple[Rule, ...] = (
-    _builtin("secretsmanager", "GetSecretValue", "BatchGetSecretValue"),
-    _builtin("ssm", "GetParameter", "GetParameters", "GetParametersByPath",
-             "GetParameterHistory", condition=CONDITION_WITH_DECRYPTION),
-    _builtin("iam", "CreateAccessKey", "CreateServiceSpecificCredential",
-             "ResetServiceSpecificCredential"),
-    _builtin("ecr", "GetAuthorizationToken"),
-    _builtin("ecr-public", "GetAuthorizationToken"),
-    _builtin("codeartifact", "GetAuthorizationToken"),
-    _builtin("sts", "Assume*", "Get*Token"),
-    _builtin("lambda", "GetFunction", "GetFunctionConfiguration", "ListFunctions",
-             "ListVersionsByFunction"),
-    _builtin("kms", "Decrypt", "DeriveSharedSecret"),
-    _builtin("*", UNKNOWN),
+    _builtin("secretsmanager", "GetSecretValue", "BatchGetSecretValue", UNKNOWN),
+    _builtin("*", UNKNOWN, condition=CONDITION_UNVERIFIED_SERVICE),
 )
 
 

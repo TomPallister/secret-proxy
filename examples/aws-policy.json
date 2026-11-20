@@ -3,12 +3,21 @@
   "rules": [
     {
       "action": "deny",
+      "service": "sts",
+      "operations": [
+        "Assume*",
+        "Get*Token"
+      ],
+      "comment": "Example: stop clients minting their own STS credentials."
+    },
+    {
+      "action": "deny",
       "service": "dynamodb",
       "operations": [
         "Scan",
         "BatchGetItem"
       ],
-      "comment": "Extra deny rules apply on top of the built-in deny list, which cannot be removed here."
+      "comment": "Extra deny rules apply on top of the built-in Secrets Manager rule, which cannot be removed here."
     },
     {
       "action": "allow",

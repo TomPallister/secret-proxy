@@ -839,7 +839,7 @@ class AwsAuditTests(AwsPolicyAddonTestCase):
         self.okta_file.write_text(json.dumps({"default_account": ACCOUNT, "default_role": "ReadOnly"}))
 
     def test_denied_and_allowed_aws_calls_are_recorded_without_credentials(self):
-        denied = self.query_flow("sts", b"Action=AssumeRole&RoleArn=" + BODY_VALUE.encode())
+        denied = self.query_flow("secretsmanager", b"Action=GetSecretValue&SecretId=" + BODY_VALUE.encode())
         self.addon.request(denied)
         self.assertEqual(denied.response.status_code, 403)
         allowed = self.query_flow("sts", b"Action=GetCallerIdentity&Version=2011-06-15")
@@ -849,10 +849,11 @@ class AwsAuditTests(AwsPolicyAddonTestCase):
         first, second = events(self.dir)
         self.assertEqual((first["event"], first["decision"], first["account"], first["role"],
                           first["service"], first["operation"], first["rule"]),
-                         ("aws", "denied", ACCOUNT, "ReadOnly", "sts", "AssumeRole", "built-in deny list"))
+                         ("aws", "denied", ACCOUNT, "ReadOnly", "secretsmanager", "GetSecretValue",
+                          "built-in deny list"))
         self.assertEqual((second["decision"], second["operation"]), ("allowed", "GetCallerIdentity"))
         data = all_bytes(self.dir)
-        for value in ("fixture-signing-material-not-real", "fixture-session-token", BODY_VALUE, "RoleArn"):
+        for value in ("fixture-signing-material-not-real", "fixture-session-token", BODY_VALUE, "SecretId"):
             self.assertNotIn(value.encode(), data)
 
     def test_audit_failure_refuses_the_aws_call_before_it_is_sent(self):

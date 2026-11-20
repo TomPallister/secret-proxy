@@ -85,24 +85,21 @@ investigate a failure.
 
 ## AWS operation policy
 
-Some AWS calls send a credential or a secret value back to the caller. The proxy
-checks every AWS request that carries its dummy credentials **before** it mints
-or uses STS credentials, and refuses these by default:
+The proxy checks every AWS request that carries its dummy credentials **before**
+it mints or uses STS credentials. By default it refuses only reads of stored
+Secrets Manager values:
 
-| Service | Denied operations |
+| Service | Denied by default |
 |---|---|
-| `secretsmanager` | `GetSecretValue`, `BatchGetSecretValue` |
-| `ssm` | `GetParameter`, `GetParameters`, `GetParametersByPath`, `GetParameterHistory`, only when `WithDecryption` is true |
-| `iam` | `CreateAccessKey`, `CreateServiceSpecificCredential`, `ResetServiceSpecificCredential` |
-| `sts` | `Assume*` and `Get*Token` (for example `AssumeRole`, `GetSessionToken`, `GetFederationToken`) |
-| `ecr`, `ecr-public`, `codeartifact` | `GetAuthorizationToken` |
-| `lambda` | `GetFunction`, `GetFunctionConfiguration`, `ListFunctions`, `ListVersionsByFunction` (they return environment variables) |
-| `kms` | `Decrypt`, `DeriveSharedSecret` |
-| any | `Unknown` |
+| `secretsmanager` | `GetSecretValue`, `BatchGetSecretValue`, and any Secrets Manager request whose operation can't be identified |
+| any | a request whose target service can't be verified (its signature's service doesn't match the host) |
 
-`sts get-caller-identity`, S3, `ssm get-parameter` without decryption and other
-calls are unaffected. This is a **new default**: it applies even with no policy
-file. Terraform plans that read Lambda functions now need an override.
+Everything else, including `ListSecrets` and `DescribeSecret`, is allowed. This
+applies even with no policy file. Other calls can also return credentials or
+secrets (STS `AssumeRole`, SSM `GetParameter` with decryption, IAM
+`CreateAccessKey`, KMS `Decrypt`, Lambda and ECS configuration with environment
+variables); add rules for them in `aws-policy.json` if you want them refused or
+held for approval.
 
 The operation comes from the request itself: `X-Amz-Target` (JSON protocols), the
 `Action` form or query value (Query protocols), the `/service/…/operation/…` path
@@ -110,10 +107,12 @@ The operation comes from the request itself: `X-Amz-Target` (JSON protocols), th
 requests are `Unclassified`). The service comes from the signature's credential
 scope and must match the host. Anything missing, duplicated, conflicting,
 encoded, non-UTF-8, over 16 MiB when the body is needed, or carrying more than one
-protocol's operation field is `Unknown`, and is denied.
+protocol's operation field is `Unknown`. Unknown Secrets Manager requests are
+denied by default; to deny Unknown requests for other services, list `Unknown` in
+a rule's operations (`"service": "*", "operations": ["Unknown"]` for all).
 
 A denied call gets HTTP 403 with code `AccessDeniedException` and a message such
-as `secret-proxy blocked sts:AssumeRole: …`, in the protocol's own JSON, XML or
+as `secret-proxy blocked secretsmanager:GetSecretValue: …`, in the protocol's own JSON, XML or
 CBOR shape. The proxy terminal shows one line with the account, role, service,
 operation and decision. Bodies and responses are never logged. Presigned URLs are
 out of scope and behave as before.

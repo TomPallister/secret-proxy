@@ -2377,16 +2377,18 @@ def _aws_policy_check(flow: http.HTTPFlow, body, quiet: bool = False):
     except Exception as e:  # noqa: BLE001 - never forward what we cannot identify
         log.error("secret_proxy: AWS operation classification failed (%s)", type(e).__name__)
         op = awsops.AwsOperation(awsops.UNKNOWN, awsops.UNKNOWN, awsops.PROTOCOL_UNKNOWN,
-                                 "classification failed")
-    if op.operation != awsops.UNKNOWN:
-        # Defence in depth: the re-signer must sign for the same service.
-        try:
-            signing = sigv4.parse_authorization(flow.request.headers.get("Authorization", ""))["service"]
-        except Exception:  # noqa: BLE001
-            signing = None
-        if signing != op.service:
-            op = awsops.AwsOperation(op.service, awsops.UNKNOWN, op.protocol,
-                                     "signing scope differs from the inspected scope")
+                                 "classification failed",
+                                 conditions=frozenset({awsops.CONDITION_UNVERIFIED_SERVICE}))
+    # Defence in depth: the re-signer must sign for the same service. A
+    # mismatch is an unverifiable target, denied whatever the service.
+    try:
+        signing = sigv4.parse_authorization(flow.request.headers.get("Authorization", ""))["service"]
+    except Exception:  # noqa: BLE001
+        signing = None
+    if signing != op.service and awsops.CONDITION_UNVERIFIED_SERVICE not in op.conditions:
+        op = awsops.AwsOperation(op.service, awsops.UNKNOWN, op.protocol,
+                                 "signing scope differs from the inspected scope",
+                                 conditions=frozenset({awsops.CONDITION_UNVERIFIED_SERVICE}))
     who = f"{account or '-'}/{role or '-'}"
     flow.metadata["secret_proxy_aws_operation"] = op.label
     # A scoped client's grant is checked first: no override can widen it.

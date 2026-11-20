@@ -132,23 +132,30 @@ class AwsPolicyAddonTestCase(AddonTestCase):
 
 
 class BufferedPathTests(AwsPolicyAddonTestCase):
+    def deny_in_file(self, *rules):
+        with open(self.policy_file, "w") as stream:
+            json.dump({"version": 1, "rules": [
+                {"action": "deny", "service": service, "operations": list(ops)} for service, *ops in rules]}, stream)
+
     def test_denied_operations_return_403_without_minting(self):
         cases = [
             (self.json_flow("secretsmanager", "secretsmanager.GetSecretValue"), "secretsmanager:GetSecretValue"),
-            (self.json_flow("ssm", "AmazonSSM.GetParameter", b'{"Name":"p","WithDecryption":true}'),
-             "ssm:GetParameter"),
-            (self.json_flow("ssm", "AmazonSSM.GetParametersByPath", b'{"Path":"/","WithDecryption":true}'),
-             "ssm:GetParametersByPath"),
-            (self.query_flow("iam", b"Action=CreateAccessKey&Version=2010-05-08"), "iam:CreateAccessKey"),
-            (self.json_flow("ecr", "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken",
-                            host="api.ecr.eu-west-1.amazonaws.com"), "ecr:GetAuthorizationToken"),
-            (self.aws_flow("codeartifact.eu-west-1.amazonaws.com", "codeartifact",
-                           path="/v1/authorization-token?domain=example"), "codeartifact:GetAuthorizationToken"),
+            (self.json_flow("secretsmanager", "secretsmanager.BatchGetSecretValue"),
+             "secretsmanager:BatchGetSecretValue"),
+            (self.query_flow("secretsmanager", b"Action=GetSecretValue&SecretId=x"),
+             "secretsmanager:GetSecretValue"),
+        ]
+        for flow, label in cases:
+            with self.subTest(label=label):
+                self.provider.calls.clear()
+                self.provider_lookups = 0
+                self.run_hooks(flow)
+                self.assertDenied(flow, label)
+
+    def test_operator_denies_from_the_policy_file_return_403_without_minting(self):
+        self.deny_in_file(("sts", "Assume*"), ("lambda", "GetFunction*"), ("kms", "Decrypt"))
+        cases = [
             (self.query_flow("sts", b"Action=AssumeRole&RoleArn=x&RoleSessionName=y"), "sts:AssumeRole"),
-            (self.query_flow("sts", b"Action=GetSessionToken"), "sts:GetSessionToken"),
-            (self.query_flow("sts", b"Action=GetFederationToken&Name=x"), "sts:GetFederationToken"),
-            (self.aws_flow("lambda.eu-west-1.amazonaws.com", "lambda", method="GET",
-                           path="/2015-03-31/functions/fn"), "lambda:GetFunction"),
             (self.aws_flow("lambda.eu-west-1.amazonaws.com", "lambda", method="GET",
                            path="/2015-03-31/functions/fn/configuration"), "lambda:GetFunctionConfiguration"),
             (self.json_flow("kms", "TrentService.Decrypt"), "kms:Decrypt"),
@@ -159,6 +166,18 @@ class BufferedPathTests(AwsPolicyAddonTestCase):
                 self.provider_lookups = 0
                 self.run_hooks(flow)
                 self.assertDenied(flow, label)
+
+    def test_former_defaults_are_now_allowed(self):
+        for flow, label in (
+            (self.query_flow("sts", b"Action=AssumeRole&RoleArn=x&RoleSessionName=y"), "sts:AssumeRole"),
+            (self.aws_flow("lambda.eu-west-1.amazonaws.com", "lambda", method="GET",
+                           path="/2015-03-31/functions/fn/configuration"), "lambda:GetFunctionConfiguration"),
+            (self.json_flow("ssm", "AmazonSSM.GetParameter", b'{"Name":"p","WithDecryption":true}'),
+             "ssm:GetParameter"),
+        ):
+            with self.subTest(label=label):
+                self.provider.calls.clear()
+                self.assertResigned(self.run_hooks(flow), label)
 
     def test_allowed_calls_are_resigned(self):
         flow = self.run_hooks(self.query_flow("sts", b"Action=GetCallerIdentity&Version=2011-06-15"))
@@ -179,18 +198,18 @@ class BufferedPathTests(AwsPolicyAddonTestCase):
 
     def test_oversized_query_body_is_unknown(self):
         import awsops
-        body = b"Action=GetCallerIdentity&pad=" + b"a" * (awsops.BODY_LIMIT + 1)
-        flow = self.run_hooks(self.query_flow("sts", body))
-        self.assertDenied(flow, "sts:Unknown")
+        body = b"Action=ListSecrets&pad=" + b"a" * (awsops.BODY_LIMIT + 1)
+        flow = self.run_hooks(self.query_flow("secretsmanager", body))
+        self.assertDenied(flow, "secretsmanager:Unknown")
 
     def test_query_error_is_xml_and_log_has_no_body(self):
         marker = "BODY-MARKER-MUST-NOT-BE-LOGGED"
-        flow = self.run_hooks(self.query_flow("sts", f"Action=AssumeRole&RoleSessionName={marker}".encode()))
-        self.assertDenied(flow, "sts:AssumeRole")
+        flow = self.run_hooks(self.query_flow("secretsmanager", f"Action=GetSecretValue&SecretId={marker}".encode()))
+        self.assertDenied(flow, "secretsmanager:GetSecretValue")
         self.assertTrue(flow.response.content.startswith(b"<ErrorResponse>"))
         self.assertIn(b"<Code>AccessDeniedException</Code>", flow.response.content)
         log = self.log.getvalue()
-        self.assertIn(f"AWS DENY {ACCOUNT}/ReadOnly sts:AssumeRole", log)
+        self.assertIn(f"AWS DENY {ACCOUNT}/ReadOnly secretsmanager:GetSecretValue", log)
         self.assertNotIn(marker, log)
         self.assertNotIn(marker.encode(), flow.response.content)
 
@@ -254,6 +273,9 @@ class StreamingPathTests(AwsPolicyAddonTestCase):
         self.assertResigned(flow)
 
     def test_streaming_rest_denial_happens_before_minting(self):
+        with open(self.policy_file, "w") as stream:
+            json.dump({"version": 1, "rules": [
+                {"action": "deny", "service": "lambda", "operations": ["GetFunction"]}]}, stream)
         flow = self.aws_flow("lambda.eu-west-1.amazonaws.com", "lambda", method="GET",
                              path="/2015-03-31/functions/fn", sha256="UNSIGNED-PAYLOAD")
         self.addon.requestheaders(flow)
@@ -263,30 +285,25 @@ class StreamingPathTests(AwsPolicyAddonTestCase):
     def test_body_dependent_operation_is_deferred_then_decided(self):
         # A content-sha256 header normally selects streaming; a body-named
         # operation is instead deferred to the buffered hook's bounded look.
-        body = b'{"Name":"p","WithDecryption":true}'
-        flow = self.json_flow("ssm", "AmazonSSM.GetParameter", body, sha256=sigv4.sha256_hex(body))
+        body = b"Action=GetSecretValue&SecretId=x"
+        flow = self.query_flow("secretsmanager", body, sha256=sigv4.sha256_hex(body))
         self.addon.requestheaders(flow)
         self.assertIsNone(flow.response)
         self.assertFalse(flow.request.stream)
         self.assertEqual(self.provider_lookups, 0)
         self.addon.request(flow)
-        self.assertDenied(flow, "ssm:GetParameter")
+        self.assertDenied(flow, "secretsmanager:GetSecretValue")
 
-        body = b"Action=AssumeRole&RoleArn=x"
-        flow = self.query_flow("sts", body, sha256=sigv4.sha256_hex(body))
+        body = b"Action=ListSecrets"
+        flow = self.query_flow("secretsmanager", body, sha256=sigv4.sha256_hex(body))
         self.run_hooks(flow)
-        self.assertDenied(flow, "sts:AssumeRole")
-
-        body = b'{"Name":"p","WithDecryption":false}'
-        flow = self.json_flow("ssm", "AmazonSSM.GetParameter", body, sha256=sigv4.sha256_hex(body))
-        self.run_hooks(flow)
-        self.assertResigned(flow, "ssm:GetParameter")
+        self.assertResigned(flow, "secretsmanager:ListSecrets")
 
     def test_already_streaming_body_cannot_be_inspected(self):
-        flow = self.query_flow("sts", b"", sha256="UNSIGNED-PAYLOAD")
+        flow = self.query_flow("secretsmanager", b"", sha256="UNSIGNED-PAYLOAD")
         flow.request.stream = True  # mitmproxy already streams it: body unavailable
         self.addon.requestheaders(flow)
-        self.assertDenied(flow, "sts:Unknown")
+        self.assertDenied(flow, "secretsmanager:Unknown")
 
 
 class Http2Tests(AwsPolicyAddonTestCase):
@@ -300,6 +317,9 @@ class Http2Tests(AwsPolicyAddonTestCase):
         self.assertIsNone(flow.request.headers.get("Host"))
 
     def test_http2_streaming_denial(self):
+        with open(self.policy_file, "w") as stream:
+            json.dump({"version": 1, "rules": [
+                {"action": "deny", "service": "lambda", "operations": ["GetFunctionConfiguration"]}]}, stream)
         flow = self.aws_flow("lambda.eu-west-1.amazonaws.com", "lambda", method="GET",
                              path="/2015-03-31/functions/fn/configuration", sha256="UNSIGNED-PAYLOAD", http2=True)
         self.addon.requestheaders(flow)
@@ -332,17 +352,19 @@ class OverrideAndPolicyFileTests(AwsPolicyAddonTestCase):
 
     def test_override_never_mints_for_a_different_target(self):
         # The policy and the provider must agree on the target, or deny.
-        self.write_okta([{"account": ACCOUNT, "role": "ReadOnly", "service": "kms", "operations": ["Decrypt"]}])
+        self.write_okta([{"account": ACCOUNT, "role": "ReadOnly", "service": "secretsmanager",
+                          "operations": ["GetSecretValue"]}])
         self.provider.default_target = lambda: (ACCOUNT, "Admin")
-        flow = self.json_flow("kms", "TrentService.Decrypt")
+        flow = self.json_flow("secretsmanager", "secretsmanager.GetSecretValue")
         del flow.request.headers["x-amz-security-token"]
         self.run_hooks(flow)
         self.assertEqual(flow.response.status_code, 403)
         self.assertNotIn("get_creds", [call[0] for call in self.provider.calls])
 
     def test_default_role_from_config_is_used_without_a_selector(self):
-        self.write_okta([{"account": ACCOUNT, "role": "ReadOnly", "service": "kms", "operations": ["Decrypt"]}])
-        flow = self.json_flow("kms", "TrentService.Decrypt")
+        self.write_okta([{"account": ACCOUNT, "role": "ReadOnly", "service": "secretsmanager",
+                          "operations": ["GetSecretValue"]}])
+        flow = self.json_flow("secretsmanager", "secretsmanager.GetSecretValue")
         del flow.request.headers["x-amz-security-token"]
         self.run_hooks(flow)
         self.assertIsNone(flow.response)
