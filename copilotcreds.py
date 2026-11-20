@@ -133,6 +133,7 @@ class CopilotCredentials:
                                  user_agent=USER_AGENT, label="GitHub Copilot",
                                  request=self._request, clock=clock, sleep=sleep)
         self._lock = threading.RLock()
+        self._login_generation = 0
         self._github = None
         self._token = None
         self._expires_at = 0
@@ -146,14 +147,23 @@ class CopilotCredentials:
         return "api." + self.domain
 
     def start(self) -> dict:
-        return self.device.start()
+        with self._lock:
+            self._login_generation += 1
+            self.device.cancel()
+            return self.device.start()
 
     def poll(self, max_wait: float = 10.0) -> dict | None:
         """Finish a device login. Return the sealed client credential, or None."""
+        with self._lock:
+            generation = self._login_generation
         result = self.device.poll(max_wait)
         if result is None:
             return None
         with self._lock:
+            # DeviceFlow guards cancellation during the network call. Also
+            # guard the gap between its return and publishing the credentials.
+            if generation != self._login_generation:
+                raise GitHubDeviceError("no_login", "The login was replaced; start again")
             self._clear()
             self._github = result["access_token"]
             try:
@@ -262,8 +272,9 @@ class CopilotCredentials:
 
     def logout(self) -> dict:
         """Forget the login in RAM and delete the stored item, if any."""
-        self.device.cancel()
         with self._lock:
+            self._login_generation += 1
+            self.device.cancel()
             self._clear()
             self._refresh_count = 0
             self._last_refresh_at = None

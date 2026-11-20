@@ -147,11 +147,10 @@ class SsmResponseCheckTests(AwsPolicyAddonTestCase):
 
     def respond(self, flow, document, status=200, length=True, encoding=None):
         from mitmproxy import http
-        import gzip
         body = json.dumps(document).encode()
         headers = {"content-type": "application/x-amz-json-1.1"}
         if encoding == "gzip":
-            body = gzip.compress(body)
+            # Response.make compresses content itself; do not double-encode.
             headers["content-encoding"] = "gzip"
         if length:
             headers["content-length"] = str(len(body))
@@ -212,6 +211,12 @@ class SsmResponseCheckTests(AwsPolicyAddonTestCase):
     def test_gzip_encoded_response_is_decoded_and_checked(self):
         flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("SecureString")}, encoding="gzip")
         self.assertRefused(flow)
+
+    def test_gzip_encoded_plain_string_is_allowed(self):
+        flow = self.respond(self.ssm_read(), {"Parameter": self.parameter("String", "plain-value")},
+                            encoding="gzip")
+        self.assertEqual(flow.response.status_code, 200)
+        self.assertEqual(json.loads(flow.response.get_content())["Parameter"]["Value"], "plain-value")
 
     def test_unreadable_response_is_refused(self):
         from mitmproxy import http
@@ -470,6 +475,20 @@ class Http2Tests(AwsPolicyAddonTestCase):
 
 
 class OverrideAndPolicyFileTests(AwsPolicyAddonTestCase):
+    def test_override_cannot_resign_an_unverified_service(self):
+        self.okta_file.write_text(json.dumps({
+            "default_account": ACCOUNT, "default_role": "ReadOnly",
+            "operation_overrides": [{"account": ACCOUNT, "role": "ReadOnly",
+                                     "service": "s3", "operations": ["*"]}]}))
+        for http2 in (False, True):
+            for sha256 in (None, "0" * 64):
+                with self.subTest(http2=http2, sha256=sha256):
+                    flow = self.aws_flow("secretsmanager.eu-west-1.amazonaws.com", "s3",
+                                         headers={"X-Amz-Target": "secretsmanager.GetSecretValue"},
+                                         content=b"{}", http2=http2, sha256=sha256)
+                    self.run_hooks(flow)
+                    self.assertDenied(flow, "s3:Unknown")
+
     def write_okta(self, overrides):
         config = {"default_account": ACCOUNT, "default_role": "ReadOnly", "operation_overrides": overrides}
         self.okta_file.write_text(json.dumps(config))

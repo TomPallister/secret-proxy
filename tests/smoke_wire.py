@@ -133,6 +133,8 @@ def main():
             'okta_hosts': ['example.okta.com'],
             'default_app_url': 'https://example.okta.com/home/amazon_aws/example/1',
             'default_account': '123456789012', 'default_role': 'ReadOnly', 'allowed_roles': ['ReadOnly'],
+            'operation_overrides': [{'account': '123456789012', 'role': 'ReadOnly',
+                                     'service': 's3', 'operations': ['*']}],
             'OKTA_USERNAME': 'OKTA_USERNAME', 'OKTA_PASSWORD': 'OKTA_PASSWORD', 'OKTA_SECRET': 'OKTA_SECRET'}))
         # The starter policy setup writes: Secrets Manager reads are refused.
         (root / 'aws-policy.json').write_text(json.dumps(awsops.STARTER_POLICY))
@@ -319,6 +321,21 @@ entry._resolver = fixture_resolver
                                      host='github.example.com', target_port=443)
                 assert code == 403 and json.loads(body) == {'error': 'use_gh_login'}
                 assert observed == [True] * 5
+                # Equivalent form/query/JSON encodings must not bypass the
+                # refusal of client-side logins for either owned OAuth app.
+                for client_id, error in (('178c6fc778ccc68e1d6a', 'use_gh_login'),
+                                         ('Iv1.b507a08c87ecfe98', 'use_github_copilot_login')):
+                    percent = ''.join('%%%02x' % ord(char) for char in client_id)
+                    escaped = ''.join('\\u%04x' % ord(char) for char in client_id)
+                    for path, content_type, payload in (
+                        ('/login/device/code', 'application/x-www-form-urlencoded', 'client_id=' + percent),
+                        ('/login/oauth/access_token?client_id=' + percent, 'application/json', '{}'),
+                        ('/login/oauth/access_token', 'application/json', '{"client_id":"' + escaped + '"}'),
+                    ):
+                        code, body = request('POST', path, {'Content-Type': content_type}, payload,
+                                             host='github.example.com', target_port=443)
+                        assert code == 403 and json.loads(body) == {'error': error}
+                assert observed == [True] * 5
             finally:
                 child.terminate()
                 try:
@@ -396,6 +413,14 @@ def aws_checks(request, port, proxy_auth, context):
     assert status == '403' and json.loads(body)['__type'] == 'AccessDeniedException', (status, body)
     assert headers.get('x-amzn-errortype') == 'AccessDeniedException'
     assert b'BODY-MARKER' not in body
+    # A matching S3 role override must not waive the host/service invariant.
+    mismatch = aws_headers('s3', {'X-Amz-Target': 'secretsmanager.GetSecretValue'})
+    status, body = request('POST', '/', mismatch, b'{}',
+                           host='secretsmanager.eu-west-1.amazonaws.com', target_port=443)
+    assert status == 403 and b's3:Unknown' in body, (status, body)
+    status, headers, body = h2_request(port, proxy_auth, context, 'secretsmanager.eu-west-1.amazonaws.com',
+                                       mismatch, b'{}')
+    assert status == '403' and b's3:Unknown' in body, (status, body)
     # An allowed operation passes the policy and only then reaches credential
     # vending, which fails here because no Okta values exist.
     status, headers, body = h2_request(port, proxy_auth, context, 'sts.amazonaws.com', aws_headers('sts', {

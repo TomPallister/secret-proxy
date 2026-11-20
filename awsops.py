@@ -695,6 +695,12 @@ class AwsOperationPolicy:
 
     def _evaluate_request(self, op: AwsOperation, account: Optional[str],
                           role: Optional[str]) -> Decision:
+        # Overrides waive operator policy, never the service/host invariant.
+        # Unknown may be explicitly allowed for a verified service, but a
+        # mismatched or unreadable signing scope must never reach the signer.
+        if CONDITION_UNVERIFIED_SERVICE in op.conditions:
+            return Decision(DENY, "the target service could not be verified",
+                            "built-in deny list")
         override = next((o for o in self.overrides if o.matches(op, account, role)), None)
         deny = next((r for r in self.rules if r.action == DENY and r.when is None and r.matches(op)), None)
         approve = next((r for r in self.rules if r.action == APPROVE and r.matches(op)), None)

@@ -509,6 +509,40 @@ class GhCliStoreTests(unittest.TestCase):
         self.assertEqual(set(CopilotCredentials().status()), {"loggedIn", "expiresAt", "refreshCount", "lastRefreshAt"})
 
 
+class LoginCompletionRaceTests(unittest.TestCase):
+    def test_late_device_result_cannot_undo_logout_or_replace_new_login(self):
+        for kind in ("github", "github-copilot"):
+            for persistent in (False, True):
+                for action in ("logout", "start"):
+                    with self.subTest(kind=kind, persistent=persistent, action=action):
+                        clock, op = Clock(), FakeOp()
+                        login, _ = store(op)
+                        fake = FakeGhGitHub() if kind == "github" else FakeGitHub(clock)
+                        factory = GhCliCredentials if kind == "github" else CopilotCredentials
+                        provider = factory(request=fake, clock=clock, sleep=clock.sleep,
+                                           store=login if persistent else None)
+                        provider.start()
+                        if kind == "github-copilot":
+                            fake.polls.append({"access_token": GITHUB_TOKEN})
+                        original_poll = provider.device.poll
+
+                        def delayed_result(wait):
+                            result = original_poll(wait)
+                            self.assertIsNotNone(result)
+                            # Deterministic scheduling seam: upstream finished,
+                            # but the provider has not yet published/persisted it.
+                            getattr(provider, action)()
+                            return result
+
+                        with patch.object(provider.device, "poll", side_effect=delayed_result):
+                            with self.assertRaisesRegex(copilotcreds.GitHubDeviceError, "replaced"):
+                                provider.poll()
+                        self.assertFalse(provider.status()["loggedIn"])
+                        self.assertEqual(op.items, {}, "late completion must not resurrect the vault item")
+                        if kind == "github-copilot":
+                            self.assertEqual(fake.exchanges, 0)
+
+
 class ManifestTests(unittest.TestCase):
     def test_absent_means_off(self):
         manifest = load(manifest_data())

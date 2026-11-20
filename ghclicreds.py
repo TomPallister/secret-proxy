@@ -49,18 +49,28 @@ class GhCliCredentials:
                                  request=request or githubdevice.request_json,
                                  clock=clock, sleep=sleep)
         self._lock = threading.Lock()
+        self._login_generation = 0
         self._token = None
         self._scopes = ()
 
     def start(self) -> dict:
-        return self.device.start()
+        with self._lock:
+            self._login_generation += 1
+            self.device.cancel()
+            return self.device.start()
 
     def poll(self, max_wait: float = 10.0) -> dict | None:
         """Finish a device login; return non-secret completion details or None."""
+        with self._lock:
+            generation = self._login_generation
         result = self.device.poll(max_wait)
         if result is None:
             return None
         with self._lock:
+            # DeviceFlow guards cancellation during the network call. Also
+            # guard the gap between its return and publishing the credentials.
+            if generation != self._login_generation:
+                raise githubdevice.GitHubDeviceError("no_login", "The login was replaced; start again")
             self._token, self._scopes = result["access_token"], result["scopes"]
             if self._store is not None:
                 self._store.skip_restore()
@@ -97,8 +107,9 @@ class GhCliCredentials:
 
     def logout(self) -> dict:
         """Forget the login in RAM and delete the stored item, if any."""
-        self.device.cancel()
         with self._lock:
+            self._login_generation += 1
+            self.device.cancel()
             self._token, self._scopes = None, ()
             if self._store is None:
                 return {"stored": False}

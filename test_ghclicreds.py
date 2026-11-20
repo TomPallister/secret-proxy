@@ -221,6 +221,36 @@ class GhCliAddonTests(unittest.TestCase):
         self.assertEqual(json.loads(copilot.response.content), {"error": "use_github_copilot_login"})
         self.assertEqual(self.fake.calls, [])
 
+    def test_encoded_own_logins_are_refused_without_upstream_calls(self):
+        for client_id, error in ((ghclicreds.CLIENT_ID, "use_gh_login"),
+                                  (copilotcreds.CLIENT_ID, "use_github_copilot_login")):
+            percent = "".join("%%%02x" % ord(char) for char in client_id)
+            escaped = "".join("\\u%04x" % ord(char) for char in client_id)
+            form = ("client_id=" + percent).encode()
+            encoded_json = ('{"client_id":"' + escaped + '"}').encode()
+            for endpoint in ("/login/device/code", "/login/oauth/access_token"):
+                cases = [
+                    (endpoint, form, {"content-type": "application/x-www-form-urlencoded"}),
+                    (endpoint + "?client_id=" + percent, b"", {}),
+                    (endpoint, encoded_json, {"content-type": "application/json"}),
+                    # Request.make encodes content according to these headers.
+                    (endpoint, form,
+                     {"content-type": "application/x-www-form-urlencoded", "content-encoding": "gzip"}),
+                    (endpoint, encoded_json,
+                     {"content-type": "application/json", "content-encoding": "gzip"}),
+                ]
+                for path, body, headers in cases:
+                    with self.subTest(client=client_id, path=path, headers=headers):
+                        flow = self.flow("github.com", "POST", path, body=body, headers=headers)
+                        self.assertEqual(flow.request.get_content(), body)
+                        if headers.get("content-encoding") == "gzip":
+                            self.assertNotEqual(flow.request.raw_content, body)
+                        self.send(flow)
+                        self.assertIsNotNone(flow.response, "encoded login must not reach GitHub")
+                        self.assertEqual(flow.response.status_code, 403)
+                        self.assertEqual(json.loads(flow.response.content), {"error": error})
+        self.assertEqual(self.fake.calls, [])
+
     def test_logged_out_reference_fails_closed(self):
         request = self.send(self.flow("api.github.com", "GET", "/user", "token " + REFERENCE))
         self.assertEqual(request.response.status_code, 502)

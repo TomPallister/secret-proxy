@@ -226,18 +226,34 @@ def form_or_query_mentions(flow_request, value: str) -> bool:
     """Whether *value* appears anywhere in a request's target or body.
 
     Used to refuse a client's own device flow for a proxy-owned client ID.
-    A byte search over the raw and decoded body and the full target is
-    deliberately broader than parsing: an encoded or ambiguous body that names
-    the client ID is refused rather than interpreted.
+    Inspect raw bytes, percent-decoded form/query data and JSON strings after
+    HTTP content decoding. Keep duplicate JSON fields: an ambiguous request
+    naming the owned client anywhere must not reach the upstream token endpoint.
     """
     needle = value.encode("ascii")
-    if needle in (flow_request.path or "").encode("utf-8", "surrogateescape"):
+    target = (flow_request.path or "").encode("utf-8", "surrogateescape")
+    if needle in target or needle in urllib.parse.unquote_to_bytes(target):
         return True
     raw = flow_request.raw_content or b""
     if needle in raw:
         return True
     try:
-        decoded = flow_request.get_content(strict=False) or b""
+        decoded = flow_request.get_content(strict=True) or b""
     except Exception:  # noqa: BLE001 - undecodable bodies are treated as a match
         return bool(raw)
-    return needle in decoded
+    if needle in decoded or needle in urllib.parse.unquote_to_bytes(decoded):
+        return True
+    try:
+        document = json.loads(decoded, object_pairs_hook=lambda pairs: pairs)
+    except (ValueError, UnicodeError):
+        return False
+    except RecursionError:
+        return True  # too deeply nested to inspect safely
+    pending = [document]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str) and value in item:
+            return True
+        if isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return False

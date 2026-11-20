@@ -514,6 +514,23 @@ class OverrideTests(unittest.TestCase):
         other = json_req("secretsmanager", "secretsmanager.BatchGetSecretValue")
         self.assertEqual(policy.evaluate(classify(other), ACCOUNT, "Deployer").action, "deny")
 
+    def test_override_cannot_bypass_service_verification(self):
+        request = req("POST", "secretsmanager.eu-west-1.amazonaws.com", service="sts")
+        op = classify(request)
+        self.assertIn(awsops.CONDITION_UNVERIFIED_SERVICE, op.conditions)
+        for operations in (["Unknown"], ["*"]):
+            for action in ("allow", "approve", "deny"):
+                with self.subTest(operations=operations, action=action):
+                    policy = AwsOperationPolicy(
+                        awsops.parse_policy({"version": 1, "rules": [
+                            {"action": action, "service": "*", "operations": ["*"]}]}),
+                        awsops.parse_overrides([{"account": ACCOUNT, "role": "Ops",
+                                                "service": "sts", "operations": operations}]))
+                    decision = policy.evaluate(op, ACCOUNT, "Ops")
+                    self.assertEqual(decision.action, "deny")
+                    self.assertFalse(decision.overridden)
+                    self.assertEqual(decision.rule, "built-in deny list")
+
     def test_override_also_covers_allow_lists_and_unknown(self):
         rules = awsops.load_policy_bytes(json.dumps({"version": 1, "rules": [
             {"action": "allow", "service": "ec2", "operations": ["Describe*"]}]}).encode())
