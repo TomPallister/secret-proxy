@@ -99,6 +99,28 @@ class InstallTests(unittest.TestCase):
             with self.assertRaises(host.HostError):
                 installer.install(args)
 
+    def test_name_constrained_ca_opt_in_is_validated_and_copied_as_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'config'
+            config.mkdir()
+            def write(hosts, ca):
+                (config / 'manifest.json').write_text(json.dumps({'schemaVersion': 3, 'account': {'vault': 'Fixture'},
+                    'secrets': {'EXAMPLE_TOKEN': {'placements': [{'kind': 'header', 'hosts': hosts,
+                    'name': 'authorization', 'template': 'Bearer {secret}'}]}}}))
+                (config / 'ca.json').write_text(ca)
+            write(['api.example.com', '*.example.org'], '{"mode": "name-constrained"}')
+            self.assertIn('ca.json', installer.validate_source_config(config))
+            self.assertIn('ca.json', installer.POLICY_FILES)
+            for hosts, ca in ((['*.com'], '{"mode": "name-constrained"}'),
+                              (['api.example.com'], '{"mode": "anything"}')):
+                write(hosts, ca)
+                with self.subTest(hosts=hosts, ca=ca), self.assertRaises(host.HostError):
+                    installer.validate_source_config(config)
+            (config / 'ca.json').unlink()
+            write(['*.com'], '{}')
+            (config / 'ca.json').unlink()
+            installer.validate_source_config(config)  # wildcards stay valid without the opt-in
+
     def test_private_config_symlinks_and_unrecognised_fields_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

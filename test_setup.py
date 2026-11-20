@@ -15,7 +15,7 @@ from secretstore import SecretManifest
 class SetupTests(unittest.TestCase):
     def create(self, path, answers=None):
         with patch('builtins.input', side_effect=answers or [
-                'example.1password.com', '', '', '', '', 'y']):
+                'example.1password.com', '', '', '', '', 'y', '']):
             setup.initialise(path)
 
     def test_init_generates_valid_private_metadata_not_credentials(self):
@@ -25,7 +25,7 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(base.stat().st_mode & 0o777, 0o700)
             config = base / 'config'
             self.assertEqual(set(p.name for p in config.iterdir()),
-                             {'manifest.json', 'bootstrap.json', 'client-environment.json'})
+                             {'manifest.json', 'bootstrap.json', 'client-environment.json', 'ca.json'})
             self.assertEqual(config.stat().st_mode & 0o777, 0o700)
             for p in config.iterdir():
                 self.assertEqual(p.stat().st_mode & 0o777, 0o600)
@@ -39,6 +39,17 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(bootstrap, {'account': 'example.1password.com', 'vault': 'Private',
                 'item': 'Secret Proxy Bootstrap', 'runtimeVault': 'DevEnv'})
             self.assertNotIn('cli.json', [p.name for p in base.iterdir()])
+            self.assertEqual(json.loads((config / 'ca.json').read_text()), {'mode': 'name-constrained'})
+            setup.validate_source_config(config)
+
+    def test_name_constrained_ca_is_the_new_install_default_and_can_be_declined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / 'settings'
+            self.create(base, ['example.1password.com', '', '', '', '', 'n', 'n'])
+            self.assertFalse((base / 'config/ca.json').exists())
+            with self.assertRaises(setup.SetupError):
+                self.create(Path(tmp) / 'other', ['example.1password.com', '', '', '', '', 'n', 'maybe'])
+            self.assertFalse((Path(tmp) / 'other').exists())
 
     def test_existing_paths_symlinks_and_repository_locations_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,7 +74,7 @@ class SetupTests(unittest.TestCase):
     def test_github_demo_is_read_only_and_codex_is_optional(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / 'settings'
-            self.create(base, ['example.1password.com', '', '', '', '', 'n'])
+            self.create(base, ['example.1password.com', '', '', '', '', 'n', ''])
             manifest = json.loads((base / 'config/manifest.json').read_text())
             self.assertEqual(set(manifest['secrets']), {'GITHUB_TOKEN'})
             placement = manifest['secrets']['GITHUB_TOKEN']['placements'][0]

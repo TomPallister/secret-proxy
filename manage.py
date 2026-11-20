@@ -6,17 +6,24 @@ are explicit; start remains attached and uses the existing desktop bootstrap.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
+import capolicy
 from client import ClientError, ProxyClient, private_read
 from host import Deployment, HostError, PYTHON, ROOT, SHARED_ROOT
+
+SECURITY = '/usr/bin/security'
 
 
 def load_settings(path: Path) -> dict:
@@ -98,6 +105,139 @@ def auth_status(client: ProxyClient, settings: dict, provider: str = 'chatgpt') 
     return result
 
 
+def run_security(args: list) -> subprocess.CompletedProcess:
+    # Inherit stdin/terminal: macOS shows its own password/Touch ID dialog for
+    # user trust changes. Output contains certificate names, never secrets.
+    return subprocess.run([SECURITY, *args], capture_output=True, timeout=300,
+                          env={'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(Path.home())})
+
+
+class Keychain:
+    """User-domain trust settings and the login keychain via /usr/bin/security."""
+
+    def __init__(self, run=run_security):
+        self.run = run
+
+    def call(self, *args, allow=()):
+        result = self.run(list(args))
+        if result.returncode and not any(text in (result.stdout or b'') + (result.stderr or b'') for text in allow):
+            detail = (result.stderr or b'').decode('utf-8', 'replace').strip()[-300:]
+            raise ClientError('security ' + args[0] + ' failed' + (': ' + detail if detail else ''))
+        return result
+
+    def login_keychain(self) -> str:
+        output = self.call('login-keychain').stdout.decode('utf-8', 'replace').strip().strip('"')
+        if not output.startswith('/') or not output.endswith(('.keychain', '.keychain-db')) or '\n' in output:
+            raise ClientError('Could not identify the login keychain')
+        return output
+
+    def find(self, name: str, keychain: str) -> list:
+        output = self.call('find-certificate', '-a', '-c', name, '-p', keychain,
+                           allow=(b'could not be found',)).stdout or b''
+        found = []
+        for der in capolicy.pem_certificates(output):
+            info = capolicy.certificate_info(der)
+            if info['commonName'] == name:  # -c is a substring match
+                found.append((info['sha1'], der))
+        return found
+
+    def trusted(self) -> set:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'trust.plist'
+            result = self.call('trust-settings-export', str(target), allow=(b'No Trust Settings',))
+            if result.returncode or not target.exists():
+                return set()
+            data = plistlib.loads(target.read_bytes())
+        return {key.upper() for key in data.get('trustList', {})}
+
+    def add_trust(self, pem: Path, keychain: str | None):
+        args = ['add-trusted-cert', '-r', 'trustRoot', '-p', 'ssl']
+        if keychain:
+            args += ['-k', keychain]
+        self.call(*args, str(pem))
+
+    def remove_trust(self, pem: Path):
+        self.call('remove-trusted-cert', str(pem))
+
+    def delete(self, sha1: str, keychain: str):
+        self.call('delete-certificate', '-Z', sha1, keychain)
+
+
+def pem_file(directory: Path, der: bytes) -> Path:
+    target = directory / (hashlib.sha1(der).hexdigest() + '.pem')
+    body = base64.encodebytes(der).replace(b'\n', b'')
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    target.write_bytes(b'-----BEGIN CERTIFICATE-----\n' + b'\n'.join(lines) + b'\n-----END CERTIFICATE-----\n')
+    return target
+
+
+def current_ca(client: ProxyClient, settings: dict) -> bytes:
+    """The CA serving the authenticated instance now, refused unless constrained."""
+    client.check_ready()
+    path = SHARED_ROOT / settings['instance'] / 'ca.pem'
+    certificates = capolicy.pem_certificates(private_read(path, 131072))
+    if len(certificates) != 1:
+        raise ClientError('Expected exactly one public proxy CA')
+    try:
+        capolicy.check_trustable(certificates[0], settings['instance'])
+    except capolicy.CAPolicyError as error:
+        raise ClientError(str(error)) from None
+    # Prove that this exact file (with the platform default roots, which cannot
+    # issue the private sentinel name) verifies the proxy's own TLS identity.
+    client.env = dict(client.env, SSL_CERT_FILE=str(path))
+    client.check_ready()
+    return certificates[0]
+
+
+def remove_entries(keychain: Keychain, login: str, entries, directory: Path, trusted: set) -> int:
+    for sha1, der in entries:
+        if sha1 in trusted:
+            keychain.remove_trust(pem_file(directory, der))
+        keychain.delete(sha1, login)
+    return len(entries)
+
+
+def trust_ca(client: ProxyClient, settings: dict, keychain: Keychain):
+    der = current_ca(client, settings)
+    info = capolicy.check_trustable(der, settings['instance'])
+    login = keychain.login_keychain()
+    entries = keychain.find(capolicy.common_name(settings['instance']), login)
+    trusted = keychain.trusted()
+    with tempfile.TemporaryDirectory() as tmp:
+        stale = [entry for entry in entries if entry[0] != info['sha1']]
+        removed = remove_entries(keychain, login, stale, Path(tmp), trusted)
+        present = any(sha1 == info['sha1'] for sha1, _ in entries)
+        if present and info['sha1'] in trusted:
+            print('Proxy CA already trusted for SSL' + (f'; removed {removed} older entr' + ('y' if removed == 1 else 'ies') if removed else ''))
+            return
+        keychain.add_trust(pem_file(Path(tmp), der), None if present else login)
+    if info['sha1'] not in keychain.trusted():
+        raise ClientError('Trust setting was not recorded; nothing else changed')
+    print('Trusted the name-constrained proxy CA for SSL in your login keychain, limited to: '
+          + ', '.join(info['domains']) + '. Undo with: secret-proxy untrust-ca')
+
+
+def untrust_ca(settings: dict, keychain: Keychain):
+    """Remove every trust entry and certificate this instance added. Needs no running proxy."""
+    name = capolicy.common_name(settings['instance'])
+    login = keychain.login_keychain()
+    entries = keychain.find(name, login)
+    trusted = keychain.trusted()
+    with tempfile.TemporaryDirectory() as tmp:
+        removed = remove_entries(keychain, login, entries, Path(tmp), trusted)
+        # A trust setting can outlive a manually deleted keychain item.
+        try:
+            shared = capolicy.pem_certificates(private_read(SHARED_ROOT / settings['instance'] / 'ca.pem', 131072))
+        except (OSError, ClientError, capolicy.CAPolicyError):
+            shared = []
+        for der in shared:
+            info = capolicy.certificate_info(der)
+            if info['commonName'] == name and info['sha1'] in trusted and info['sha1'] not in {s for s, _ in entries}:
+                keychain.remove_trust(pem_file(Path(tmp), der))
+                removed += 1
+    print('Removed the proxy CA trust entry' if removed else 'No proxy CA trust entry found; nothing changed')
+
+
 def execute(settings: dict, command: str, argv=(), provider: str | None = None):
     instance = settings['instance']
     config = str(SHARED_ROOT / instance / 'client.json')
@@ -127,6 +267,10 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None):
     elif command == 'login':
         extra = [] if provider in (None, 'chatgpt') else ['--provider', provider]
         os.execv(PYTHON, [PYTHON, client, '--config', config, 'login', *extra])
+    elif command == 'trust-ca':
+        trust_ca(selected_client(settings), settings, Keychain())
+    elif command == 'untrust-ca':
+        untrust_ca(settings, Keychain())
     elif command == 'run':
         argv = list(argv)
         if argv[:1] == ['--']:
@@ -143,7 +287,7 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=Path.home() / '.config/secret-proxy/cli.json',
                         help='Private metadata file, never a token file')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('start', 'stop', 'status'):
+    for name in ('start', 'stop', 'status', 'trust-ca', 'untrust-ca'):
         commands.add_parser(name)
     for name in ('login', 'auth-status'):
         commands.add_parser(name).add_argument('provider', nargs='?', choices=sorted(LOGINS),

@@ -80,6 +80,7 @@ def initialise(base):
     codex = yes('Enable ChatGPT/Codex for Pi', False)
     if not github and not codex:
         raise SetupError('Choose at least one starter integration. Advanced policy can be added later.')
+    constrained = yes('Limit the proxy CA to these hosts with name constraints (needed for trust-ca)', True)
     secrets, environment = {}, {}
     if github:
         secrets['GITHUB_TOKEN'] = {'placements': [{
@@ -97,6 +98,8 @@ def initialise(base):
     save(config / 'manifest.json', {'schemaVersion': 3,
          'account': {'vault': bootstrap['runtimeVault']}, 'secrets': secrets})
     save(config / 'client-environment.json', environment)
+    if constrained:
+        save(config / 'ca.json', {'mode': 'name-constrained'})
     print('Created metadata in ' + str(config))
     print('Next: complete the 1Password steps in docs/setup.md, then run:')
     extra = '' if base == Path.home() / '.config/secret-proxy' else ' --directory ' + shlex.quote(str(base))

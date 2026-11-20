@@ -31,6 +31,10 @@ class HostTests(unittest.TestCase):
         self.assertFalse(any('op_token' in arg or 'OP_SERVICE' in arg for arg in cmd))
         self.assertEqual(cmd[-1], 'sha256:' + 'a' * 64)
         self.assertFalse(any('/Users/example' in arg for arg in cmd))
+        # The instance label for an opt-in constrained CA is set before the image.
+        self.assertEqual(cmd[cmd.index('SECRET_PROXY_CA_LABEL=candidate') - 1], '--env')
+        self.assertLess(cmd.index('SECRET_PROXY_CA_LABEL=candidate'), cmd.index('sha256:' + 'a' * 64))
+        self.assertTrue({'capolicy.py', 'constrainedca.py'} <= set(host.BUILD_FILES))
 
     def test_invalid_deployment_cannot_choose_paths_or_executables(self):
         for change in ({'instance': '../live'}, {'instance': 'secret-proxy'},

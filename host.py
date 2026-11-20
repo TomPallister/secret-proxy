@@ -33,7 +33,7 @@ BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
                'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
-               'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py')
+               'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py', 'capolicy.py', 'constrainedca.py')
 
 
 class HostError(Exception):
@@ -125,6 +125,8 @@ def container_command(deployment: Deployment, image: str, gateway=None) -> list:
             '--name', deployment.name, '--read-only', '--cap-drop=ALL',
             '--security-opt=no-new-privileges', '--log-driver=none', '--pids-limit=256',
             '--userns=keep-id:uid=1000,gid=1000',
+            # Non-secret instance name; used only for an opt-in name-constrained CA.
+            '--env', 'SECRET_PROXY_CA_LABEL=' + deployment.instance,
             '--tmpfs', '/tmp:rw,noexec,nosuid,size=128m',
             '--volume', f'{deployment.name}-ca:/data',
             '--volume', f'{deployment.private}/config:/config:ro',

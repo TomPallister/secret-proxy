@@ -28,6 +28,7 @@ from secretstore import SecretManifest
 from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
 from egress import EgressConfigError
+from capolicy import CAPolicyError
 
 MAX_BOOTSTRAP = 16384
 
@@ -180,6 +181,8 @@ def main():
     parser.add_argument("--runtime-dir", type=Path, default=Path("/tmp/secret-proxy"))
     parser.add_argument("--port", type=int, default=10256)
     parser.add_argument("--required-interface")
+    parser.add_argument("--ca-label", default=os.environ.get("SECRET_PROXY_CA_LABEL"),
+                        help="Instance name, used only for a name-constrained CA")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         raise ValueError("invalid port")
@@ -191,10 +194,19 @@ def main():
         # Validate before credentials are consumed; never mint during validation.
         AwsCredsProvider.from_config_file(str(aws), lambda _: (_ for _ in ()).throw(AssertionError()))
     validate_aws_policy(config)
+    # Opt-in CA policy is validated before credentials are consumed. Imported
+    # here: host.py imports this module on macOS Python without cryptography.
+    import constrainedca
+    ca_domains = constrainedca.plan(config, args.ca_label)
     capabilities = read_bootstrap(sys.stdin.fileno())
     os.umask(0o077)
     args.state_dir.mkdir(parents=True, exist_ok=True)
     args.runtime_dir.mkdir(parents=True, exist_ok=True)
+    ca_state = constrainedca.ensure(args.state_dir, args.ca_label, ca_domains)
+    if ca_state in ("created", "replaced"):
+        print("secret-proxy runtime: " + ca_state + " a name-constrained CA for "
+              + ", ".join(ca_domains) + ". Consumers need the new public CA; run "
+              "`secret-proxy trust-ca` again if you trust it on macOS.", file=sys.stderr, flush=True)
     with tempfile.TemporaryDirectory(prefix="proxy-", dir=args.runtime_dir) as tmp:
         auth = Path(tmp) / "htpasswd"
         digest = base64.b64encode(hashlib.sha1(capabilities["proxy_token"].encode()).digest()).decode()
@@ -239,7 +251,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         # Provider/JSON errors must not echo any capability or callback content.
-        # AWS policy and egress configuration errors contain only policy text, so show them.
-        detail = str(error) if isinstance(error, (AwsPolicyError, EgressConfigError)) else type(error).__name__
+        # AWS policy, egress and CA policy errors contain only policy text, so show them.
+        detail = (str(error) if isinstance(error, (AwsPolicyError, EgressConfigError, CAPolicyError))
+                  else type(error).__name__)
         print("secret-proxy runtime failed: " + detail, file=sys.stderr)
         sys.exit(1)

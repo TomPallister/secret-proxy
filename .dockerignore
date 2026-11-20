@@ -19,3 +19,5 @@
 !egress.py
 !secretstore.py
 !runtime.py
+!capolicy.py
+!constrainedca.py

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import plistlib
 from pathlib import Path
 import subprocess
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import manage
+import capolicy
 
 
 class ManageTests(unittest.TestCase):
@@ -121,3 +123,181 @@ class ManageTests(unittest.TestCase):
         result = subprocess.run([manage.sys.executable, str(Path(__file__).with_name('manage.py')), '--help'], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
         self.assertIn('auth-status', result.stdout)
+
+
+class FakeSecurity:
+    """In-memory stand-in for /usr/bin/security; nothing real is changed."""
+    KEYCHAIN = '/Users/example/Library/Keychains/login.keychain-db'
+
+    def __init__(self):
+        self.keychain, self.trust, self.calls = {}, set(), []
+
+    @staticmethod
+    def der(path):
+        return capolicy.pem_certificates(Path(path).read_bytes())[0]
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        ok = lambda out=b'': subprocess.CompletedProcess(args, 0, out, b'')
+        fail = lambda err: subprocess.CompletedProcess(args, 1, b'', err)
+        command = args[0]
+        if command == 'login-keychain':
+            return ok(b'    "' + self.KEYCHAIN.encode() + b'"\n')
+        if command == 'find-certificate':
+            assert args[-1] == self.KEYCHAIN and args[1:3] == ['-a', '-c']
+            pems = [manage.pem_file(Path(tempfile.mkdtemp()), der).read_bytes() for der in self.keychain.values()
+                    if args[3] in (capolicy.certificate_info(der)['commonName'] or '')]
+            return ok(b''.join(pems))
+        if command == 'trust-settings-export':
+            if not self.trust:
+                return fail(b'SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.')
+            Path(args[1]).write_bytes(plistlib.dumps({'trustList': {h: {} for h in self.trust}, 'trustVersion': 1}))
+            return ok()
+        if command == 'add-trusted-cert':
+            assert args[1:5] == ['-r', 'trustRoot', '-p', 'ssl']
+            der = self.der(args[-1])
+            sha1 = capolicy.certificate_info(der)['sha1']
+            if '-k' in args:
+                if sha1 in self.keychain:
+                    return fail(b'already in keychain')
+                self.keychain[sha1] = der
+            self.trust.add(sha1)
+            return ok()
+        if command == 'remove-trusted-cert':
+            sha1 = capolicy.certificate_info(self.der(args[1]))['sha1']
+            if sha1 not in self.trust:
+                return fail(b'not trusted')
+            self.trust.discard(sha1)
+            return ok()
+        if command == 'delete-certificate':
+            if args[1] != '-Z' or args[2] not in self.keychain:
+                return fail(b'could not be found')
+            del self.keychain[args[2]]
+            return ok()
+        raise AssertionError(args)
+
+
+def constrained_ca(label='candidate', domains=('example.com',)):
+    import datetime
+    from cryptography.hazmat.primitives import serialization
+    import constrainedca
+    _, cert = constrainedca.generate(label, list(domains), datetime.datetime.now(datetime.timezone.utc))
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+class TrustCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.shared = Path(self.tmp.name)
+        (self.shared / 'candidate').mkdir()
+        patcher = patch.object(manage, 'SHARED_ROOT', self.shared)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.security = FakeSecurity()
+        self.keychain = manage.Keychain(self.security)
+        self.client = Mock(env={'SSL_CERT_FILE': '/bundle.pem'})
+
+    def publish(self, der):
+        path = self.shared / 'candidate/ca.pem'
+        path.write_bytes(manage.pem_file(Path(self.tmp.name), der).read_bytes())
+        path.chmod(0o640)
+        return capolicy.certificate_info(der)['sha1']
+
+    def run_quiet(self, function, *args):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            function(*args)
+        return output.getvalue()
+
+    def trust(self):
+        return self.run_quiet(manage.trust_ca, self.client, ManageTests.settings(None), self.keychain)
+
+    def untrust(self):
+        return self.run_quiet(manage.untrust_ca, ManageTests.settings(None), self.keychain)
+
+    def test_trust_is_idempotent_and_proves_the_published_ca_serves_tls(self):
+        sha1 = self.publish(constrained_ca())
+        self.assertIn('limited to: example.com', self.trust())
+        self.assertEqual(set(self.security.keychain), {sha1})
+        self.assertEqual(self.security.trust, {sha1})
+        self.assertEqual(self.client.env['SSL_CERT_FILE'], str(self.shared / 'candidate/ca.pem'))
+        self.assertEqual(self.client.check_ready.call_count, 2)
+        writes = [c for c in self.security.calls if c[0] in ('add-trusted-cert', 'remove-trusted-cert', 'delete-certificate')]
+        self.assertEqual(len(writes), 1)
+        self.assertIn('-k', writes[0])
+        self.security.calls.clear()
+        self.assertIn('already trusted', self.trust())
+        self.assertFalse([c for c in self.security.calls if c[0] in ('add-trusted-cert', 'remove-trusted-cert', 'delete-certificate')])
+
+    def test_trust_replaces_an_older_ca_of_the_same_instance_only(self):
+        old = self.publish(constrained_ca())
+        self.trust()
+        other = constrained_ca('candidate-other')
+        self.security.keychain['OTHER'] = other
+        self.security.trust.add('OTHER')
+        new = self.publish(constrained_ca(domains=('example.com', 'example.org')))
+        self.trust()
+        self.assertEqual(set(self.security.keychain), {new, 'OTHER'})
+        self.assertEqual(self.security.trust, {new, 'OTHER'})
+        self.assertNotEqual(old, new)
+
+    def test_existing_untrusted_keychain_item_gets_trust_without_duplicate_add(self):
+        der = constrained_ca()
+        sha1 = self.publish(der)
+        self.security.keychain[sha1] = der
+        self.trust()
+        self.assertEqual(self.security.trust, {sha1})
+
+    def test_unconstrained_wrong_instance_or_unready_ca_is_never_trusted(self):
+        from mitmproxy import certs
+        from cryptography.hazmat.primitives import serialization
+        _, plain = certs.create_ca('mitmproxy', 'mitmproxy', 2048)
+        for der in (plain.public_bytes(serialization.Encoding.DER), constrained_ca('other')):
+            self.publish(der)
+            with self.subTest(), self.assertRaises(manage.ClientError):
+                self.trust()
+            self.assertEqual(self.security.calls, [])
+        self.publish(constrained_ca())
+        self.client.check_ready.side_effect = manage.ClientError('not ready')
+        with self.assertRaises(manage.ClientError):
+            self.trust()
+        self.assertEqual(self.security.calls, [])
+
+    def test_untrust_removes_entries_and_is_idempotent_without_a_running_proxy(self):
+        sha1 = self.publish(constrained_ca())
+        self.trust()
+        self.assertIn('Removed', self.untrust())
+        self.assertEqual((self.security.keychain, self.security.trust), ({}, set()))
+        self.assertIn('nothing changed', self.untrust())
+        # A trust setting orphaned by a manually deleted keychain item is removed.
+        self.trust()
+        del self.security.keychain[sha1]
+        self.untrust()
+        self.assertEqual(self.security.trust, set())
+
+    def test_untrust_leaves_other_instances_alone(self):
+        other = constrained_ca('candidate2')
+        sha1 = capolicy.certificate_info(other)['sha1']
+        self.security.keychain[sha1] = other
+        self.security.trust.add(sha1)
+        self.assertIn('nothing changed', self.untrust())
+        self.assertEqual(set(self.security.keychain), {sha1})
+
+    def test_failed_security_call_reports_without_further_changes(self):
+        self.publish(constrained_ca())
+        def refuse(args):
+            if args[0] == 'add-trusted-cert':
+                return subprocess.CompletedProcess(args, 1, b'', b'User canceled the operation.')
+            return self.security(args)
+        with self.assertRaisesRegex(manage.ClientError, 'canceled'):
+            manage.trust_ca(self.client, ManageTests.settings(None), manage.Keychain(refuse))
+        self.assertEqual(self.security.trust, set())
+
+    def test_trust_commands_dispatch_with_the_real_security_binary_injected(self):
+        with patch.object(manage, 'trust_ca') as trust, patch.object(manage, 'untrust_ca') as untrust, \
+                patch.object(manage, 'selected_client', return_value='client'):
+            manage.execute(ManageTests.settings(None), 'trust-ca')
+            manage.execute(ManageTests.settings(None), 'untrust-ca')
+        self.assertIs(trust.call_args.args[2].run, manage.run_security)
+        self.assertIs(untrust.call_args.args[1].run, manage.run_security)
+        self.assertEqual(manage.SECURITY, '/usr/bin/security')
