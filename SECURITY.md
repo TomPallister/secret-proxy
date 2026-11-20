@@ -27,6 +27,12 @@ engineering evidence, not a penetration test or a security certification.
   The proxy resolves a name once, checks every address and connects only to a
   checked one, so DNS rebinding cannot redirect that connection. An optional
   host allow/deny list limits where proxied traffic may go.
+- Optional scoped clients: each named client has its own proxy token (its
+  proxy-auth user name is the client name) and may use only its granted
+  secrets, placements, AWS accounts/roles/operations, logins and Git signing.
+  Identity comes from proxy authentication only, never a request header; a
+  refusal happens before any secret is resolved or AWS credential minted.
+  Without a `clients` section there is one unrestricted token, as before.
 - ChatGPT access and rotating refresh tokens are memory-only. Restart requires
   browser sign-in again. Static secrets remain cached until invalidation/restart.
 - GitHub Copilot: the proxy runs the device flow and the Copilot token exchange.
@@ -53,6 +59,12 @@ engineering evidence, not a penetration test or a security certification.
   applies to any client that can select that role. Non-AWS vendor APIs that
   return or create keys are not blocked. Narrow upstream permissions and external
   policy accordingly; this is not response-data loss prevention.
+- **Scoped tokens a process can read.** Scoping limits a process only if it
+  cannot read another, broader token. On a single-user host every published
+  token, including the unrestricted default one, is readable by that user and
+  so by any process running as them. Hand a narrow token to a separate
+  container, VM or user, giving it only that one file. Upstream permissions of
+  the granted secrets still apply in full.
 - **All host traffic.** The host client supplies command-scoped proxy variables;
   a program can ignore them. Egress checks and the optional allow-list apply only
   to traffic that goes through the proxy; they are not an egress firewall for the

@@ -18,6 +18,8 @@ Supply a private directory containing:
   top of the built-in deny list. See [AWS operation policy](operations.md#aws-operation-policy)
   and `examples/aws-policy.json`.
 - `checkmarxRealm` in the manifest when enabling Checkmarx.
+- Optional `clients` in the manifest: named clients, each with its own token and
+  grants. See [scoped clients](#scoped-clients).
 - Optional `upstream-ca.pem`: corporate trust roots. Used as a build secret and
   as an external runtime trust input, never baked into the image.
 - Optional `client-environment.json`: tool variables containing canonical
@@ -214,6 +216,96 @@ full-access policy, including uploads and Git over HTTPS, looks like this:
   Use GitHub permissions and scopes to limit writes.
 - Enabling the login adds `<domain>` to the intercepted hosts so the proxy can
   refuse gh's own device flow.
+
+## Scoped clients
+
+By default there is one proxy token, and whoever holds it can use every
+placement, login, Git signing and every allowed AWS role. An optional `clients`
+section in the manifest gives each named client its own token and its own
+grants (`examples/clients-manifest.json`):
+
+```json
+{
+  "clients": {
+    "default": {"all": true},
+    "issue-reader": {"secrets": {"GITHUB_TOKEN": {"placements": [0]}}},
+    "notifier": {
+      "secrets": {"EXAMPLE_WEBHOOK_URL": true},
+      "aws": [{"account": "123456789012", "role": "ExampleReadOnly",
+               "operations": ["sts:GetCallerIdentity", "s3:*"]}],
+      "signing": false,
+      "logins": []
+    }
+  }
+}
+```
+
+- Without a `clients` section nothing changes: one `default` client with every
+  grant, proxy-auth user name `secret-proxy`, token file `proxy-token`.
+- With the section, `default` must be declared. `{"all": true}` keeps every
+  grant (used alone). The default client keeps the user name `secret-proxy` and
+  the `proxy-token` file, so existing settings, health checks and the daily CLI
+  keep working. Other names are `[a-z][a-z0-9-]{0,31}`, at most 16 clients; the
+  name is the client's proxy-auth user name.
+- Everything not granted is refused. A grant lists:
+  - `secrets`: canonical names. `true` allows every placement of that secret;
+    `{"placements": [0, 2]}` allows only those entries (by index) of its
+    `placements` list. Grant a derived entry (for example `WIZ_ACCESS_TOKEN`),
+    never the internal-only secret it comes from.
+  - `aws`: `account` (12 digits or `*`) and `role` (exact name or `*`) a client
+    may select, optionally narrowed by `operations`, as `service:Operation`
+    globs matched against the operation the proxy identifies (REST services
+    without named operations, such as S3, identify as `s3:Unclassified`; use
+    `s3:*`). The AWS operation policy and its deny list still apply, and a role
+    override cannot widen a client's grant. Presigned URLs are not classified,
+    so only an `aws` grant without `operations` covers them.
+  - `signing`: `true` to use proxy Git signing.
+  - `logins`: proxy-owned login routes the client may drive (`chatgpt`,
+    `github-copilot`, `github`). Using the resulting token is a separate secret
+    grant, for example `CHATGPT_ACCESS_TOKEN`.
+- Refusals happen before any secret is resolved or any AWS credential minted:
+  `403` with `secret_proxy_placement_not_allowed` for placements,
+  `secret_proxy_client_not_granted` for logins, signing and the Copilot and
+  Checkmarx token-exchange answers, and an AWS `AccessDeniedException` for AWS.
+  `/health` stays open to every authenticated client. Egress rules apply to all
+  clients unchanged. Requests with no reference pass through for any client.
+- A URL-rewrite secret granted by placement index is resolved before its
+  destination is known, then refused if the destination matches an ungranted
+  placement. Grant the whole secret, or keep one URL-rewrite placement per secret.
+
+The controller creates one random token per named client, keeps it in the
+instance's private directory (so it survives restarts, like the default token)
+and passes it to the runtime on stdin with the service-account capability. The
+runtime writes one `{SHA}` line per client into its private htpasswd file. Each
+token is published as its own owner-only file, `proxy-token.<name>`, next to
+`proxy-token`; files of clients removed from the manifest are deleted at the
+next start. Tokens are never in argv or logs. Use one with `--client`:
+
+```sh
+secret-proxy run --client issue-reader -- gh api repos/example/project/issues
+```
+
+**Scoping is only a boundary when the less-trusted process cannot read the
+other tokens.** On a single-user Mac you can read every published token,
+including the unrestricted `proxy-token`, so any process running as you can
+too: there, scoping organises access but does not contain a hostile process.
+It contains one when the narrow token is the only one the process can reach,
+for example a container that gets just its own file:
+
+```sh
+podman run --rm \
+  -v /private/etc/secret-proxy/<instance>/proxy-token.issue-reader:/run/proxy-token:ro \
+  -v /private/etc/secret-proxy/<instance>/bundle.pem:/run/ca.pem:ro \
+  example/tool sh -c 'export HTTPS_PROXY="http://issue-reader:$(cat /run/proxy-token)@host.containers.internal:10260"; exec tool'
+```
+
+Adjust the proxy address to however your container reaches the proxy port.
+Mount the single file, never the shared directory. A shim run as another
+local user, given only its own token file, works the same way.
+
+Changing the `clients` section is a policy change, like any manifest change:
+register it as a new candidate or replace the root-owned policy deliberately,
+then restart.
 
 ## Candidate installation on macOS
 

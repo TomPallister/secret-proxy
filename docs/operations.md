@@ -23,6 +23,18 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    foreground controllers to finish. It preserves volumes, trust, capability,
    policy and client auth. A new start requires browser login again.
 
+## Scoped client tokens
+
+With a manifest [`clients` section](advanced-setup.md#scoped-clients), each start
+publishes `proxy-token.<name>` (owner-only) beside the default `proxy-token` in
+the instance's shared directory. Tokens persist across restarts. To rotate one,
+stop the proxy, delete
+`/Users/secagent/.config/standalone-secret-proxy/<instance>/client-tokens/<name>`
+as root, and start again; hand the new file to that client. Removing a client
+from the manifest deletes its published file at the next start. Any client can
+use `secret-proxy status --client <name>`; logins need that client's `logins`
+grant. A refused use logs `client '<name>' is not granted ...` without values.
+
 ## Name-constrained CA and macOS trust
 
 With `ca.json` (see [advanced configuration](advanced-setup.md)) the proxy owns

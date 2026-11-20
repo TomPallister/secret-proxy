@@ -72,6 +72,8 @@ only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
   credentials or secrets (`GetSecretValue`, `AssumeRole`, `CreateAccessKey`…)
   are refused by default; see the [AWS operation policy](docs/operations.md#aws-operation-policy).
 - Git commit/tag signing without handing the client a private key.
+- Optional [scoped clients](docs/advanced-setup.md#scoped-clients): separate
+  tokens that may use only the secrets, AWS roles and logins they are granted.
 - Refusing proxied connections to metadata, loopback and private addresses,
   with an optional host allow/deny list ([egress controls](docs/advanced-setup.md#egress-controls)).
 

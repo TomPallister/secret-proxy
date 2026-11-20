@@ -123,6 +123,23 @@ a name-constrained CA and run `secret-proxy trust-ca` once (see
 [compatibility limits](#compatibility-limits)); do not disable TLS verification
 instead. In Linux containers that trust the proxy CA, gh works without it.
 
+## Scoped clients
+
+If the manifest defines [scoped clients](advanced-setup.md#scoped-clients),
+choose one with `--client` (the default is `default`):
+
+```sh
+secret-proxy run --client issue-reader -- your-command
+secret-proxy status --client issue-reader
+secret-proxy login github --client notifier
+```
+
+The command then gets only that client's token and user name. Anything outside
+the client's grants is refused with `403`, before any secret is resolved. Start,
+stop and CA trust always use the default client. A scoped token is a security
+boundary only if the narrower process cannot read the other token files; see
+the deployment example in [scoped clients](advanced-setup.md#scoped-clients).
+
 ## Compatibility limits
 
 Applications must honour the supplied proxy and CA settings. Curl and accepted
@@ -188,7 +205,8 @@ python3 /opt/secret-proxy/current/client.py \
   --config /private/etc/secret-proxy/local/client.json status
 ```
 
-Replace `status` with `login` or `run -- <command>` as needed.
+Replace `status` with `login` or `run -- <command>` as needed. Add
+`--client <name>` before the command to use a scoped client's token.
 A configuration can set `agentDir`; otherwise the client honours its explicit
 agent-directory option or Pi's environment/default. A configured directory takes
 precedence over `PI_CODING_AGENT_DIR`.
