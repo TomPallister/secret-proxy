@@ -215,6 +215,75 @@ A launcher that starts `runtime.py` directly enables approvals by adding an
 every client token) to
 the bootstrap bundle. Without it, every request that needs approval is denied.
 
+## Audit log
+
+Off by default. The proxy then writes nothing about requests anywhere: its
+activity goes only to the attached terminal. To keep a tamper-evident record of
+security decisions, add to `manifest.json` (see `examples/audit-manifest.json`):
+
+```json
+"audit": {"enabled": true, "signingKey": "AUDIT_SIGNING_SSH_KEY"}
+```
+
+and an Ed25519 SSH Key item for it:
+
+```json
+"AUDIT_SIGNING_SSH_KEY": {"internalOnly": true, "valueField": "sshPrivateKey"}
+```
+
+Use a dedicated key rather than your Git signing key; reuse works (audit seals
+use their own SSH signature namespace) but a separate key keeps the two apart.
+Without `signingKey` the files are still hash-chained, but nothing is signed.
+
+| Field | Default | Range |
+|---|---|---|
+| `maxFileBytes` | 4 MiB | 64 KiB to 64 MiB; a new file starts after this size, and at least daily |
+| `maxTotalBytes` | 64 MiB | `maxFileBytes` to 256 MiB; oldest files are deleted above it |
+| `maxAgeDays` | 90 | 1 to 3650; files whose last change is older are deleted |
+
+Files are `audit-NNNNNNNN.jsonl` in the proxy's own volume (`/data/audit` in
+the container): directory 0700, files 0600, readable only through the proxy
+account. Nothing goes to `/config` or the shared client directory. A file is
+deleted only from the oldest end, never the one in use. A client that makes
+many refused requests can push older entries out through retention, so size
+`maxTotalBytes` for how far back you need to look and export regularly. An invalid `audit`
+section, or an audit directory that cannot be opened, stops the proxy from
+starting.
+
+**What is recorded.** One JSON line per decision: time, client, host, port,
+method and path without the query string or fragment, and as relevant the
+secret's canonical name, placement kind and field name, the decision
+(`injected`, `refused`, `allowed`, `denied`, `failed`, `signed`, `answered`,
+`started`, `completed`), a fixed reason code or rule, an exception class name,
+AWS account, role, service and operation, and the approval choice. Events cover
+injections, AWS decisions, egress refusals, approvals, proxy-owned logins, the
+Copilot and Checkmarx exchange answers and Git signing. Requests without a
+reference (plain passthrough) are not recorded.
+
+**Never recorded:** secret values, headers, request or response bodies, query
+strings, OAuth tokens, callbacks or error message text. Every field is checked
+against a fixed allow-list and shape when it is written; anything else is
+dropped and counted in the entry's `dropped` field. For a URL-rewrite secret the
+destination is itself the secret, so only the sentinel host and the reference
+name are recorded.
+
+**Each entry is on disk before the request proceeds.** Every line is written
+and `fsync`ed before the decision takes effect. If an entry that grants
+something (an injection, an AWS signature, a Git signature, a login or an
+exchange answer) cannot be written, the request is refused with
+`503 {"error":"secret_proxy_audit_unavailable"}` and nothing is sent upstream.
+A failed write is cut back so no partial line stays in the chain.
+
+**Chain and seal.** Each line carries a sequence number and the SHA-256 of the
+previous line. Each file starts with a header (format version, file number,
+boot nonce, start time, signing-key fingerprint) chained to the previous
+file's last line. A clean stop (`secret-proxy stop`, Ctrl-C) and each rotation
+end the file with a `seal`: an SSH signature (namespace `secret-proxy-audit`)
+over the file's header hash, the seal's position and the last hash. If the key
+cannot be read, the seal says why and has no signature. A crash, `kill -9` or
+VM failure leaves the last file without a seal. To export and check the log,
+see [operations](operations.md#audit-log).
+
 ## GitHub logins
 
 The proxy can own a GitHub Copilot login (for Pi) and a GitHub CLI login (for

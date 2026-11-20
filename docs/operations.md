@@ -21,7 +21,8 @@ launcher configuration. Bootstrap metadata is not a service-account token.
    the supplied proxy and trust settings; see [client compatibility](clients.md).
 5. `secret-proxy stop` stops only the selected instance and waits for the old
    foreground controllers to finish. It preserves volumes, trust, capability,
-   policy and client auth. A new start requires browser login again.
+   policy and client auth. A new start requires browser login again. With the
+   [audit log](#audit-log) on, a stop seals and signs it.
 
 ## Scoped client tokens
 
@@ -199,6 +200,55 @@ Expires in 119 s. Choose:
 The proxy terminal logs each decision with the rule and request summary, never
 a secret value, body or query string, for example
 `APPROVAL deny (approval-timeout) aws method=POST host=iam.amazonaws.com ...`.
+
+## Audit log
+
+Only with an enabled manifest [`audit` section](advanced-setup.md#audit-log).
+The files live in the proxy account's volume; copy them out to read them:
+
+```bash
+secret-proxy audit export ~/audit-2026-11-20
+secret-proxy audit verify --public-key ~/audit-signing.pub ~/audit-2026-11-20
+secret-proxy audit verify --public-key ~/audit-signing.pub   # export to a temporary directory, then verify
+```
+
+`export` asks for sudo, then reads the files as the proxy account through a
+throwaway container with no network and the volume mounted read-only. It works
+while the proxy runs and after it stops, and refuses to overwrite an existing
+directory. The copy is 0700/0600.
+
+`verify` needs no sudo and no running proxy. Get the public key independently
+(for example the public key of the SSH Key item in 1Password), not from the
+log or the proxy: pinning it is what makes the check meaningful. It uses
+`ssh-keygen -Y verify`. Results:
+
+- `VALID, SEALED` (exit 0): every entry is in an unbroken chain up to a seal
+  signed by the pinned key. Expect this after a clean stop.
+- `VALID CHAIN, UNSIGNED TAIL` (exit 3): the chain is intact, but the last
+  entries come after the last valid signature (the proxy is still running, it
+  stopped uncleanly, or no signing key was available). Those entries are not
+  authenticated. After a clean stop with a key, treat this as suspicious.
+- `INVALID` (exit 1): an entry was edited, deleted, inserted or reordered, a
+  file in the middle is missing or truncated, or a seal does not verify with
+  the pinned key (a wrong or replaced key). The message names the first file
+  and line that fails.
+
+A signature also covers every earlier file, because each file's header is
+chained to the previous one. Retention removes files from the oldest end;
+`verify` then notes how many earlier files are missing, and cannot tell
+retention from someone deleting the oldest files.
+
+What `verify` cannot detect:
+
+- Removal of the newest whole files, or of the unsigned tail of the newest file:
+  the log just looks shorter. Compare the end time with when you expect.
+- Changes to the unsigned tail by someone who rewrites its hashes consistently.
+- Anything by someone who can read the proxy's state **and** holds the signing
+  key: they can rewrite the history and sign it again. So can anyone if you
+  verify without pinning the key yourself.
+
+To turn the log off, remove the section (or set `"enabled": false`) and
+restart. Old files stay in the volume until you delete them as the proxy account.
 
 ## Refused destinations
 

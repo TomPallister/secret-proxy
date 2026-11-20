@@ -201,6 +201,11 @@ response, so allow for that in client timeouts. A refusal is a `403` with
 `{"error":"secret_proxy_approval_denied","rule":"approval-..."}` (AWS SDKs see
 an `AccessDeniedException`). The client never sees the prompt.
 
+With the [audit log](advanced-setup.md#audit-log) enabled, a request whose
+decision cannot be recorded (for example the proxy's disk is full) is refused
+with `503 {"error":"secret_proxy_audit_unavailable"}` rather than sent
+unrecorded. Retry once the operator has fixed the proxy's storage.
+
 ## Low-level client interface
 
 The daily CLI delegates to the installed client. For an explicitly registered

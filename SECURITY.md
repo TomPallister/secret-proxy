@@ -21,7 +21,15 @@ engineering evidence, not a penetration test or a security certification.
   readiness file must not silently select an old or unauthenticated service.
 - Bootstrap capabilities use bounded stdin rather than command arguments. Provider
   failures are sanitised; there is no persistent request log in the host launch
-  contract. Browser callbacks belong in the hidden terminal prompt, not chat/logs.
+  contract unless the opt-in audit log is enabled. Browser callbacks belong in
+  the hidden terminal prompt, not chat/logs.
+- Optional audit log (off by default): one hash-chained JSON line per security
+  decision in the proxy account's own volume (0700/0600), sealed with an SSH
+  signature from an internalOnly store key at each clean stop and rotation.
+  Fields pass a fixed allow-list: never secret values, headers, bodies, query
+  strings or error text. A decision that grants something is refused when its
+  entry cannot be written. `secret-proxy audit verify` checks the chain and
+  seals against a public key you pin.
 - Proxied connections to loopback, link-local, cloud-metadata, multicast and
   reserved addresses are refused, and private ranges unless explicitly allowed.
   The proxy resolves a name once, checks every address and connects only to a
@@ -104,6 +112,15 @@ engineering evidence, not a penetration test or a security certification.
   (`github.com`). Whoever can read the CA key (secagent, root) can impersonate
   those names to every application trusting it. Name constraints are enforced by
   macOS, Go, OpenSSL/LibreSSL and curl; an application with its own verifier might not.
+- **A tamper-proof audit log.** The audit log is tamper evidence on the local
+  machine only. Someone who can read the proxy's state and also holds the
+  signing key can rewrite history consistently and sign it again, and a
+  verifier that does not pin the public key independently proves nothing. After
+  an unclean stop (crash, `kill -9`, VM failure) the entries since the last
+  seal are unsigned. Deleting the newest files or the unsigned tail, or the
+  oldest files (indistinguishable from retention), is not detected. The log
+  records request metadata such as hosts, paths and client names: treat it as
+  sensitive, and note that root can read or delete it.
 - **An atomic VPN kill switch.** Interface/container watchdogs are secondary.
   The external VPN owner must enforce fail-closed routes; no live VPN acceptance
   is claimed merely because the disposable namespace tests pass.

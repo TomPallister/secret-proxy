@@ -75,7 +75,7 @@ only; `secret-proxy untrust-ca` undoes that. See [clients](docs/clients.md).
   tokens that may use only the secrets, AWS roles and logins they are granted.
 - Refusing proxied connections to metadata, loopback and private addresses,
   with an optional host allow/deny list ([egress controls](docs/advanced-setup.md#egress-controls)).
-- Optional [approval rules](docs/advanced-setup.md#approval-rules), answered with `secret-proxy approvals`.
+- Optional [approval rules](docs/advanced-setup.md#approval-rules) (`secret-proxy approvals`) and a signed [audit log](docs/advanced-setup.md#audit-log).
 
 Each integration needs an explicit policy defining **where** its credential may
 be used. The starter setup includes read-only GitHub and optional ChatGPT/Codex;

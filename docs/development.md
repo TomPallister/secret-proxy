@@ -57,3 +57,8 @@ original agent directory, enables tools/extensions or saves a session:
 ```sh
 uv run --locked python tests/smoke_pi.py --help
 ```
+
+The audit-log tests (`test_audit.py`, `test_audit_wire.py`) create throwaway
+Ed25519 keys with `ssh-keygen` and verify seals with `ssh-keygen -Y verify`;
+they skip those cases when `ssh-keygen` is not installed. `test_audit_wire.py`
+starts a real `mitmdump`, stops it with SIGTERM and checks the signed seal.
