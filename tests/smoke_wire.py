@@ -177,8 +177,9 @@ from entry import (load, http_connect, requestheaders, request, responseheaders,
 import entry
 _system_resolver = entry._resolver
 def fixture_resolver(host, port):
-    # The synthetic GitHub login domain is answered by the proxy itself.
-    if host in ('github.example.com', 'api.github.example.com'):
+    # Synthetic GitHub login domains and AWS endpoints are answered or refused
+    # by the proxy itself; resolve them locally so the test needs no DNS.
+    if host in ('github.example.com', 'api.github.example.com') or host.endswith('.amazonaws.com'):
         return ['127.0.0.1']
     return _system_resolver(host, port)
 entry._resolver = fixture_resolver

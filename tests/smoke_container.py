@@ -3,7 +3,9 @@ import base64
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import tempfile
 import threading
@@ -24,7 +26,7 @@ assert not Path("/tmp/build-ca.pem").exists()
 assert not Path("/usr/local/share/ca-certificates/corporate-ca.crt").exists()
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
-with tempfile.TemporaryDirectory() as tmp:
+with tempfile.TemporaryDirectory() as tmp, open(Path(tempfile.gettempdir()) / "smoke-runtime.log", "w+b") as log:
     config = Path(tmp) / "config"
     config.mkdir()
     (config / "manifest.json").write_text(json.dumps({"schemaVersion": 3, "account": {"vault": "Fixture"}, "secrets": {}}))
@@ -38,7 +40,7 @@ with tempfile.TemporaryDirectory() as tmp:
     child = subprocess.Popen(["/opt/secret-proxy/.venv/bin/python", "/opt/secret-proxy/runtime.py",
         "--config-dir", str(config), "--port", "19080",
         "--state-dir", str(Path(tmp) / "state"), "--runtime-dir", str(Path(tmp) / "runtime")],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:
         child.stdin.write(json.dumps({"op_token": "not-a-real-capability", "proxy_token": "a" * 48}).encode())
         child.stdin.close()
@@ -61,7 +63,11 @@ with tempfile.TemporaryDirectory() as tmp:
                     raise AssertionError("proxy did not become ready")
                 time.sleep(0.1)
         assert status == 407, status
-        assert request("secret-proxy:" + "a" * 48) == (200, b"ok")
+        # Authenticated, then refused by the always-on egress address rules:
+        # the loopback upstream is never connected to.
+        status, body = request("secret-proxy:" + "a" * 48)
+        assert status == 403 and json.loads(body) == {
+            "error": "secret_proxy_egress_refused", "rule": "loopback-address"}, (status, body)
         while not (Path(tmp) / 'runtime/ready.json').exists():
             assert child.poll() is None and time.monotonic() < deadline, 'authenticated readiness missing'
             time.sleep(.1)
@@ -70,11 +76,16 @@ with tempfile.TemporaryDirectory() as tmp:
         child.terminate()
         child.wait(timeout=10)
         assert not list((Path(tmp) / "runtime").glob("proxy-*")), "temporary auth file not cleaned"
-        print("PASS: read-only, capability-dropped container; 407/200 authentication; clean shutdown; no Node, bw or baked corporate CA")
+        print("PASS: read-only, capability-dropped container; 407/authenticated egress refusal; clean shutdown; no Node, bw or baked corporate CA")
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait()
-        output = child.stdout.read()
+        # Kill the whole session (runtime.py and its mitmdump child), so a
+        # failed assertion can never leave a process holding the log open.
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+        log.seek(0)
+        output = log.read()
         assert b"not-a-real-capability" not in output and b"a" * 48 not in output
         server.shutdown()
