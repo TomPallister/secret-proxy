@@ -18,6 +18,7 @@
 !gitsign.py
 !egress.py
 !secretstore.py
+!clientgrants.py
 !runtime.py
 !capolicy.py
 !constrainedca.py

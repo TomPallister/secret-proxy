@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 3,
+  "account": {"vault": "Automation"},
+  "secrets": {
+    "GITHUB_TOKEN": {
+      "placements": [
+        {"kind": "header", "hosts": ["api.github.com"], "name": "authorization", "template": "Bearer {secret}", "methods": ["GET", "HEAD"]},
+        {"kind": "basic-password", "hosts": ["github.com"], "username": "x-access-token"}
+      ]
+    },
+    "EXAMPLE_WEBHOOK_URL": {
+      "placements": [{"kind": "url-rewrite", "hosts": ["hooks.example.com"], "methods": ["POST"]}]
+    }
+  },
+  "clients": {
+    "default": {"all": true, "comment": "The operator's own token: every grant, as without a clients section."},
+    "issue-reader": {
+      "comment": "A read-only tool: GitHub API reads only, no Git, no AWS, no signing.",
+      "secrets": {"GITHUB_TOKEN": {"placements": [0]}}
+    },
+    "notifier": {
+      "secrets": {"EXAMPLE_WEBHOOK_URL": true},
+      "aws": [{"account": "123456789012", "role": "ExampleReadOnly", "operations": ["sts:GetCallerIdentity", "s3:*"]}]
+    }
+  }
+}

@@ -17,6 +17,8 @@ import termios
 import time
 import urllib.parse
 
+import clientgrants
+
 MARKER = 'secret' + 'ref:'
 HOST = 'secret' + 'ref.invalid'
 MAX_CALLBACK = 32768
@@ -71,10 +73,18 @@ def validate_config(config: dict) -> dict:
     return config
 
 
-def client_env(config: dict) -> dict:
+def check_client_name(client: str) -> str:
+    if client != clientgrants.DEFAULT_CLIENT and not clientgrants.valid_name(client):
+        raise ClientError('Invalid client name')
+    return client
+
+
+def client_env(config: dict, client: str = clientgrants.DEFAULT_CLIENT) -> dict:
+    """Proxy/trust environment for one client, using only that client's token."""
     validate_config(config)
+    check_client_name(client)
     shared = Path(config['sharedDir'])
-    token = private_read(shared / 'proxy-token', 49).decode('ascii').strip()
+    token = private_read(shared / clientgrants.token_file_name(client), 49).decode('ascii').strip()
     if not re.fullmatch(r'[0-9a-f]{48}', token):
         raise ClientError('Invalid proxy capability')
     private_read(shared / 'ca.pem', 131072)
@@ -87,7 +97,7 @@ def client_env(config: dict) -> dict:
     env = {key: value for key, value in os.environ.items()
            if not key.lower().endswith('_proxy') and key != 'OP_SERVICE_ACCOUNT_TOKEN' and not key.startswith('OP_SESSION_')}
     env.update(config.get('environment', {}))
-    proxy = f'http://secret-proxy:{token}@127.0.0.1:{config["port"]}'
+    proxy = f'http://{clientgrants.username(client)}:{token}@127.0.0.1:{config["port"]}'
     env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, http_proxy=proxy, https_proxy=proxy,
                NO_PROXY='localhost,127.0.0.1,::1', no_proxy='localhost,127.0.0.1,::1',
                NODE_USE_ENV_PROXY='1', NODE_EXTRA_CA_CERTS=ca, SSL_CERT_FILE=ca,
@@ -98,9 +108,10 @@ def client_env(config: dict) -> dict:
 
 
 class ProxyClient:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, client: str = clientgrants.DEFAULT_CLIENT):
         self.config = validate_config(config)
-        self.env = client_env(config)
+        self.client = check_client_name(client)
+        self.env = client_env(config, client)
 
     def call(self, path: str, body: bytes | None = None, *, tls: bool = True) -> dict:
         # Explicit CONNECT; never honour ambient proxy/no_proxy or redirects.
@@ -307,6 +318,8 @@ def device_login(client: ProxyClient, prefix: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True, type=Path, help='Non-secret client JSON')
+    parser.add_argument('--client', default=clientgrants.DEFAULT_CLIENT,
+                        help='Scoped client whose token to use (default: default)')
     commands = parser.add_subparsers(dest='command', required=True)
     run = commands.add_parser('run', help='Run one command with scoped proxy/trust environment')
     run.add_argument('argv', nargs=argparse.REMAINDER)
@@ -317,7 +330,7 @@ def main():
     commands.add_parser('status')
     args = parser.parse_args()
     config = json.loads(private_read(args.config, 65536))
-    client = ProxyClient(config)
+    client = ProxyClient(config, args.client)
     client.check_ready()
     if args.command == 'status':
         print('Proxy ready (authenticated instance check; vault/upstreams not tested)')

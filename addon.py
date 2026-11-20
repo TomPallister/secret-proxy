@@ -39,6 +39,7 @@ from urllib.parse import urlsplit
 from mitmproxy import http
 
 import awsops
+import clientgrants
 import sigv4
 from awscreds import AwsCredsProvider
 from googlecreds import GoogleTokenProvider
@@ -279,6 +280,64 @@ def _current_manifest():
     return _manifest if bound is _UNBOUND else (bound.manifest if bound else None)
 
 
+# --- Scoped clients (clientgrants.py) ---------------------------------------
+# The proxy-auth user name identifies the client. mitmproxy's proxyauth addon
+# validates it against the htpasswd file and records (user, password) in
+# flow.metadata["proxyauth"]: per request for plain HTTP, and from the CONNECT
+# for every request in that tunnel (HTTP/1.1 and HTTP/2 alike). A client header
+# is never trusted for identity.
+
+
+def flow_client(flow: http.HTTPFlow) -> str | None:
+    """The authenticated client name for *flow*, or None when unauthenticated.
+
+    The default client authenticates as ``secret-proxy``. Shared helper for
+    audit logging and approvals.
+    """
+    auth = getattr(flow, "metadata", {}).get("proxyauth")
+    if not isinstance(auth, tuple) or len(auth) != 2:
+        return None
+    return clientgrants.client_for_username(auth[0])
+
+
+def _client_grant(flow: http.HTTPFlow):
+    """The flow's grant, or None when no ``clients`` section exists (unscoped)."""
+    policy = getattr(_current_manifest(), "clients", None)
+    if policy is None:
+        return None
+    return policy.get(flow_client(flow))
+
+
+def _client_label(flow: http.HTTPFlow) -> str:
+    return flow_client(flow) or "unauthenticated"
+
+
+def _client_may_use(flow: http.HTTPFlow, canonical: str) -> bool:
+    """Whether the flow's client may use *canonical* in at least one placement."""
+    grant = _client_grant(flow)
+    return grant is None or grant.may_use_secret(canonical)
+
+
+def _client_may_login(flow: http.HTTPFlow, kind: str) -> bool:
+    grant = _client_grant(flow)
+    return grant is None or grant.may_login(kind)
+
+
+def _client_denied(flow: http.HTTPFlow, what: str) -> None:
+    log.warning("secret_proxy: BLOCKED %s %s - client '%s' is not granted %s",
+                flow.request.method, flow.request.host, _client_label(flow), what)
+
+
+def _client_refusal(flow: http.HTTPFlow, what: str) -> bool:
+    """403 for a proxy route or answer the client is not granted."""
+    _client_denied(flow, what)
+    flow.response = http.Response.make(
+        403, json.dumps({"error": "secret_proxy_client_not_granted"}).encode(),
+        {"content-type": "application/json", "cache-control": "no-store"},
+    )
+    return True
+
+
 def _placement_allowed(
     canonical: str,
     flow: http.HTTPFlow,
@@ -296,10 +355,13 @@ def _placement_allowed(
         return False
     target = host if host is not None else (flow.request.host or "")
     try:
+        grant = _client_grant(flow)
+        if grant is not None and not grant.may_use_secret(canonical):
+            _client_denied(flow, canonical)
+            return False
         if not _pinned_host_allows(canonical, target):
             return False
-        return bool(manifest.placement_allowed(
-            canonical,
+        context = dict(
             kind=kind,
             host=target,
             method=flow.request.method or "",
@@ -307,7 +369,15 @@ def _placement_allowed(
             name=name,
             template=template,
             username=username,
-        ))
+        )
+        granted = None if grant is None else grant.granted_placements(canonical)
+        if granted is None:
+            return bool(manifest.placement_allowed(canonical, **context))
+        # The client may use only some placements: one of those must match.
+        if not granted.intersection(manifest.placement_indices(canonical, **context)):
+            _client_denied(flow, canonical + " in this placement")
+            return False
+        return True
     except Exception:  # noqa: BLE001 - policy failures must fail closed
         return False
 
@@ -323,11 +393,21 @@ def _sentinel_resolve(ref: str, flow: http.HTTPFlow) -> tuple[str, str, int, str
     try:
         info = manifest.secret(canonical) if manifest is not None else None
         method = (flow.request.method or "").upper()
+        grant = _client_grant(flow)
+        granted = None
+        if grant is not None:
+            if not grant.may_use_secret(canonical):
+                _client_denied(flow, canonical)
+                raise PolicyViolation(canonical, SENTINEL_HOST)
+            granted = grant.granted_placements(canonical)
         eligible = bool(info and any(
             placement.kind == "url-rewrite"
             and (not placement.methods or method in placement.methods)
-            for placement in info.placements
+            and (granted is None or index in granted)
+            for index, placement in enumerate(info.placements)
         ))
+    except PolicyViolation:
+        raise
     except Exception:  # noqa: BLE001 - policy failures must fail closed
         eligible = False
     if not eligible:
@@ -513,15 +593,18 @@ class _GitHubLogin:
     error: bytes
     client_id: str
     factory: object
+    cli_name: str  # the daily CLI's provider name, also the clients login grant
 
 
 _GITHUB_LOGINS = (
     _GitHubLogin("copilot", copilotcreds.CANONICAL, "/github-copilot",
                  b'{"error":"use_github_copilot_login"}', copilotcreds.CLIENT_ID,
-                 lambda settings: copilotcreds.CopilotCredentials(domain=settings["domain"])),
+                 lambda settings: copilotcreds.CopilotCredentials(domain=settings["domain"]),
+                 "github-copilot"),
     _GitHubLogin("cli", ghclicreds.CANONICAL, "/github",
                  b'{"error":"use_gh_login"}', ghclicreds.CLIENT_ID,
-                 lambda settings: ghclicreds.GhCliCredentials(domain=settings["domain"], scopes=settings["scopes"])),
+                 lambda settings: ghclicreds.GhCliCredentials(domain=settings["domain"], scopes=settings["scopes"]),
+                 "github"),
 )
 
 
@@ -1083,6 +1166,9 @@ def _checkmarx_exchange_response(flow: http.HTTPFlow) -> bool:
         return False
     if any(sealedjwt.MARKER in value for value in others):
         return False
+    # The answer resolves the API key and mints an access token: both need the grant.
+    if not _client_may_use(flow, CHECKMARX_ACCESS_TOKEN):
+        return _client_refusal(flow, CHECKMARX_ACCESS_TOKEN)
 
     provider = _form_token_provider(CHECKMARX_ACCESS_TOKEN)
     access_token = provider.get_token()
@@ -1110,6 +1196,8 @@ def _chatgpt_status_route(flow: http.HTTPFlow) -> bool:
     """Proxy-auth protected, credential-free evidence of expiry-triggered refresh."""
     if flow.request.host != SENTINEL_HOST or flow.request.path != '/chatgpt/status':
         return False
+    if not _client_may_login(flow, "chatgpt"):
+        return _client_refusal(flow, "the chatgpt login")
     if flow.request.method != 'GET':
         flow.response = http.Response.make(405, b'{"error":"method_not_allowed"}')
         return True
@@ -1135,6 +1223,8 @@ def _chatgpt_login_route(flow: http.HTTPFlow) -> bool:
     path = (flow.request.path or "").split("?", 1)[0]
     if path not in ("/chatgpt/start", "/chatgpt/finish"):
         return False
+    if not _client_may_login(flow, "chatgpt"):
+        return _client_refusal(flow, "the chatgpt login")
     manifest = _current_manifest()
     try:
         manifest.canonical_name("CHATGPT_ACCESS_TOKEN")
@@ -1211,6 +1301,8 @@ def _copilot_exchange_response(flow: http.HTTPFlow) -> bool:
         return False
     if (flow.request.path or "").split("?", 1)[0] != copilotcreds.EXCHANGE_PATH:
         return False
+    if not _client_may_use(flow, copilotcreds.CANONICAL):
+        return _client_refusal(flow, copilotcreds.CANONICAL)
     reference = sealedjwt.MARKER + copilotcreds.CANONICAL
     auth = flow.request.headers.get_all("authorization")
     if (flow.request.method or "").upper() != "GET" or len(auth) != 1 or auth[0] not in (
@@ -1244,6 +1336,8 @@ def _github_login_route(flow: http.HTTPFlow) -> bool:
         action = raw_path.split("?", 1)[0].rsplit("/", 1)[1]
         if raw_path != login.prefix + "/" + action:
             return _json_response(flow, 400, {"error": "bad_request"})
+        if not _client_may_login(flow, login.cli_name):
+            return _client_refusal(flow, "the " + login.cli_name + " login")
         provider = _github_provider(login)
         if provider is None:
             return _json_response(flow, 403, {"error": "not_available"})
@@ -1303,6 +1397,10 @@ def _git_signing_route(flow: http.HTTPFlow) -> bool:
         _current_manifest().canonical_name(GIT_SIGNING_SSH_KEY)
     except (AttributeError, KeyError, ValueError):
         return _git_signing_response(flow, 403, "git_signing_not_configured")
+    grant = _client_grant(flow)
+    if grant is not None and not grant.may_sign():
+        _client_denied(flow, "git signing")
+        return _git_signing_response(flow, 403, "secret_proxy_client_not_granted")
     payload = flow.request.content or b""
     if len(payload) > gitsign.MAX_PAYLOAD_BYTES:
         return _git_signing_response(flow, 413, "object_too_large")
@@ -1651,6 +1749,32 @@ def _resign_presigned(flow: http.HTTPFlow) -> None:
     creds so an in-container fetch of a self-generated presigned URL works."""
     if not _require_https(flow):
         return
+    checked = None
+    if _client_grant(flow) is not None:
+        # Before the provider is touched: a scoped client needs an AWS grant
+        # without an operations restriction (presigned URLs are not classified).
+        try:
+            _policy, default_target = _load_aws_policy()
+        except Exception:  # noqa: BLE001 - unreadable configuration denies
+            default_target = (None, None)
+        tok = flow.request.query.get("X-Amz-Security-Token", "")
+        checked = tuple(default_target)
+        if tok.startswith("secretrole:") and "/" in tok:
+            a, r = tok[len("secretrole:"):].split("/", 1)
+            if a and r:
+                checked = (a, r)
+        account, role = checked
+        if not (isinstance(account, str) and re.fullmatch(r"[0-9]{12}", account)
+                and isinstance(role, str) and re.fullmatch(r"[A-Za-z0-9+=,.@_-]{1,64}", role)):
+            account = role = None
+        checked = (account, role)
+        denied = _aws_client_denial(flow, account, role, None)
+        if denied is not None:
+            credential = flow.request.query.get("X-Amz-Credential", "").split("/")
+            service = credential[3] if len(credential) == 5 and credential[3] else awsops.UNKNOWN
+            op = awsops.AwsOperation(service, awsops.UNKNOWN, awsops.PROTOCOL_REST, "presigned URL")
+            log.warning("secret_proxy: AWS DENY %s/%s presigned (%s)", account or "-", role or "-", denied.reason)
+            raise AwsOperationDenied(op, denied, account, role)
     provider = _get_aws_provider()
     if provider is None:
         log.warning(f"secret_proxy: {flow.request.host} presigned but no creds provider - passthrough")
@@ -1662,6 +1786,10 @@ def _resign_presigned(flow: http.HTTPFlow) -> None:
         a, r = tok[len("secretrole:"):].split("/", 1)
         if a and r:
             account, role = a, r
+    if checked is not None and (account, role) != checked:
+        op = awsops.AwsOperation(awsops.UNKNOWN, awsops.UNKNOWN, awsops.PROTOCOL_REST, "presigned URL")
+        denied = awsops.Decision(awsops.DENY, "the signing target differs from the checked target", "clients")
+        raise AwsOperationDenied(op, denied, checked[0], checked[1])
     creds = provider.get_creds(account, role)
     params = {k: q[k] for k in q}
     headers_lower = {k.lower(): v for k, v in flow.request.headers.items()}
@@ -1835,9 +1963,14 @@ def _aws_policy_check(flow: http.HTTPFlow, body):
         if signing != op.service:
             op = awsops.AwsOperation(op.service, awsops.UNKNOWN, op.protocol,
                                      "signing scope differs from the inspected scope")
-    decision = policy.evaluate(op, account, role)
     who = f"{account or '-'}/{role or '-'}"
     flow.metadata["secret_proxy_aws_operation"] = op.label
+    # A scoped client's grant is checked first: no override can widen it.
+    denied = _aws_client_denial(flow, account, role, op)
+    if denied is not None:
+        log.warning("secret_proxy: AWS DENY %s %s (%s)", who, op.label, denied.reason)
+        raise AwsOperationDenied(op, denied, account, role)
+    decision = policy.evaluate(op, account, role)
     if not decision.allowed:
         log.warning(
             "secret_proxy: AWS DENY %s %s (%s; rule=%s)", who, op.label, decision.reason, decision.rule,
@@ -1846,6 +1979,29 @@ def _aws_policy_check(flow: http.HTTPFlow, body):
     if decision.overridden:
         log.warning("secret_proxy: AWS ALLOW (override) %s %s", who, op.label)
     return op, decision, account, role
+
+
+def _aws_client_denial(flow: http.HTTPFlow, account, role, op) -> "awsops.Decision | None":
+    """A deny Decision when the flow's client may not use this target/operation."""
+    grant = _client_grant(flow)
+    if grant is None:
+        return None
+    grants = grant.aws_grants_for(account, role)
+    if not grants:
+        return awsops.Decision(
+            awsops.DENY, f"client '{_client_label(flow)}' is not granted this AWS account and role",
+            "clients")
+    if op is None:
+        # Presigned URLs are not classified: only an unrestricted grant covers them.
+        if not any(not g.operations for g in grants):
+            return awsops.Decision(
+                awsops.DENY, f"client '{_client_label(flow)}' may use this role only for listed operations",
+                "clients")
+        return None
+    if not any(g.allows_operation(op.service, op.operation) for g in grants):
+        return awsops.Decision(
+            awsops.DENY, f"client '{_client_label(flow)}' is not granted {op.label}", "clients")
+    return None
 
 
 def _cbor_text(value: str) -> bytes:
@@ -1912,6 +2068,12 @@ def _aws_resign_apply(flow: http.HTTPFlow, body):
         log.warning(f"secret_proxy: {flow.request.host} AWS SigV4 but no creds provider (aws-okta.json missing) - passthrough")
         return None
     account, role = _aws_target(flow, provider)
+    if _client_grant(flow) is not None and (account, role) != (policy_account, policy_role):
+        # The client grant was checked for the policy target; never mint for another.
+        denied = awsops.Decision(awsops.DENY, "the signing target differs from the checked target", "clients")
+        log.warning("secret_proxy: AWS DENY %s/%s %s (%s)", policy_account or "-", policy_role or "-",
+                    op.label, denied.reason)
+        raise AwsOperationDenied(op, denied, policy_account, policy_role)
     if decision.overridden and (account, role) != (policy_account, policy_role):
         # An override is for one exact role; never mint for any other target.
         denied = awsops.Decision(awsops.DENY, "the role override does not match the signing target",

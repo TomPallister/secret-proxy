@@ -25,6 +25,7 @@ import tempfile
 import time
 
 from secretstore import SecretManifest
+import clientgrants
 from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
 from egress import EgressConfigError
@@ -57,7 +58,8 @@ def read_bootstrap(fd: int, timeout: float = 30) -> dict:
             result[key] = value
         return result
     obj = json.loads(data, object_pairs_hook=unique)
-    if not isinstance(obj, dict) or set(obj) != {"op_token", "proxy_token"}:
+    if not isinstance(obj, dict) or not {"op_token", "proxy_token"} <= set(obj) \
+            or set(obj) - {"op_token", "proxy_token", "client_tokens"}:
         raise ValueError("invalid bootstrap fields")
     op = obj["op_token"]
     if not isinstance(op, str) or not op or not op.isascii() or any(c.isspace() or ord(c) < 33 for c in op):
@@ -65,7 +67,33 @@ def read_bootstrap(fd: int, timeout: float = 30) -> dict:
     proxy = obj["proxy_token"]
     if not isinstance(proxy, str) or re.fullmatch(r"[0-9a-f]{48}", proxy) is None:
         raise ValueError("invalid proxy capability")
+    # Optional: one token per named client (the default client uses proxy_token).
+    clients = obj.get("client_tokens", {})
+    if not isinstance(clients, dict) or len(clients) > clientgrants.MAX_CLIENTS:
+        raise ValueError("invalid client capabilities")
+    seen = {proxy}
+    for name, token in clients.items():
+        if (not clientgrants.valid_name(name) or name == clientgrants.DEFAULT_CLIENT
+                or not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{48}", token) is None
+                or token in seen):
+            raise ValueError("invalid client capabilities")
+        seen.add(token)
     return obj
+
+
+def htpasswd(capabilities: dict, named_clients) -> str:
+    """One {SHA} line per client; with no clients section, exactly today's file.
+
+    *named_clients* are the manifest's non-default clients; each needs exactly
+    its own token in the bundle, and the bundle may carry nothing else.
+    """
+    tokens = capabilities.get("client_tokens", {})
+    if set(tokens) != set(named_clients):
+        raise clientgrants.ClientConfigError("client tokens do not match the manifest clients; restart through the controller")
+    lines = [(clientgrants.DEFAULT_USERNAME, capabilities["proxy_token"])]
+    lines += [(name, tokens[name]) for name in sorted(named_clients)]
+    return "".join(user + ":{SHA}" + base64.b64encode(hashlib.sha1(token.encode()).digest()).decode() + "\n"
+                   for user, token in lines)
 
 
 def command(config: Path, state: Path, auth: Path, port: int, capabilities: dict):
@@ -188,7 +216,8 @@ def main():
         raise ValueError("invalid port")
     require_interface(args.required_interface)
     config = args.config_dir.resolve(strict=True)
-    SecretManifest.load(config / "manifest.json")
+    manifest = SecretManifest.load(config / "manifest.json")
+    named_clients = manifest.clients.named() if manifest.clients is not None else ()
     aws = config / "aws-okta.json"
     if aws.exists():
         # Validate before credentials are consumed; never mint during validation.
@@ -209,8 +238,7 @@ def main():
               "`secret-proxy trust-ca` again if you trust it on macOS.", file=sys.stderr, flush=True)
     with tempfile.TemporaryDirectory(prefix="proxy-", dir=args.runtime_dir) as tmp:
         auth = Path(tmp) / "htpasswd"
-        digest = base64.b64encode(hashlib.sha1(capabilities["proxy_token"].encode()).digest()).decode()
-        auth.write_text("secret-proxy:{SHA}" + digest + "\n")
+        auth.write_text(htpasswd(capabilities, named_clients))
         auth.chmod(0o600)
         argv, env = command(config, args.state_dir.resolve(), auth, args.port, capabilities)
         if aws.exists():
@@ -251,8 +279,9 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as error:
         # Provider/JSON errors must not echo any capability or callback content.
-        # AWS policy, egress and CA policy errors contain only policy text, so show them.
-        detail = (str(error) if isinstance(error, (AwsPolicyError, EgressConfigError, CAPolicyError))
+        # AWS policy, egress, CA policy and client errors contain only policy text, so show them.
+        detail = (str(error) if isinstance(error, (AwsPolicyError, EgressConfigError, CAPolicyError,
+                                                   clientgrants.ClientConfigError))
                   else type(error).__name__)
         print("secret-proxy runtime failed: " + detail, file=sys.stderr)
         sys.exit(1)

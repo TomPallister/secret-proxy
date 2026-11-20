@@ -20,7 +20,8 @@ import tempfile
 import time
 
 import capolicy
-from client import ClientError, ProxyClient, private_read
+from client import ClientError, ProxyClient, check_client_name, private_read
+from clientgrants import DEFAULT_CLIENT
 from host import Deployment, HostError, PYTHON, ROOT, SHARED_ROOT
 
 SECURITY = '/usr/bin/security'
@@ -41,9 +42,9 @@ def load_settings(path: Path) -> dict:
     return value
 
 
-def selected_client(settings: dict) -> ProxyClient:
+def selected_client(settings: dict, client: str = DEFAULT_CLIENT) -> ProxyClient:
     config = SHARED_ROOT / settings['instance'] / 'client.json'
-    return ProxyClient(json.loads(private_read(config, 65536)))
+    return ProxyClient(json.loads(private_read(config, 65536)), client)
 
 
 def controller_pids(instance: str) -> list[int]:
@@ -238,8 +239,13 @@ def untrust_ca(settings: dict, keychain: Keychain):
     print('Removed the proxy CA trust entry' if removed else 'No proxy CA trust entry found; nothing changed')
 
 
-def execute(settings: dict, command: str, argv=(), provider: str | None = None):
+def execute(settings: dict, command: str, argv=(), provider: str | None = None,
+            client_name: str = DEFAULT_CLIENT):
     instance = settings['instance']
+    check_client_name(client_name)
+    # Only commands acting as a client take --client; lifecycle and CA trust
+    # always use the default client (the operator's own token).
+    scoped = [] if client_name == DEFAULT_CLIENT else ['--client', client_name]
     config = str(SHARED_ROOT / instance / 'client.json')
     host = str(ROOT / 'current/host.py')
     client = str(ROOT / 'current/client.py')
@@ -260,13 +266,13 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None):
         wait_controllers(pids)
         print('Selected proxy stopped; CA, capability, policy and workspace retained. Start needs browser login again.')
     elif command == 'status':
-        selected_client(settings).check_ready()
+        selected_client(settings, client_name).check_ready()
         print('Proxy ready (authenticated instance check; vault/upstreams not tested)')
     elif command == 'auth-status':
-        print(json.dumps(auth_status(selected_client(settings), settings, provider or 'chatgpt'), indent=2))
+        print(json.dumps(auth_status(selected_client(settings, client_name), settings, provider or 'chatgpt'), indent=2))
     elif command == 'login':
         extra = [] if provider in (None, 'chatgpt') else ['--provider', provider]
-        os.execv(PYTHON, [PYTHON, client, '--config', config, 'login', *extra])
+        os.execv(PYTHON, [PYTHON, client, '--config', config, *scoped, 'login', *extra])
     elif command == 'trust-ca':
         trust_ca(selected_client(settings), settings, Keychain())
     elif command == 'untrust-ca':
@@ -277,7 +283,7 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None):
             argv = argv[1:]
         if not argv:
             raise ClientError('A command is required')
-        os.execv(PYTHON, [PYTHON, client, '--config', config, 'run', '--', *argv])
+        os.execv(PYTHON, [PYTHON, client, '--config', config, *scoped, 'run', '--', *argv])
     else:
         raise ClientError('Unknown command')
 
@@ -287,14 +293,21 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=Path.home() / '.config/secret-proxy/cli.json',
                         help='Private metadata file, never a token file')
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('start', 'stop', 'status', 'trust-ca', 'untrust-ca'):
+    client_help = 'Scoped client whose token to use (default: default)'
+    for name in ('start', 'stop', 'trust-ca', 'untrust-ca'):
         commands.add_parser(name)
+    commands.add_parser('status').add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
     for name in ('login', 'auth-status'):
-        commands.add_parser(name).add_argument('provider', nargs='?', choices=sorted(LOGINS),
-                                               help='Proxy-owned login (default: chatgpt)')
-    commands.add_parser('run').add_argument('argv', nargs=argparse.REMAINDER)
+        sub = commands.add_parser(name)
+        sub.add_argument('provider', nargs='?', choices=sorted(LOGINS),
+                         help='Proxy-owned login (default: chatgpt)')
+        sub.add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
+    run = commands.add_parser('run')
+    run.add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
+    run.add_argument('argv', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    execute(load_settings(args.config), args.command, getattr(args, 'argv', ()), getattr(args, 'provider', None))
+    execute(load_settings(args.config), args.command, getattr(args, 'argv', ()), getattr(args, 'provider', None),
+            getattr(args, 'client', DEFAULT_CLIENT))
 
 
 if __name__ == '__main__':

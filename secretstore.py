@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Mapping, Protocol
 
 from egress import EgressPolicy
+import clientgrants
 
 
 # Validation patterns
@@ -129,7 +130,7 @@ class SecretManifest:
         provider = "1password"
         with open(path) as f:
             data = json.load(f, object_pairs_hook=_unique_object)
-        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins"}:
+        if not isinstance(data, dict) or set(data) - {"schemaVersion", "account", "secrets", "checkmarxRealm", "egress", "githubLogins", "clients"}:
             raise ValueError("invalid manifest root")
         if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 3:
             raise ValueError("schemaVersion must be exactly integer 3")
@@ -423,6 +424,14 @@ class SecretManifest:
         manifest.checkmarx_realm = realm
         manifest._egress = egress
         manifest.github_logins = _github_logins(data.get("githubLogins"), secrets)
+        enabled_logins = [kind for kind, on in (
+            ("chatgpt", "CHATGPT_ACCESS_TOKEN" in secrets and secrets["CHATGPT_ACCESS_TOKEN"].runtime_only),
+            ("github-copilot", "copilot" in manifest.github_logins),
+            ("github", "cli" in manifest.github_logins),
+        ) if on]
+        # Optional; absent means one default client with every grant (today's
+        # behaviour). Raises ClientConfigError, a ValueError.
+        manifest.clients = clientgrants.parse_clients(data.get("clients"), secrets, enabled_logins)
         return manifest
 
     def egress_policy(self) -> EgressPolicy:
@@ -523,29 +532,77 @@ class SecretManifest:
         if secret.internal_only or not isinstance(host, str):
             return False
 
+        return any(
+            self._placement_matches(
+                secret, placement, kind=kind, host=host, method=method, path=path,
+                name=name, template=template, username=username,
+            )
+            for placement in secret.placements
+        )
+
+    def _placement_matches(
+        self,
+        secret: SecretInfo,
+        placement: SecretPlacement,
+        *,
+        kind: str,
+        host: str,
+        method: str,
+        path: str,
+        name: str | None,
+        template: str | None,
+        username: str | None,
+    ) -> bool:
+        if secret.internal_only or not isinstance(host, str):
+            return False
         method_upper = method.upper() if isinstance(method, str) else ""
-        for placement in secret.placements:
-            if placement.kind != kind:
-                continue
-            if not any(self._host_matches(pattern, host) for pattern in placement.hosts):
-                continue
-            if placement.methods and method_upper not in placement.methods:
-                continue
-            if not self._path_matches(placement.paths, path):
-                continue
-            if kind == "header":
-                if not isinstance(name, str) or placement.name != name.lower():
-                    continue
-                if placement.template != template:
-                    continue
-            elif kind in {"query", "form"}:
-                if placement.name != name or placement.template != template:
-                    continue
-            elif kind == "basic-password":
-                if placement.username is not None and placement.username != username:
-                    continue
-            return True
-        return False
+        if placement.kind != kind:
+            return False
+        if not any(self._host_matches(pattern, host) for pattern in placement.hosts):
+            return False
+        if placement.methods and method_upper not in placement.methods:
+            return False
+        if not self._path_matches(placement.paths, path):
+            return False
+        if kind == "header":
+            if not isinstance(name, str) or placement.name != name.lower():
+                return False
+            if placement.template != template:
+                return False
+        elif kind in {"query", "form"}:
+            if placement.name != name or placement.template != template:
+                return False
+        elif kind == "basic-password":
+            if placement.username is not None and placement.username != username:
+                return False
+        return True
+
+    def placement_indices(
+        self,
+        secret_name: str,
+        *,
+        kind: str,
+        host: str,
+        method: str,
+        path: str,
+        name: str | None = None,
+        template: str | None = None,
+        username: str | None = None,
+    ) -> tuple[int, ...]:
+        """Indices of every placement a complete request context matches.
+
+        Scoped clients may be granted individual placements by index.
+        """
+        secret = self._secrets.get(secret_name)
+        if secret is None:
+            raise KeyError(f"Unknown secret: '{secret_name}'")
+        return tuple(
+            index for index, placement in enumerate(secret.placements)
+            if self._placement_matches(
+                secret, placement, kind=kind, host=host, method=method, path=path,
+                name=name, template=template, username=username,
+            )
+        )
 
     def has_placement_kind(self, secret_name: str, kind: str) -> bool:
         """Return whether a non-internal secret declares *kind* at all."""

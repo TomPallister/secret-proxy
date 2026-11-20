@@ -23,6 +23,8 @@ import time
 from client import private_read, ProxyClient
 from networking import NetworkPolicy, NetworkError, resolve_gateway, check_gateway, relay_command
 from runtime import read_bootstrap
+import clientgrants
+from secretstore import SecretManifest
 
 ROOT = Path('/opt/secret-proxy')
 SHARED_ROOT = Path('/private/etc/secret-proxy')
@@ -33,7 +35,7 @@ BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
                'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
-               'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py', 'capolicy.py', 'constrainedca.py')
+               'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py')
 
 
 class HostError(Exception):
@@ -216,6 +218,49 @@ def prepare(deployment: Deployment):
     print('Candidate image prepared; no credentials consumed and no existing container changed.', flush=True)
 
 
+def client_tokens(deployment: Deployment, default_token: str) -> dict:
+    """One persistent private token per named manifest client (issue #2).
+
+    Tokens survive restarts, like the default capability, so a client keeps its
+    published file. With no ``clients`` section this returns {} and nothing
+    changes. Values never appear in argv or output.
+    """
+    manifest = SecretManifest.load(deployment.private / 'config/manifest.json')
+    names = manifest.clients.named() if manifest.clients is not None else ()
+    if not names:
+        return {}
+    directory = deployment.private / 'client-tokens'
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise HostError('Unsafe client token directory')
+    directory.chmod(0o700)
+    tokens = {}
+    for name in names:
+        path = directory / name
+        if not path.exists():
+            atomic(path, (secrets.token_hex(24) + '\n').encode(), 0o600)
+        token = private_read(path, 49).decode().strip()
+        if re.fullmatch(r'[0-9a-f]{48}', token) is None or token == default_token or token in tokens.values():
+            raise HostError('Invalid client proxy capability: ' + name)
+        tokens[name] = token
+    return tokens
+
+
+def publish_client_tokens(deployment: Deployment, tokens: dict):
+    """Publish each named client's token as its own owner-only file.
+
+    A token is only a boundary if a less-trusted process can read just its own
+    file: hand that one file (not the shared directory) to the client's
+    container, VM or user. Files of clients no longer in the manifest go.
+    """
+    for path in deployment.shared.iterdir():
+        name = path.name[len('proxy-token.'):] if path.name.startswith('proxy-token.') else None
+        if name is not None and name not in tokens and clientgrants.valid_name(name):
+            path.unlink()
+    for name, token in tokens.items():
+        atomic(deployment.shared / clientgrants.token_file_name(name), (token + '\n').encode(), 0o600)
+
+
 def serve(deployment: Deployment):
     if engine(deployment, 'container', 'exists', deployment.name).returncode == 0:
         raise HostError('Instance already exists; stop it explicitly before starting')
@@ -235,6 +280,9 @@ def serve(deployment: Deployment):
     if re.fullmatch(r'[0-9a-f]{48}', capability) is None:
         raise HostError('Invalid instance proxy capability')
     bundle['proxy_token'] = capability
+    clients = client_tokens(deployment, capability)
+    if clients:
+        bundle['client_tokens'] = clients
     ready = deployment.shared / 'ready.json'
     ready.unlink(missing_ok=True)
     child = subprocess.Popen(container_command(deployment, image, gateway), env=engine_env(), stdin=subprocess.PIPE)
@@ -254,6 +302,7 @@ def serve(deployment: Deployment):
                     raise HostError('Invalid runtime readiness')
                 ca = checked(engine(deployment, 'exec', deployment.name, '/bin/cat', '/data/mitmproxy/mitmproxy-ca-cert.pem'), 'public CA export')
                 atomic(deployment.shared / 'proxy-token', (capability + '\n').encode())
+                publish_client_tokens(deployment, clients)
                 atomic(deployment.shared / 'ca.pem', ca)
                 roots = (deployment.private / 'runtime-ca.pem').read_bytes()
                 atomic(deployment.shared / 'bundle.pem', roots + b'\n' + ca)

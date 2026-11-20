@@ -19,6 +19,7 @@ import tempfile
 from awscreds import AwsCredsProvider
 from awsops import AwsPolicyError, load_policy_bytes
 import capolicy
+from clientgrants import ClientConfigError
 from client import private_read, validate_config
 from host import Deployment, HostError, PODMAN, PYTHON, ROOT, SA_HOME, SHARED_ROOT
 from egress import EgressConfigError
@@ -29,7 +30,7 @@ FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
          'copilotcreds.py', 'ghclicreds.py', 'sealedjwt.py',
-         'gitsign.py', 'egress.py', 'secretstore.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
+         'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
          'manage.py', 'secret-proxy', 'capolicy.py', 'constrainedca.py')
 # Private policy copied into the instance's read-only /config (bootstrap metadata
 # stays desktop-side). ca.json opts into a name-constrained CA.
@@ -121,7 +122,10 @@ def validate_source_config(source: Path):
     with tempfile.TemporaryDirectory() as tmp:
         manifest = Path(tmp) / 'manifest.json'
         manifest.write_bytes(contents['manifest.json'])
-        loaded = SecretManifest.load(manifest)
+        try:
+            loaded = SecretManifest.load(manifest)
+        except ClientConfigError as error:
+            raise HostError('Invalid clients section: ' + str(error)) from None
     if 'aws-okta.json' in contents:
         AwsCredsProvider._validate_config(json.loads(contents['aws-okta.json']))
     if 'aws-policy.json' in contents:
