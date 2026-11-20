@@ -97,10 +97,12 @@ class ManageTests(unittest.TestCase):
         with patch.object(manage, 'execute') as run, patch.object(manage, 'load_settings', return_value=self.settings()):
             manage.main(['login', 'github-copilot'])
             self.assertEqual(run.call_args.args[3], 'github-copilot')
-            manage.main(['login'])
-            self.assertIsNone(run.call_args.args[3])
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                manage.main(['login', 'unknown'])
+            manage.main(['login', 'chatgpt'])
+            self.assertEqual(run.call_args.args[3], 'chatgpt')
+            for argv in (['login'], ['login', 'unknown'], ['auth-status']):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    manage.main(argv)
 
     def test_copilot_auth_status_has_its_own_credential_free_fields(self):
         status = {'instance': 'a' * 32, 'loggedIn': True, 'expiresAt': 2000, 'refreshCount': 1, 'lastRefreshAt': 1000}

@@ -44,7 +44,7 @@ secret-proxy run -- your-command
 secret-proxy stop
 ```
 
-For **ChatGPT/Codex in Pi**, run `secret-proxy login` after starting the proxy.
+For **ChatGPT/Codex in Pi**, run `secret-proxy login chatgpt` after starting the proxy.
 Follow the browser instructions and paste the callback into the terminal's
 hidden prompt. You must log in again after a restart: those OAuth tokens are
 kept in memory, not saved to disk. Other integrations do not require this login.

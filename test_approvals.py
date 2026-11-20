@@ -267,6 +267,8 @@ class ConfigurationTests(unittest.TestCase):
                        template="Bearer {secret}")
         match = manifest.match_placement("EXAMPLE_TOKEN", method="DELETE", allowed={0}, **context)
         self.assertEqual((match.index, match.approval), (0, "prompt"))
+        # The prompt names the rule that asked for approval, not the granted placement.
+        self.assertEqual(match.rule("EXAMPLE_TOKEN"), "EXAMPLE_TOKEN.placements[1]")
         match = manifest.match_placement("EXAMPLE_TOKEN", method="GET", allowed={0}, **context)
         self.assertEqual((match.index, match.approval), (0, None))
         self.assertIsNone(manifest.match_placement("EXAMPLE_TOKEN", method="GET", allowed={1}, **context))

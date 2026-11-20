@@ -347,8 +347,7 @@ def main(argv=None):
     commands.add_parser('status').add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
     for name in ('login', 'auth-status'):
         sub = commands.add_parser(name)
-        sub.add_argument('provider', nargs='?', choices=sorted(LOGINS),
-                         help='Proxy-owned login (default: chatgpt)')
+        sub.add_argument('provider', choices=sorted(LOGINS), help='Proxy-owned login')
         sub.add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
     run = commands.add_parser('run')
     run.add_argument('--client', default=DEFAULT_CLIENT, help=client_help)

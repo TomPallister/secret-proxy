@@ -164,7 +164,7 @@ the separate check that the configured credential and upstream connection work.
 Install Pi separately and enable ChatGPT/Codex during `init`. Then:
 
 ```sh
-secret-proxy login
+secret-proxy login chatgpt
 secret-proxy run -- /absolute/path/to/your/pi
 ```
 
@@ -175,7 +175,7 @@ The client saves a sealed reference in Pi's `openai-codex` auth entry, not the
 real access/refresh tokens. Other provider entries are preserved. Avoid running
 Pi `/login` or `/logout` at the same time.
 
-After every proxy restart, run `secret-proxy login` again. GitHub and other
+After every proxy restart, run `secret-proxy login chatgpt` again. GitHub and other
 vault-backed services do not need this browser login.
 
 ## If something goes wrong
@@ -188,7 +188,7 @@ vault-backed services do not need this browser login.
 | Vault lookup fails | Check item title, runtime vault and service-account read permission. |
 | GitHub returns 401/403 | Check the token's validity, scopes and organisation approval. The proxy cannot grant access your token lacks. |
 | TLS issuer error | Check your organisation's CA bundle; do not disable certificate verification. |
-| ChatGPT stops working after restart | Run `secret-proxy login` again. |
+| ChatGPT stops working after restart | Run `secret-proxy login chatgpt` again. |
 | CLI/link setup fails after sudo | Installation may have partially completed. Keep the files and inspect them using the advanced guide; the first-install helper will not overwrite them on retry. |
 
 Use `secret-proxy stop` explicitly when finished. It retains the CA, configuration

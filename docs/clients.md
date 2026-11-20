@@ -27,7 +27,7 @@ Enable the integration during setup and install with the Pi agent directory you
 want to use. Then:
 
 ```sh
-secret-proxy login
+secret-proxy login chatgpt
 secret-proxy run -- /absolute/path/to/your/pi
 ```
 
@@ -42,7 +42,7 @@ URL to contain the code.
 The proxy performs the OAuth exchange and keeps the real access/refresh tokens
 in RAM. The client saves only sealed references in the selected Pi auth file
 (mode 0600), preserving other providers. Do not run Pi's own `/login` or
-`/logout` concurrently. Restarting the proxy requires `secret-proxy login`
+`/logout` concurrently. Restarting the proxy requires `secret-proxy login chatgpt`
 again; your existing same-account client references can stay in place.
 
 ## Pi with GitHub Copilot

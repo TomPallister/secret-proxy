@@ -9,7 +9,7 @@ launcher configuration. Bootstrap metadata is not a service-account token.
 
 1. `secret-proxy start` prepares the image before desktop approval. Keep its
    terminal attached. A ready instance is left alone.
-2. In another terminal, `secret-proxy login` starts proxy-owned PKCE. Paste the
+2. In another terminal, `secret-proxy login chatgpt` starts proxy-owned PKCE. Paste the
    full callback only into its hidden prompt. No usable OAuth token is saved.
    For GitHub Copilot, run `secret-proxy login github-copilot`: open the URL it
    prints and enter the code. The proxy waits for GitHub, so leave it running.
@@ -55,7 +55,7 @@ Neither command restarts the proxy or changes its CA. Inspect what is trusted wi
 
 ## Optional authentication diagnostics
 
-`secret-proxy auth-status` reads `/chatgpt/status` over authenticated TLS and
+`secret-proxy auth-status chatgpt` reads `/chatgpt/status` over authenticated TLS and
 checks the response against the current boot nonce. The output contains only:
 
 - `instance`: boot nonce, not a credential;

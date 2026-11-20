@@ -75,9 +75,13 @@ class PlacementMatch:
 
     index: int
     approval: str | None
+    # The placement whose approval rule applies, when it isn't *index* (a
+    # scoped client granted only a broader placement).
+    approval_index: int | None = None
 
     def rule(self, secret_name: str) -> str:
-        return f"{secret_name}.placements[{self.index}]"
+        index = self.index if self.approval_index is None else self.approval_index
+        return f"{secret_name}.placements[{index}]"
 
 
 @dataclass
@@ -597,7 +601,7 @@ class SecretManifest:
             name=name, template=template, username=username,
         )
         placements = self._secrets[secret_name].placements
-        approval = next((placements[index] for index in indices if placements[index].approval is not None), None)
+        approval = next((index for index in indices if placements[index].approval is not None), None)
         if allowed is not None:
             indices = tuple(index for index in indices if index in allowed)
         if not indices:
@@ -606,7 +610,7 @@ class SecretManifest:
             if placements[index].approval is not None:
                 return PlacementMatch(index, placements[index].approval)
         if approval is not None:
-            return PlacementMatch(indices[0], approval.approval)
+            return PlacementMatch(indices[0], placements[approval].approval, approval)
         return PlacementMatch(indices[0], None)
 
     def _placement_matches(
