@@ -963,6 +963,11 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(posted[0][2], {"X-Secret-Proxy-Approver": APPROVER, "X-Secret-Proxy-Instance": INSTANCE})
         self.assertNotIn(APPROVER, output)
 
+    def test_each_prompt_rings_the_terminal_bell(self):
+        _posted, output = self.run_loop(["2", "1"])
+        self.assertEqual(output.count("\a"), 2)
+        self.assertIn("An AWS operation needs approval", output)
+
     def test_timeout_posts_nothing_and_interrupt_denies(self):
         posted, _ = self.run_loop([None])
         self.assertEqual(posted, [])

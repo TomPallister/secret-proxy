@@ -413,7 +413,8 @@ def approvals_loop(client: ProxyClient, approver: str, *, fd: int = 0, out=None,
         if status != 200 or len(data) > 65536:
             raise ClientError('The approval endpoint refused this approver')
         prompt = validate_prompt(json.loads(data), instance)
-        print(describe_prompt(prompt), file=out, flush=True)
+        # The terminal bell: terminals flag or sound it when this tab isn't in front.
+        print('\a' + time.strftime('[%H:%M:%S]') + describe_prompt(prompt), file=out, flush=True)
         print('Choice: ', end='', file=out, flush=True)
         try:
             answer = reader(fd, float(prompt['answerAfter']), float(prompt['expiresIn']))
