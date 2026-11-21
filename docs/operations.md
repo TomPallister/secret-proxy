@@ -345,7 +345,9 @@ you list them. Check the networks you need before switching over.
 - Prepare the new image before interrupting the working service. Installation
   and image preparation alone do not replace a running container.
 - At a coordinated checkpoint, stop the selected proxy, wait for controller
-  cleanup, start it from the newly selected release and perform browser login.
+  cleanup and start it from the newly selected release. With a login store,
+  verify restoration through normal use; otherwise perform the required browser
+  or device login. A failed restoration may also require a fresh login.
 - Verify both normal host and container consumers: authenticated nonce, expected
   network isolation, read-only upstream access, signing and real model calls.
   Preserve workspaces and existing same-account sealed client auth. A system-root
