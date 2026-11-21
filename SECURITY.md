@@ -76,6 +76,14 @@ engineering evidence, not a penetration test or a security certification.
   `GH_TOKEN` that is not a reference. gh's own device flow is refused. The
   token can only be added where the manifest places `GH_CLI_OAUTH_TOKEN`.
 
+- Explicit managed `vpnc` networks use an inet output-drop firewall before
+  starting the tunnel, retained through disconnect and route restoration. No
+  client proxy serves until tunnel readiness; no failed VPN start falls back to
+  direct. The trusted gateway bootstraps vault/DNS before the tunnel and uses
+  direct IKE/ESP only to its pinned peer. It holds the bootstrap capability
+  briefly and VPN credentials in RAM; its network/device capabilities make it
+  part of the trusted proxy boundary. See [network limits](docs/networks.md).
+
 ## What is not protected
 
 - **Use of access.** An authorised or compromised client can perform operations
@@ -137,9 +145,11 @@ engineering evidence, not a penetration test or a security certification.
   oldest files (indistinguishable from retention), is not detected. The log
   records request metadata such as hosts, paths and client names: treat it as
   sensitive, and note that root can read or delete it.
-- **An atomic VPN kill switch.** Interface/container watchdogs are secondary.
-  The external VPN owner must enforce fail-closed routes; no live VPN acceptance
-  is claimed merely because the disposable namespace tests pass.
+- **An external gateway's kill switch or real VPN compatibility.** External
+  VPN owners must enforce fail-closed routing; interface/container watchdogs are
+  only secondary checks. Managed-vpnc packet tests exercise its kill switch,
+  but neither synthetic transport nor namespace tests prove a real VPN login,
+  MFA, company DNS or upstream access. No host-wide VPN is implied.
 
 ## Operator guidance
 

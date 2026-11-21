@@ -52,7 +52,7 @@ with socket.socket() as sock:
     port = sock.getsockname()[1]
 policy = {'container': donor, 'network': network, 'interface': 'tunfixture', 'port': 10257,
           'readyFile': '/run/vpn/ready', 'dns': ['127.0.0.1']}
-deployment = host.Deployment.from_dict({'instance': name, 'machine': args.connection, 'port': port, 'network': policy})
+deployment = host.Deployment.from_dict({'instance': name, 'machine': args.connection, 'port': port, 'network': policy}).select_network('legacy')
 results = queue.Queue()
 worker = None
 try:
@@ -73,6 +73,8 @@ shutil.copyfile('/etc/ssl/certs/ca-certificates.crt', root / 'runtime-ca.pem')
     with patch.object(host, 'SA_HOME', local), patch.object(host, 'SHARED_ROOT', local / 'shared'), patch.object(host, 'engine_env', return_value=env):
         deployment.private.mkdir(parents=True, mode=0o700)
         deployment.shared.mkdir(parents=True, mode=0o700)
+        (deployment.private / 'config').mkdir()
+        (deployment.private / 'config/manifest.json').write_text(json.dumps({'schemaVersion': 3, 'account': {'vault': 'Fixture'}, 'secrets': {}}))
         (deployment.private / 'image.json').write_text(json.dumps({'image': image}))
         (deployment.private / 'proxy-token').write_text('a' * 48 + '\n')
         roots = run('run', '--rm', '--network=none', '--entrypoint=/bin/cat', image, '/etc/ssl/certs/ca-certificates.crt')

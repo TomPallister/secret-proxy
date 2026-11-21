@@ -50,6 +50,27 @@ uv run --locked python tests/smoke_vpn.py --connection devenv \
   --image localhost/secret-proxy-candidate:integration --failure gateway
 ```
 
+Managed VPN tests use only synthetic provider/client executables and disposable
+resources on the selected engine (no company VPN or vault calls):
+
+```sh
+uv run --locked python tests/smoke_managed_vpn.py --connection devenv \
+  --image localhost/secret-proxy-candidate:phase2
+uv run --locked python tests/smoke_managed_vpn.py --connection devenv \
+  --image localhost/secret-proxy-candidate:phase2 --failure auth
+uv run --locked python tests/smoke_vpn_firewall.py --connection devenv \
+  --image localhost/secret-proxy-candidate:phase2
+```
+
+The latter uses two **internal** networks for kernel packet tests. Its
+`--mutation open`, `--mutation established` and `--mutation dns` variants must
+fail: they deliberately weaken
+only the disposable fixture's firewall and demonstrate the negative assertions
+are effective. The managed lifecycle test replaces authentication/transport with
+fixtures, but executes the real controller, route script, firewall, relay and
+cleanup. It is not live VPN acceptance. `tests/vpn_mutations.py` checks the unit
+regressions against temporary source mutations and restores every byte.
+
 Optional **live, billable** Pi prompt/compaction/recall acceptance uses an already
 logged-in candidate and temporary sealed-only auth/settings. It never changes the
 original agent directory, enables tools/extensions or saves a session:

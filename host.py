@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ import pwd
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,7 @@ import time
 
 from client import private_read, ProxyClient
 from networking import NetworkPolicy, NetworkError, resolve_gateway, check_gateway, relay_command
+import vpn_profiles
 from runtime import read_bootstrap
 import clientgrants
 import secretstore
@@ -38,7 +41,7 @@ BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
                'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
                'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py',
-               'approvals.py', 'audit.py')
+               'approvals.py', 'audit.py', 'networking.py', 'vpn_profiles.py', 'vpnc_runtime.py')
 
 
 class HostError(Exception):
@@ -51,16 +54,33 @@ class Deployment:
     machine: str
     port: int
     network: NetworkPolicy | None = None
+    networks: dict = field(default_factory=dict)
+    network_name: str = 'direct'
+    vpn: dict | None = None
+
+    def select_network(self, name='direct'):
+        vpn_profiles.network_name(name)
+        if name == 'direct':
+            return replace(self, network=None, vpn=None, network_name='direct')
+        if name == 'legacy' and self.network and not self.networks:
+            return replace(self, network_name='legacy')
+        if name not in self.networks:
+            raise NetworkError('Unknown network; install its private profile before starting')
+        profile = self.networks[name]
+        return replace(self, network=vpn_profiles.gateway_policy(self.instance, profile),
+                       vpn=profile if profile['type'] == 'vpnc' else None, network_name=name)
 
     def to_dict(self):
         result = {'instance': self.instance, 'machine': self.machine, 'port': self.port}
-        if self.network:
+        if self.networks:
+            result['networks'] = self.networks
+        elif self.network:
             result['network'] = self.network.to_dict()
         return result
 
     @classmethod
     def from_dict(cls, data):
-        if not isinstance(data, dict) or set(data) - {'instance', 'machine', 'port', 'network'} or not {'instance', 'machine', 'port'} <= set(data):
+        if not isinstance(data, dict) or set(data) - {'instance', 'machine', 'port', 'network', 'networks'} or not {'instance', 'machine', 'port'} <= set(data):
             raise HostError('Invalid deployment settings')
         if (not isinstance(data['instance'], str) or re.fullmatch(r'[a-z][a-z0-9-]{0,30}', data['instance']) is None
                 or data['instance'] in {'secret-proxy', 'work-vpn'}):
@@ -69,8 +89,16 @@ class Deployment:
             raise HostError('Invalid machine name')
         if type(data['port']) is not int or not 1024 <= data['port'] <= 65535:
             raise HostError('Invalid listen port')
+        if 'network' in data and 'networks' in data:
+            raise HostError('Legacy network and named networks cannot be combined')
         network = NetworkPolicy.from_dict(data['network']) if 'network' in data else None
-        return cls(data['instance'], data['machine'], data['port'], network)
+        networks = vpn_profiles.validate_networks(data.get('networks', {}))
+        reserved = {'sp-' + data['instance'] + suffix for suffix in ('', '-relay', '-vpn')}
+        external = ([network] if network else []) + [vpn_profiles.gateway_policy(data['instance'], p)
+                    for p in networks.values() if p['type'] == 'external']
+        if any(policy.container in reserved for policy in external):
+            raise HostError('External gateway conflicts with instance-owned resource names')
+        return cls(data['instance'], data['machine'], data['port'], network, networks)
 
     @property
     def name(self):
@@ -194,7 +222,8 @@ def prepare(deployment: Deployment):
     ensure_machine(deployment)
     deployment.private.mkdir(mode=0o700, parents=True, exist_ok=True)
     if deployment.network:
-        resolve_gateway(deployment.network, lambda *args: engine(deployment, *args))
+        if not deployment.vpn:
+            resolve_gateway(deployment.network, lambda *args: engine(deployment, *args))
         atomic(deployment.private / 'resolv.conf', ''.join('nameserver ' + ip + '\n' for ip in deployment.network.dns).encode(), 0o644)
     source = ROOT / 'current'
     source_id = json.loads((source / 'source.json').read_text())['commit']
@@ -273,7 +302,72 @@ def publish_client_tokens(deployment: Deployment, tokens: dict):
         atomic(deployment.shared / clientgrants.token_file_name(name), (token + '\n').encode(), 0o600)
 
 
+def open_instance_lock(deployment, *, installer=False):
+    expected = SA_HOME.resolve() / '.config/standalone-secret-proxy' / deployment.instance
+    if deployment.private.resolve() != expected:
+        raise HostError('Unsafe instance lock directory')
+    owner = deployment.private.stat()
+    path = deployment.private / 'serve.lock'
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    created = False
+    try:
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(path, flags)
+    try:
+        metadata = os.fstat(fd)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_size != 0 or metadata.st_mode & 0o077):
+            raise HostError('Unsafe instance lock file')
+        if created and installer:
+            # Only chown an inode this invocation created exclusively. An
+            # existing secagent-controlled hardlink must never be privileged.
+            os.fchown(fd, owner.st_uid, owner.st_gid)
+        elif metadata.st_uid != owner.st_uid:
+            raise HostError('Unexpected instance lock owner')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def serve(deployment: Deployment):
+    if (deployment.network is None) != (deployment.network_name == 'direct'):
+        raise HostError('Select the network explicitly before serving')
+    # Serialize startup and lifetime: concurrent direct/VPN starts must never
+    # remove each other's same-name proxy or overwrite routing metadata.
+    lock = open_instance_lock(deployment)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HostError('Instance already starting/running; stop it explicitly first') from None
+        if engine(deployment, 'container', 'exists', deployment.name).returncode != 1:
+            raise HostError('Instance already exists or cannot be inspected')
+        (deployment.shared / 'ready.json').unlink(missing_ok=True)
+        (deployment.shared / 'network-state.json').unlink(missing_ok=True)
+        bundle = read_bootstrap(sys.stdin.fileno())
+        try:
+            check_login_vault(deployment, bundle.get('login_vault'))
+            if deployment.vpn:
+                from vpn_gateway import ManagedGateway
+                profiles = vpn_profiles.load_networks((deployment.private / 'config/networks.json').read_bytes())
+                if profiles.get(deployment.network_name) != deployment.vpn:
+                    raise HostError('Installed network profile differs from registration')
+                record = json.loads(private_read(deployment.private / 'image.json', 4096))
+                with ManagedGateway(deployment, record['image'], bundle,
+                        lambda *a, **kw: engine(deployment, *a, **kw),
+                        lambda a: [PODMAN, '--connection', deployment.machine, *a], engine_env()):
+                    return serve_proxy(deployment, bundle)
+            return serve_proxy(deployment, bundle)
+        finally:
+            bundle.clear()
+    finally:
+        os.close(lock)
+
+
+def serve_proxy(deployment: Deployment, bundle):
     if engine(deployment, 'container', 'exists', deployment.name).returncode == 0:
         raise HostError('Instance already exists; stop it explicitly before starting')
     gateway = None
@@ -284,7 +378,6 @@ def serve(deployment: Deployment):
             raise HostError('Candidate relay already exists; refusing to replace it')
     record = json.loads(private_read(deployment.private / 'image.json', 4096))
     image = record['image']
-    bundle = read_bootstrap(sys.stdin.fileno())
     proxy_file = deployment.private / 'proxy-token'
     if not proxy_file.exists():
         atomic(proxy_file, (secrets.token_hex(24) + '\n').encode(), 0o600)
@@ -339,6 +432,8 @@ def serve(deployment: Deployment):
                     client = ProxyClient({'sharedDir': str(deployment.shared), 'port': deployment.port})
                     if client.call('/health') != status:
                         raise HostError('Candidate relay did not reach the expected proxy')
+                atomic(deployment.shared / 'network-state.json', json.dumps({
+                    'instance': status['instance'], 'network': deployment.network_name}).encode() + b'\n')
                 atomic(ready, result.stdout)  # publish readiness LAST
                 print('Candidate ready. Keep this command attached; use stop for explicit shutdown.', flush=True)
                 if gateway:
@@ -354,6 +449,7 @@ def serve(deployment: Deployment):
         raise HostError('Candidate failed readiness')
     finally:
         ready.unlink(missing_ok=True)
+        (deployment.shared / 'network-state.json').unlink(missing_ok=True)
         approver_file.unlink(missing_ok=True)
         if relay_id:
             try:
@@ -372,10 +468,11 @@ def serve(deployment: Deployment):
 
 
 def stop_instance(deployment):
-    """Idempotently stop only this instance, never its externally owned gateway."""
+    """Stop this instance's proxy/relay and managed VPN, never external gateways."""
     (deployment.shared / 'ready.json').unlink(missing_ok=True)
+    (deployment.shared / 'network-state.json').unlink(missing_ok=True)
     names = [deployment.name]
-    if deployment.network:
+    if deployment.network or deployment.networks:
         names.append(deployment.name + '-relay')
     for name in names:
         exists = engine(deployment, 'container', 'exists', name)
@@ -387,6 +484,25 @@ def stop_instance(deployment):
             raise HostError('Invalid candidate identity')
         # Pin the exact instance before stopping; never act on the VPN name/ID.
         checked(engine(deployment, 'rm', '-f', identifier, timeout=30), 'candidate stop')
+    if any(profile['type'] == 'vpnc' for profile in deployment.networks.values()):
+        from vpn_gateway import inspect_owned
+        name = deployment.name + '-vpn'
+        exists = engine(deployment, 'container', 'exists', name)
+        if exists.returncode == 0:
+            try:
+                row = inspect_owned(lambda *a: engine(deployment, *a), 'container', name, deployment.instance)
+            except NetworkError:
+                if engine(deployment, 'container', 'exists', name).returncode == 1:
+                    return  # The exiting controller already removed its gateway.
+                raise
+            identifier = row.get('Id') or row.get('ID')
+            if not isinstance(identifier, str) or re.fullmatch(r'[a-f0-9]{64}', identifier) is None:
+                raise HostError('Invalid managed VPN identity')
+            result = engine(deployment, 'rm', '-f', identifier, timeout=30)
+            if result.returncode and engine(deployment, 'container', 'exists', identifier).returncode != 1:
+                checked(result, 'managed VPN stop')
+        elif exists.returncode != 1:
+            raise HostError('Managed VPN inspection failed')
 
 
 def approvals_session(deployment: Deployment):
@@ -490,16 +606,17 @@ def load_deployment(instance: str) -> Deployment:
     path = ROOT / 'instances' / (instance + '.json')
     if path.stat().st_uid != 0:
         raise HostError('Instance policy must be root-owned')
-    deployment = Deployment.from_dict(json.loads(private_read(path, 4096)))
+    deployment = Deployment.from_dict(json.loads(private_read(path, 32768), object_pairs_hook=vpn_profiles.unique_object))
     if deployment.instance != instance:
         raise HostError('Instance policy identity mismatch')
     return deployment
 
 
-def as_secagent(command: str, instance: str) -> list:
+def as_secagent(command: str, instance: str, network_name='direct') -> list:
     env = engine_env()
+    suffix = ['--network', vpn_profiles.network_name(network_name)] if network_name != 'direct' else []
     return ['/usr/bin/sudo', '-n', '-u', 'secagent', '/usr/bin/env', '-i',
-            *[k + '=' + v for k, v in env.items()], PYTHON, str(ROOT / 'current/host.py'), command, instance]
+            *[k + '=' + v for k, v in env.items()], PYTHON, str(ROOT / 'current/host.py'), command, instance, *suffix]
 
 
 def relay_exec(argv: list, bundle: dict):
@@ -541,8 +658,13 @@ def main():
     parser.add_argument('instance')
     parser.add_argument('--bootstrap', type=Path)
     parser.add_argument('--op', type=Path, help='Absolute desktop-integrated op executable (up only)')
+    parser.add_argument('--network', default='direct', help='Explicit network profile; omitted means direct')
     args = parser.parse_args()
+    if args.network != 'direct' and args.command not in ('up', 'prepare', 'serve'):
+        raise HostError('Network selection is only valid for startup')
     deployment = load_deployment(args.instance)
+    if args.command in ('up', 'prepare', 'serve'):
+        deployment = deployment.select_network(args.network)
     if args.bootstrap:
         args.bootstrap = args.bootstrap.resolve(strict=True)
     os.chdir('/')
@@ -550,7 +672,7 @@ def main():
         if not args.bootstrap or not args.op or not args.op.is_absolute() or not args.op.is_file():
             raise HostError('up requires --bootstrap and an absolute --op path')
         checked(subprocess.run(['/usr/bin/sudo', '-v'], timeout=120), 'sudo authentication')
-        checked(subprocess.run(as_secagent('prepare', args.instance), timeout=1200), 'candidate preparation')
+        checked(subprocess.run(as_secagent('prepare', args.instance, args.network), timeout=1200), 'candidate preparation')
         checked(subprocess.run(['/usr/bin/sudo', '-v'], timeout=120), 'sudo refresh')
         config = json.loads(private_read(args.bootstrap, 16384))
         validate_bootstrap_config(config)
@@ -563,7 +685,7 @@ def main():
         bundle = {'op_token': capability, 'proxy_token': '0' * 48}
         if 'loginVault' in config:
             bundle['login_vault'] = config['loginVault']
-        relay_exec(as_secagent('serve', args.instance), bundle)
+        relay_exec(as_secagent('serve', args.instance, args.network), bundle)
         raise AssertionError('exec unexpectedly returned')
     if os.getuid() != pwd.getpwnam('secagent').pw_uid:
         if args.command not in ('stop', 'approvals', 'audit-export'):

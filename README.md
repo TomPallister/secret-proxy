@@ -29,7 +29,7 @@ or replace an existing installation.
 ## Everyday use
 
 ```sh
-secret-proxy start                 # terminal 1: keep attached
+secret-proxy start                 # terminal 1: direct; keep attached
 secret-proxy status                # terminal 2: authenticated readiness
 secret-proxy run -- your-command
 secret-proxy login chatgpt         # optional: first Codex login or recovery
@@ -54,6 +54,10 @@ tokens. First use (including `auth-status`) can restore a saved login.
 if configured; it does not revoke upstream access. Check reported save/delete
 failures before stopping; see [stored logins](docs/operations.md#stored-logins).
 The proxy is foreground, not a background service; use `stop` explicitly.
+
+VPN is opt-in on **each start**: `secret-proxy start --network office-vpn` selects
+an installed [network profile](docs/networks.md). Plain `start` is direct, never
+remembers a VPN, and refuses to switch a running instance silently.
 
 macOS Go tools such as gh ignore `SSL_CERT_FILE`. With a name-constrained CA
 (the setup default), `secret-proxy trust-ca` adds it to your login keychain;

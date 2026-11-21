@@ -289,8 +289,35 @@ def audit_command(settings: dict, action: str, public_key=None, paths=(), destin
     return audit.verify_command(public_key, list(paths))
 
 
+def current_network(settings):
+    """Read only nonce-bound routing metadata after authenticated readiness."""
+    shared = SHARED_ROOT / settings['instance']
+    try:
+        raw = private_read(shared / 'network-state.json', 4096)
+    except FileNotFoundError:
+        # An older direct deployment has no state file. Never guess for a
+        # registered VPN/catalog: stop/start through this controller first.
+        registration = json.loads(private_read(ROOT / 'instances' / (settings['instance'] + '.json'), 32768))
+        try:
+            Deployment.from_dict(registration)
+        except (HostError, TypeError, ValueError):
+            raise ClientError('Invalid installed registration; cannot determine running network') from None
+        if 'network' in registration or 'networks' in registration:
+            raise ClientError('Running network is unknown; stop, then start explicitly') from None
+        return 'direct'
+    state = json.loads(raw)
+    ready = json.loads(private_read(shared / 'ready.json', 4096))
+    from vpn_profiles import network_name
+    if (not isinstance(state, dict) or set(state) != {'instance', 'network'}
+            or not isinstance(ready, dict) or ready.get('status') != 'ready'
+            or not isinstance(state['instance'], str) or re.fullmatch(r'[a-f0-9]{32}', state['instance']) is None
+            or state['instance'] != ready.get('instance')):
+        raise ClientError('Network state does not match this boot; stop, then start explicitly')
+    return network_name(state['network'])
+
+
 def execute(settings: dict, command: str, argv=(), provider: str | None = None,
-            client_name: str = DEFAULT_CLIENT):
+            client_name: str = DEFAULT_CLIENT, *, network_name='direct'):
     instance = settings['instance']
     check_client_name(client_name)
     # Only commands acting as a client take --client; lifecycle and CA trust
@@ -305,11 +332,15 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None,
         except (OSError, ClientError):
             pass
         else:
+            active = current_network(settings)
+            if active != network_name:
+                raise ClientError('Proxy is running with a different network; stop, then start with the intended selection')
             print('Proxy already ready; left running unchanged. Use stop, then start for an explicit restart.')
             return
         if not os.isatty(0) or not os.isatty(1):
             raise ClientError('Start needs an attached terminal for sudo and desktop approval')
-        os.execv(PYTHON, [PYTHON, host, 'up', instance, '--bootstrap', settings['bootstrap'], '--op', settings['op']])
+        suffix = ['--network', network_name] if network_name != 'direct' else []
+        os.execv(PYTHON, [PYTHON, host, 'up', instance, '--bootstrap', settings['bootstrap'], '--op', settings['op'], *suffix])
     elif command == 'stop':
         pids = controller_pids(instance)
         subprocess.run([PYTHON, host, 'stop', instance], check=True)
@@ -318,7 +349,7 @@ def execute(settings: dict, command: str, argv=(), provider: str | None = None,
               'unless the manifest has a loginStore.')
     elif command == 'status':
         selected_client(settings, client_name).check_ready()
-        print('Proxy ready (authenticated instance check; vault/upstreams not tested)')
+        print('Proxy ready (authenticated instance check; vault/upstreams not tested); network: ' + current_network(settings))
     elif command == 'auth-status':
         print(json.dumps(auth_status(selected_client(settings, client_name), settings, provider or 'chatgpt'), indent=2))
     elif command == 'login':
@@ -355,7 +386,9 @@ def main(argv=None):
                         help='Private metadata file, never a token file')
     commands = parser.add_subparsers(dest='command', required=True)
     client_help = 'Scoped client whose token to use (default: default)'
-    for name in ('start', 'stop', 'trust-ca', 'untrust-ca', 'approvals'):
+    commands.add_parser('start').add_argument('--network', default='direct',
+        help='Installed network profile; omitted means direct, never the last selection')
+    for name in ('stop', 'trust-ca', 'untrust-ca', 'approvals'):
         commands.add_parser(name)
     commands.add_parser('status').add_argument('--client', default=DEFAULT_CLIENT, help=client_help)
     for name in ('login', 'logout', 'auth-status'):
@@ -381,7 +414,7 @@ def main(argv=None):
         sys.exit(audit_command(load_settings(args.config), args.action, getattr(args, 'public_key', None),
                                getattr(args, 'paths', ()), getattr(args, 'destination', None)))
     execute(load_settings(args.config), args.command, getattr(args, 'argv', ()), getattr(args, 'provider', None),
-            getattr(args, 'client', DEFAULT_CLIENT))
+            getattr(args, 'client', DEFAULT_CLIENT), network_name=getattr(args, 'network', 'direct'))
 
 
 if __name__ == '__main__':

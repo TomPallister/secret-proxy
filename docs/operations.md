@@ -7,15 +7,19 @@ launcher configuration. Bootstrap metadata is not a service-account token.
 
 ## Start, login and stop
 
-1. `secret-proxy start` prepares the image before desktop approval. Keep its
-   terminal attached. A ready instance is left alone.
+1. `secret-proxy start` selects **direct egress**, preparing the image before
+   desktop approval. Keep its terminal attached. To explicitly select an installed
+   VPN, use `secret-proxy start --network office-vpn`; see [networks](networks.md).
+   The previous choice is never remembered. A ready instance on the same network
+   is left alone; a different network requires explicit stop/start.
 2. In another terminal, `secret-proxy login chatgpt` starts proxy-owned PKCE. Paste the
    full callback only into its hidden prompt. The client saves only a sealed
    record; optional proxy-side persistence is described below.
    For GitHub Copilot, run `secret-proxy login github-copilot`: open the URL it
    prints and enter the code. The proxy waits for GitHub, so leave it running.
    `secret-proxy login github` works the same way for the GitHub CLI.
-3. `secret-proxy status` checks authenticated TLS and the current boot nonce.
+3. `secret-proxy status` checks authenticated TLS and the current boot nonce,
+   and reports the active network.
    This is liveness, not proof that every upstream integration works.
 4. Use clients through their existing, explicitly selected adapters, or
    `secret-proxy run -- /absolute/path/to/client`. Host programs must support

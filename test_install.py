@@ -63,6 +63,7 @@ class InstallTests(unittest.TestCase):
             stack.enter_context(patch('macos_install.os.chown'))
             stack.enter_context(patch('macos_install.root_owned'))
             commands = stack.enter_context(patch('macos_install.run'))
+            stopped = stack.enter_context(patch('macos_install.require_stopped_resources'))
             account = SimpleNamespace(pw_uid=user.pw_uid, pw_gid=user.pw_gid)
             stack.enter_context(patch('macos_install.ensure_account', return_value=account))
             for module in (host, installer):
@@ -95,9 +96,40 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(config.stat().st_mtime_ns, before)
             self.assertEqual((prefix / 'current').resolve(), prefix / 'releases' / ('a' * 40))
             self.assertFalse(any('podman' in str(c) for c in commands.call_args_list))
+            from test_vpn_selection import external
+            catalog = {'version': 1, 'networks': {'corp-vpn': external()}}
+            (source / 'networks.json').write_text(json.dumps(catalog))
+            with self.assertRaises(host.HostError):
+                installer.install(args)  # No implicit private-policy overwrite.
+            args.update_networks = True
+            (deployment.shared / 'ready.json').write_text('{}')
+            with self.assertRaisesRegex(host.HostError, 'Stop'):
+                installer.install(args)
+            (deployment.shared / 'ready.json').unlink()
+            installer.install(args)
+            stopped.assert_called_once()
+            registered = json.loads((prefix / 'instances/candidate.json').read_text())
+            self.assertEqual(registered['networks'], catalog['networks'])
+            self.assertEqual(config.stat().st_mtime_ns, before)
+            self.assertEqual((deployment.private / 'config/networks.json').read_text(), json.dumps(catalog))
+            # Network updates cannot override manifest/CA/AWS/client policy.
+            (source / 'manifest.json').write_text((source / 'manifest.json').read_text() + '\n')
+            with self.assertRaisesRegex(host.HostError, 'private policy'):
+                installer.install(args)
             args.port += 1
             with self.assertRaises(host.HostError):
                 installer.install(args)
+
+    def test_network_update_requires_all_owned_resources_absent_and_engine_available(self):
+        deployment = host.Deployment('candidate', 'secagent', 10260)
+        for result in (0, 125):
+            with patch.object(installer.subprocess, 'run', return_value=subprocess.CompletedProcess([], result)) as run:
+                with self.assertRaises(host.HostError): installer.require_stopped_resources(deployment)
+                self.assertIn('exists', run.call_args.args[0])
+        with patch.object(installer.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)) as run:
+            installer.require_stopped_resources(deployment)
+            self.assertEqual([c.args[0][-1] for c in run.call_args_list], ['sp-candidate', 'sp-candidate-relay', 'sp-candidate-vpn'])
+            self.assertTrue(all(c.args[0][:4] == ['/usr/bin/sudo', '-n', '-u', 'secagent'] for c in run.call_args_list))
 
     def test_name_constrained_ca_opt_in_is_validated_and_copied_as_policy(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -46,7 +46,7 @@ class ManageTests(unittest.TestCase):
                 'up', 'candidate', '--bootstrap', settings['bootstrap'], '--op', settings['op']])
 
     def test_start_is_idempotent_and_never_restarts_a_ready_proxy(self):
-        with patch.object(manage, 'selected_client', return_value=Mock()), patch.object(manage.os, 'execv') as execute, patch.object(manage.os, 'isatty', return_value=True), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(manage, 'current_network', return_value='direct'), patch.object(manage, 'selected_client', return_value=Mock()), patch.object(manage.os, 'execv') as execute, patch.object(manage.os, 'isatty', return_value=True), contextlib.redirect_stdout(io.StringIO()):
             manage.execute(self.settings(), 'start')
             execute.assert_not_called()
 

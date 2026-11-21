@@ -562,11 +562,15 @@ fresh machine it creates only the required private config mount.
 
 ## Optional externally managed VPN
 
-Without `network.json` the candidate uses direct egress. Internal hosts
-reached through a VPN usually resolve to private addresses, which are refused
-unless listed in `egress.allowPrivateCidrs` (see [egress controls](#egress-controls)). To attach to an already
-running VPN container on the **same secagent engine**, add external private
-`network.json` before registering a **new** candidate instance:
+Prefer named profiles in [networks.json](networks.md), with explicit
+`secret-proxy start --network office-vpn`. Managed IPsec/XAUTH and externally
+owned gateways are supported. **Plain `start` always selects direct egress**;
+there is no VPN-enabled default or remembered selection.
+
+Legacy `network.json` registrations below require `start --network legacy`.
+Internal hosts are still refused unless narrowly listed in
+`egress.allowPrivateCidrs` (see [egress controls](#egress-controls)). This older
+format attaches to an already running gateway on the **same secagent engine**:
 
 ```json
 {
@@ -591,7 +595,8 @@ Interface loss stops the proxy; gateway loss withdraws readiness and removes the
 candidate relay. Neither causes a direct-egress fallback. The external owner
 must itself enforce **fail-closed routing**: periodic watchdogs are secondary
 checks, not atomic routing enforcement or proof of an authenticated tunnel.
-A gateway restart needs an explicit candidate restart (and ChatGPT login).
-
-Do not alter the existing direct candidate's policy in place or start a duplicate
-VPN login. A live VPN rehearsal still requires operator coordination.
+A gateway restart needs an explicit proxy restart (with login restoration if
+configured). The [network guide](networks.md#installation-and-updates) describes
+explicit catalog-only updates to stopped instances. Other policy changes remain
+separate and reviewed. Do not start a duplicate VPN login; a real VPN rehearsal
+requires operator coordination.

@@ -25,3 +25,6 @@
 !constrainedca.py
 !approvals.py
 !audit.py
+!networking.py
+!vpn_profiles.py
+!vpnc_runtime.py

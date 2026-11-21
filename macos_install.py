@@ -24,6 +24,7 @@ from client import private_read, validate_config
 from host import Deployment, HostError, PODMAN, PYTHON, ROOT, SA_HOME, SHARED_ROOT
 from egress import EgressConfigError
 from secretstore import LoginStoreConfigError, SecretManifest, check_login_vault
+import vpn_profiles
 
 GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
@@ -31,10 +32,10 @@ FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
          'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
          'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
-         'manage.py', 'secret-proxy', 'capolicy.py', 'constrainedca.py', 'approvals.py', 'audit.py')
+         'manage.py', 'secret-proxy', 'vpn_profiles.py', 'vpn_gateway.py', 'vpnc_runtime.py', 'capolicy.py', 'constrainedca.py', 'approvals.py', 'audit.py')
 # Private policy copied into the instance's read-only /config (bootstrap metadata
 # stays desktop-side). ca.json opts into a name-constrained CA.
-POLICY_FILES = ('manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem', 'ca.json')
+POLICY_FILES = ('manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem', 'ca.json', 'networks.json')
 
 
 def root_owned(path: Path):
@@ -114,7 +115,7 @@ def validate_source_config(source: Path):
     if source.is_symlink():
         raise HostError('Refusing a symlinked configuration directory')
     for path in source.iterdir():
-        if path.name not in {'manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem', 'bootstrap.json', 'client-environment.json', 'network.json', 'ca.json'}:
+        if path.name not in {'manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem', 'bootstrap.json', 'client-environment.json', 'network.json', 'networks.json', 'ca.json'}:
             raise HostError('Unexpected private configuration file')
         if not path.is_file() or path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
             raise HostError('Invalid private configuration file')
@@ -128,6 +129,10 @@ def validate_source_config(source: Path):
             raise HostError('Invalid clients section: ' + str(error)) from None
         except LoginStoreConfigError as error:
             raise HostError('Invalid loginStore section: ' + str(error)) from None
+    if 'networks.json' in contents:
+        if 'network.json' in contents:
+            raise HostError('Use networks.json or legacy network.json, not both')
+        vpn_profiles.validate_secrets(vpn_profiles.load_networks(contents['networks.json']), loaded)
     if 'bootstrap.json' in contents:
         # The bootstrap item must declare exactly the manifest's login vault.
         try:
@@ -161,7 +166,46 @@ def activate(release: Path):
     os.replace(link, ROOT / 'current')
 
 
+def require_stopped_resources(deployment):
+    from host import engine_env
+    env = engine_env()
+    prefix = ['/usr/bin/sudo', '-n', '-u', 'secagent', '/usr/bin/env', '-i',
+              *[key + '=' + value for key, value in env.items()], PODMAN,
+              '--connection', deployment.machine, 'container', 'exists']
+    for suffix in ('', '-relay', '-vpn'):
+        result = subprocess.run(prefix + [deployment.name + suffix], stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=15)
+        if result.returncode != 1:
+            raise HostError('Stop all instance resources before updating networks; engine inspection must succeed')
+
+
 def install(args):
+    if not getattr(args, 'update_networks', False):
+        return install_snapshot(args)
+    if sys.platform != 'darwin' or os.getuid() != 0 or os.environ.get('SUDO_USER') in (None, '', 'root'):
+        raise HostError('Run with sudo from your own macOS account')
+    deployment = Deployment.from_dict({'instance': args.instance, 'machine': args.machine, 'port': args.port})
+    if deployment.private.is_symlink() or not deployment.private.is_dir():
+        raise HostError('Network updates require an existing installation')
+    # Metadata-only change, but require an explicitly stopped instance and hold
+    # the same lock as serve throughout validation/staging/publication.
+    import fcntl
+    from host import open_instance_lock
+    fd = open_instance_lock(deployment, installer=True)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise HostError('Stop the instance before updating networks') from None
+        if (deployment.shared / 'ready.json').exists():
+            raise HostError('Stop the instance before updating networks')
+        require_stopped_resources(deployment)
+        return install_snapshot(args)
+    finally:
+        os.close(fd)
+
+
+def install_snapshot(args):
     if sys.platform != 'darwin' or os.getuid() != 0 or os.environ.get('SUDO_USER') in (None, '', 'root'):
         raise HostError('Run with sudo from your own macOS account')
     caller = pwd.getpwnam(os.environ['SUDO_USER'])
@@ -172,6 +216,8 @@ def install(args):
     policy = {'instance': args.instance, 'machine': args.machine, 'port': args.port}
     if 'network.json' in contents:
         policy['network'] = json.loads(contents['network.json'])
+    if 'networks.json' in contents:
+        policy['networks'] = vpn_profiles.load_networks(contents['networks.json'])
     deployment = Deployment.from_dict(policy)
     environment = json.loads(contents.get('client-environment.json', b'{}'))
     client = {'sharedDir': str(deployment.shared), 'port': args.port, 'environment': environment}
@@ -192,12 +238,21 @@ def install(args):
     existing = registration.exists() or deployment.private.exists() or deployment.shared.exists()
     if existing:
         expected_registration = deployment.to_dict()
+        existing_registration = json.loads(private_read(registration, 32768))
+        old_registration, new_registration = dict(existing_registration), dict(expected_registration)
+        if getattr(args, 'update_networks', False):
+            for value in (old_registration, new_registration):
+                value.pop('networks', None)
+                value.pop('network', None)
         if (not registration.is_file() or not deployment.private.is_dir() or not deployment.shared.is_dir()
-                or json.loads(private_read(registration, 4096)) != expected_registration
+                or old_registration != new_registration
                 or json.loads(private_read(deployment.shared / 'client.json', 65536)) != client):
             raise HostError('Existing instance differs; choose a new candidate name (no implicit overwrite)')
         actual = {p.name: private_read(p, 2 * 1024 * 1024) for p in (deployment.private / 'config').iterdir()}
         expected = {name: value for name, value in contents.items() if name in POLICY_FILES}
+        if getattr(args, 'update_networks', False):
+            actual.pop('networks.json', None)
+            expected.pop('networks.json', None)
         if actual != expected:
             raise HostError('Existing private policy differs; no implicit overwrite')
     release = ROOT / 'releases' / args.commit
@@ -216,8 +271,17 @@ def install(args):
             staged.rename(release)
     release.chmod(0o755)  # Also repair byte-verified releases staged with umask 077.
     if existing:
+        if getattr(args, 'update_networks', False):
+            from host import atomic
+            path = deployment.private / 'config/networks.json'
+            if 'networks.json' in contents:
+                atomic(path, contents['networks.json'], 0o644)
+            else:
+                path.unlink(missing_ok=True)
+            atomic(registration, json.dumps(deployment.to_dict()).encode() + b'\n', 0o644)
+            print('Explicit network catalog update applied to stopped instance; other policy and client settings retained.')
         activate(release)
-        print('Identical instance policy retained; committed release staged. No running service changed.')
+        print('Committed release staged. No running service changed.')
         return
     account = ensure_account()
     for path in (deployment.private.parent, deployment.private):
@@ -264,6 +328,8 @@ def main():
     parser.add_argument('--machine', default='secagent')
     parser.add_argument('--port', type=int, default=10260)
     parser.add_argument('--agent-dir', type=Path)
+    parser.add_argument('--update-networks', action='store_true',
+                        help='Explicitly update only network profiles on a stopped existing instance')
     install(parser.parse_args())
 
 

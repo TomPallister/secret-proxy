@@ -30,6 +30,8 @@ not exempt the project from provenance review or users from upstream terms.
 | saml2aws 2.36.19 | MIT at project level | Its compiled Go dependency tree still needs a binary-level review before image distribution. |
 | oathtool (Debian package) | GPL-3+; package also lists LGPL-2.1+ material | Invoked as a separate program. Distributing the executable needs the relevant notices and corresponding-source compliance. |
 | socat (Debian package) | GPL-2 with OpenSSL exception plus other licensed files | Separate executable; retain component-specific notices and comply with source obligations for the actual package version. |
+| vpnc and vpnc-scripts (Debian packages) | GPL-2+; vpnc also contains BSD-2-clause material | Managed VPN invokes the unmodified programs as separate processes. Preserve notices and satisfy corresponding-source obligations before image redistribution. |
+| nftables (Debian package) | GPL-2 with file-specific GPL-2+ and other notices | Invoked as a separate executable for the managed VPN kill switch; include its libraries and actual package notices in any image review. |
 | 1Password CLI 2.42.0 | Proprietary terms | No affirmative permission to redistribute it in a public image has been established. Do not publish an image containing it without permission/clarification. |
 | Python/Debian base and uv 0.8.17 | Multiple component licences | A complete image review must include base packages and native/transitive components, not just Python metadata. |
 

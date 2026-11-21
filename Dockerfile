@@ -19,6 +19,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
       jq \
       oathtool \
       socat \
+      vpnc \
+      vpnc-scripts \
+      nftables \
     && rm -rf /var/lib/apt/lists/* \
     && oathtool --version | head -1
 
@@ -107,7 +110,7 @@ RUN apt-get purge -y --auto-remove curl xz-utils unzip jq \
       /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.13
 
 # Explicit source allowlist: never copy private configuration or certificates.
-COPY addon.py entry.py sigv4.py awscreds.py awsops.py googlecreds.py auth0creds.py oauthcreds.py chatgptcreds.py githubdevice.py copilotcreds.py ghclicreds.py loginstore.py sealedjwt.py gitsign.py egress.py secretstore.py clientgrants.py runtime.py capolicy.py constrainedca.py approvals.py audit.py /opt/secret-proxy/
+COPY addon.py entry.py sigv4.py awscreds.py awsops.py googlecreds.py auth0creds.py oauthcreds.py chatgptcreds.py githubdevice.py copilotcreds.py ghclicreds.py loginstore.py sealedjwt.py gitsign.py egress.py secretstore.py clientgrants.py runtime.py capolicy.py constrainedca.py approvals.py audit.py networking.py vpn_profiles.py vpnc_runtime.py /opt/secret-proxy/
 RUN useradd --uid 1000 --create-home --shell /bin/bash secretproxy \
     && mkdir -p /data/mitmproxy /run/secret-proxy \
     && chown -R 1000:1000 /data /run/secret-proxy

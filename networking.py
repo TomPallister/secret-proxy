@@ -1,7 +1,7 @@
-"""Attach to an externally owned VPN namespace without managing its lifecycle.
+"""Inspect a pinned VPN namespace and construct a credential-free TCP relay.
 
-The external owner is responsible for authenticated tunnel setup and fail-closed
-routing. This controller never starts, removes, restarts or reconfigures it.
+These helpers never change the gateway. External owners provide authenticated
+setup and fail-closed routing; managed vpnc lifecycle lives in vpn_gateway.py.
 """
 from __future__ import annotations
 
