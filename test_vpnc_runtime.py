@@ -138,6 +138,62 @@ class VpncTests(unittest.TestCase):
                 vpn.hook({'reason': 'disconnect', 'TUNDEV': 'tun0', 'INTERNAL_IP4_DNS': '10.20.0.53'})
             self.assertFalse(ready.exists())
 
+    def test_real_vpnc_pre_init_has_no_tundev_yet(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp) / 'ready'
+            with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run') as run:
+                accepted = True
+                try:
+                    vpn.hook({'reason': 'pre-init'})
+                except ValueError:
+                    accepted = False
+                self.assertTrue(accepted, 'Packaged vpnc pre-init must not require TUNDEV')
+                run.assert_called_once()
+                self.assertNotIn('TUNDEV', run.call_args.kwargs['env'])
+                self.assertFalse(ready.exists())
+                self.assertEqual((ready.parent / 'hook-status').read_text(), 'negotiating\n')
+
+    def test_invalid_hook_withdraws_readiness_and_records_only_a_code(self):
+        import tempfile
+        from pathlib import Path
+        for env in ({'reason': 'connect'}, {'reason': 'connect', 'TUNDEV': 'eth0'},
+                    {'reason': 'pre-init', 'TUNDEV': 'eth0'}, {'reason': 'synthetic-secret'}):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as tmp:
+                ready = Path(tmp) / 'ready'; ready.touch()
+                with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run') as run:
+                    with self.assertRaises(ValueError): vpn.hook(env)
+                    run.assert_not_called()
+                self.assertFalse(ready.exists())
+                self.assertEqual((ready.parent / 'hook-status').read_text(), 'hook-rejected\n')
+
+    def test_first_hook_failure_survives_disconnect_and_cannot_publish_ready(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp) / 'ready'; ready.touch()
+            with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run') as run:
+                vpn.record_hook_stage('challenge-refused')
+                vpn.record_hook_stage('disconnected')
+                self.assertEqual(vpn.hook_stage(), 'challenge-refused')
+                for reason in ('connect', 'disconnect'):
+                    with self.assertRaises(ValueError):
+                        vpn.hook({'reason': reason, 'TUNDEV': 'tun0'})
+                    self.assertFalse(ready.exists())
+                    self.assertEqual(vpn.hook_stage(), 'challenge-refused')
+                run.assert_not_called()
+
+    def test_hook_status_is_bounded_and_rejects_arbitrary_data(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp) / 'ready'
+            with patch.object(vpn, 'READY', ready):
+                for data in (b'x' * 100000, b'private-value', b'\xff'):
+                    (ready.parent / 'hook-status').write_bytes(data)
+                    self.assertEqual(vpn.hook_stage(), 'hook-rejected')
+
     def test_connect_requires_full_tunnel_route_before_readiness(self):
         import subprocess
         import tempfile

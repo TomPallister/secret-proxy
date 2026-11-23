@@ -192,6 +192,39 @@ startup. It does not delete the owned network, other gateways, ciphertext,
 policy, CA or login store. After an engine outage or failed cleanup, inspect the
 instance and use explicit stop; never delete a whole machine to recover.
 
+## Diagnosing a failed start
+
+Managed startup reports only a fixed stage code, for example
+`Managed VPN failed readiness (stage: vault); no direct fallback`.
+Raw provider/client output, prompts, usernames, host addresses, credentials and
+exception messages are not forwarded. The stage describes the last operation,
+not necessarily its underlying cause:
+
+- `launch`, `profile`, `bootstrap`: engine/image launch, installed configuration,
+  or capability-bundle intake.
+- `vault`, `peer-resolution`, `firewall`, `configuration`: selected credential
+  lookup, peer/interface discovery, kill-switch installation, or private client
+  configuration.
+- `negotiating`, `client-exited`, `startup-timeout`: the VPN client started but
+  never completed readiness. These codes alone do not prove incorrect credentials.
+- `challenge-refused`: the one-shot helper rejected a prompt, identity, deadline
+  or repeated invocation. Do not retry authentication in a loop.
+- `route-script-failed`, `full-tunnel-required`, `hook-rejected`: the distro hook
+  failed, full-tunnel routes were absent, or an unexpected event/interface was
+  supplied. The proxy does not force routes or relax the interface requirement.
+
+The packaged client calls `pre-init` before it defines `TUNDEV`; this event alone
+may omit it. Connect/disconnect events still require exactly `tun0`. A failed
+hook withdraws readiness and its first failure is retained through cleanup.
+The controller, rather than Podman's auto-removal, removes the exact owned
+container ID, so a fast startup failure cannot race away its final status.
+Status frames cannot establish readiness or authorize traffic.
+
+Inspect the stage and installed profile before a coordinated retry. If restoring
+direct service is desired, explicitly stop and then use plain `start`; it is
+never an automatic recovery action. Old versions' generic readiness errors do
+not contain enough evidence to identify which stage failed.
+
 ## Verification scope
 
 Unit/mutation tests cover strict configuration, selection, ownership, startup
@@ -201,4 +234,8 @@ firewall, namespace, TLS relay, tunnel loss and a later direct start preserving
 endpoint/trust/capability. Separate packet tests prove direct IPv4, IPv6,
 established TCP and restored-route traffic are blocked, with positive controls.
 Off-tunnel UDP DNS is also blocked, with a permitted tunnel-path control.
-These tests do not prove a real gateway login, MFA policy, company DNS or API access.
+`tests/smoke_vpnc_binary.py` additionally runs the packaged VPN binary under
+`--network=none`, with synthetic credentials and an unreachable dummy peer. It
+checks real pre-init ordering, TUN creation and refusal of an unexpected helper
+prompt. Neither that test nor the synthetic lifecycle tests prove a real gateway
+login, MFA policy, company DNS or API access.

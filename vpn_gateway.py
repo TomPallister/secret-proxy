@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import subprocess
 import time
 
 from networking import NetworkError, resolve_gateway
+from vpn_status import Progress
 
 OWNER = 'io.secret-proxy.vpn-owner'
 LAUNCH = 'io.secret-proxy.vpn-launch'
@@ -31,7 +33,9 @@ def command(deployment, image, nonce):
     if re.fullmatch(r'sha256:[0-9a-f]{64}', image) is None:
         raise NetworkError('Managed VPN requires an exact image ID')
     policy = deployment.network
-    return ['run', '--rm', '-i', '--init', '--name', policy.container,
+    # The controller removes the exact owned ID. Auto-removal races startup
+    # inspection on fast failures and hides the sanitized final stage.
+    return ['run', '-i', '--init', '--name', policy.container,
             '--label', OWNER + '=' + deployment.instance, '--label', LAUNCH + '=' + nonce,
             '--network', policy.network, '--read-only', '--user', '0:0',
             '--cap-drop=ALL', '--cap-add=NET_ADMIN', '--cap-add=NET_RAW', '--cap-add=NET_BIND_SERVICE',
@@ -52,6 +56,16 @@ class ManagedGateway:
         self.nonce = secrets.token_hex(16)
         self.child = None
         self.identifier = None
+        self.progress = Progress()
+
+    def read_progress(self):
+        # Bounded/nonblocking even if an unexpected process floods stdout.
+        # Only fixed enum frames can become a diagnostic; stderr is discarded.
+        try:
+            data = os.read(self.child.stdout.fileno(), 4096)
+        except BlockingIOError:
+            return
+        self.progress.feed(data)
 
     def __enter__(self):
         dep = self.deployment
@@ -73,11 +87,21 @@ class ManagedGateway:
         try:
             self.child = subprocess.Popen(self.engine_command(command(dep, self.image, self.nonce)),
                                           env=self.environment, stdin=subprocess.PIPE,
-                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.child.stdin.write(payload); self.child.stdin.close()
+                                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            os.set_blocking(self.child.stdout.fileno(), False)
+            try:
+                try:
+                    self.child.stdin.write(payload)
+                finally:
+                    self.child.stdin.close()
+            except BrokenPipeError:
+                # A launch/configuration refusal can precede bundle intake.
+                # Still collect its fixed stage and perform owned cleanup.
+                pass
             payload = b''
             deadline = time.monotonic() + 240
             while self.child.poll() is None and time.monotonic() < deadline:
+                self.read_progress()
                 exists = self.engine('container', 'exists', dep.network.container)
                 if exists.returncode == 0:
                     row = inspect_owned(self.engine, 'container', dep.network.container, dep.instance, self.nonce)
@@ -94,7 +118,10 @@ class ManagedGateway:
                 elif exists.returncode != 1:
                     raise NetworkError('Managed VPN startup inspection failed')
                 time.sleep(.2)
-            raise NetworkError('Managed VPN failed readiness; no direct fallback')
+            # Drain the small protocol tail after an early child exit too.
+            for _ in range(4):
+                self.read_progress()
+            raise NetworkError('Managed VPN failed readiness (stage: ' + self.progress.stage + '); no direct fallback')
         except BaseException:
             self.close()
             raise
@@ -126,6 +153,7 @@ class ManagedGateway:
                     self.child.wait(timeout=15)
                 except subprocess.TimeoutExpired:
                     self.child.kill(); self.child.wait()
+            self.child.stdout.close()
 
     def __exit__(self, *exc):
         self.close()

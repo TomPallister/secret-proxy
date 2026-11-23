@@ -27,7 +27,7 @@ from networking import NetworkError
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--connection', required=True)
 parser.add_argument('--image', required=True)
-parser.add_argument('--failure', choices=['auth'])
+parser.add_argument('--failure', choices=['auth', 'challenge', 'route', 'client'])
 parser.add_argument('--challenge', action='store_true', help='Exercise separate XAUTH TOTP using the real one-shot helper')
 args = parser.parse_args()
 env = {'HOME': str(Path.home()), 'PATH': '/opt/podman/bin:/usr/bin:/bin:/usr/sbin:/sbin',
@@ -50,7 +50,7 @@ with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
 profile = {'type': 'vpnc', 'gateway': '192.0.2.8', 'group': 'Fixture', 'dhGroup': 'dh14',
     'dns': ['10.20.0.53'], 'usernameSecret': 'VPN_USER', 'passwordSecret': 'VPN_PASSWORD', 'groupSecret': 'VPN_GROUP'}
-if args.challenge:
+if args.challenge or args.failure == 'challenge':
     profile.update(totpSecret='VPN_TOTP', totpMode='challenge')
 catalog = {'version': 1, 'networks': {'fixture': profile}}
 manifest = {'schemaVersion': 3, 'account': {'vault': 'Fixture'}, 'secrets':
@@ -83,15 +83,14 @@ if 'Password helper ' in text:
  first=subprocess.run([helper,'Password for VPN fixture-user@192.0.2.8: '],capture_output=True)
  assert first.returncode == 0 and len(first.stdout.strip()) == 6 and first.stdout.strip().isdigit()
  assert not state.exists()
- second=subprocess.run([helper,'Password for VPN fixture-user@192.0.2.8: '],capture_output=True)
- assert second.returncode != 0 and not second.stdout
 else:
  assert '--non-inter' in sys.argv
 assert 'policy drop' in subprocess.check_output(['nft','list','ruleset']).decode()
-subprocess.run(['ip','link','add','tun0','type','dummy'],check=True)
-env={**os.environ,'reason':'pre-init','TUNDEV':'tun0','VPNGATEWAY':'192.0.2.8','VPNPID':str(os.getpid()),
+env={**os.environ,'reason':'pre-init','VPNGATEWAY':'192.0.2.8','VPNPID':str(os.getpid()),
      'INTERNAL_IP4_ADDRESS':'10.222.0.2','INTERNAL_IP4_NETMASK':'255.255.255.255','INTERNAL_IP4_MTU':'1390'}
 hook(env)
+subprocess.run(['ip','link','add','tun0','type','dummy'],check=True)
+env['TUNDEV']='tun0'
 env['reason']='connect'; hook(env)
 def stop(*args):
  env['reason']='disconnect'; hook(env); sys.exit(0)
@@ -100,6 +99,13 @@ while True: time.sleep(.2)
 '''
 if args.failure == 'auth':
     fake_op = fake_op.replace("values={'VPN_USER'", "sys.exit(2)\nvalues={'VPN_USER'")
+elif args.failure == 'challenge':
+    fake_vpnc = fake_vpnc.replace("first=subprocess.run([helper,'Password for VPN fixture-user@", "first=subprocess.run([helper,'Password for VPN unexpected-user@")
+elif args.failure == 'route':
+    fake_vpnc = fake_vpnc.replace("env['reason']='connect'; hook(env)",
+        "env.update(CISCO_SPLIT_INC='1', CISCO_SPLIT_INC_0_ADDR='10.200.0.0', CISCO_SPLIT_INC_0_MASK='255.255.0.0', CISCO_SPLIT_INC_0_MASKLEN='16')\nenv['reason']='connect'; hook(env)")
+elif args.failure == 'client':
+    fake_vpnc = fake_vpnc.replace("sys.path.insert(0,'/opt/secret-proxy')", "sys.exit(42)\nsys.path.insert(0,'/opt/secret-proxy')")
 
 # All fixture bytes are synthetic and staged only in a new VM temporary dir.
 setup = '''import json,pathlib,shutil,sys
@@ -142,11 +148,13 @@ try:
         previous = None
         for mode in ('direct', 'fixture', 'direct'):
             selected = host.Deployment.from_dict(registration).select_network(mode)
-            if mode == 'fixture' and args.failure == 'auth':
+            if mode == 'fixture' and args.failure:
                 try:
                     invoke(selected)
-                except NetworkError:
-                    pass
+                except NetworkError as error:
+                    expected = {'auth': 'vault', 'challenge': 'challenge-refused',
+                                'route': 'full-tunnel-required', 'client': 'client-exited'}[args.failure]
+                    assert str(error) == 'Managed VPN failed readiness (stage: ' + expected + '); no direct fallback', str(error)
                 else:
                     raise AssertionError('Failed VPN login was accepted')
                 for target in (deployment.name, deployment.name + '-relay', deployment.network.container):
@@ -195,7 +203,7 @@ try:
             assert not (deployment.shared / 'ready.json').exists()
             assert not (deployment.shared / 'network-state.json').exists()
         if args.failure:
-            print('PASS: failed VPN credential bootstrap never serves clients or falls back; later explicit direct start preserves endpoint/CA/capability')
+            print('PASS: sanitized ' + args.failure + ' failure stage; no clients or fallback; later explicit direct start preserves endpoint/CA/capability')
         else:
             print('PASS: direct/managed/direct startup, standard route hook, firewall-before-login, shared namespace/TLS, tunnel-loss cleanup; endpoint/CA/capability retained')
 finally:

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -51,6 +52,11 @@ class GatewayTests(unittest.TestCase):
         self.container = True
         self.child = Mock()
         self.child.poll.return_value = None
+        reader, writer = os.pipe()
+        self.child.stdout = os.fdopen(reader, 'rb', buffering=0)
+        self.addCleanup(self.child.stdout.close)
+        os.write(writer, getattr(self, 'progress_output', b'SP-VPN/1 negotiating\n'))
+        os.close(writer)
         return self.child
 
     def gateway(self):
@@ -63,7 +69,7 @@ class GatewayTests(unittest.TestCase):
         for value in ('--read-only', '--security-opt=no-new-privileges', '--cap-drop=ALL',
                       '--cap-add=NET_BIND_SERVICE', '--device=/dev/net/tun'):
             self.assertIn(value, command)
-        for value in ('--privileged', '--publish', '--env', '--pid=host', '--network=host'):
+        for value in ('--rm', '--privileged', '--publish', '--env', '--pid=host', '--network=host'):
             self.assertNotIn(value, command)
         self.assertEqual(command[-1], 'managed-vpn')
         with self.assertRaises(NetworkError): vpn.command(self.dep, 'latest', 'a'*32)
@@ -95,6 +101,55 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaisesRegex(NetworkError, 'no direct fallback'):
                 with self.gateway(): self.fail('Not ready')
         self.assertIn(('rm', '-f', self.identifier), self.calls)
+
+    def test_failure_reports_only_validated_stage_not_child_output(self):
+        self.ready = False
+        self.progress_output = b'synthetic-private-value\nSP-VPN/1 vault\nSP-VPN/1 injected-private-value\n'
+        with patch.object(vpn.secrets, 'token_hex', return_value='a'*32), patch.object(vpn.subprocess, 'Popen', side_effect=self.launch) as launch, \
+             patch.object(vpn.time, 'monotonic', side_effect=[0, 1, 241]), patch.object(vpn.time, 'sleep'):
+            with self.assertRaises(NetworkError) as failure:
+                with self.gateway(): self.fail('Not ready')
+            self.assertEqual(str(failure.exception), 'Managed VPN failed readiness (stage: vault); no direct fallback')
+            self.assertEqual(launch.call_args.kwargs['stderr'], subprocess.DEVNULL)
+            self.assertTrue(self.child.stdout.closed)
+
+    def test_progress_cannot_authorize_readiness(self):
+        self.ready = False
+        self.progress_output = b'SP-VPN/1 ready\n'
+        with patch.object(vpn.secrets, 'token_hex', return_value='a'*32), patch.object(vpn.subprocess, 'Popen', side_effect=self.launch), \
+             patch.object(vpn.time, 'monotonic', side_effect=[0, 1, 241]), patch.object(vpn.time, 'sleep'):
+            with self.assertRaises(NetworkError):
+                with self.gateway(): self.fail('Progress is not readiness')
+        self.assertIn(('rm', '-f', self.identifier), self.calls)
+
+    def test_early_exit_still_drains_final_progress(self):
+        def exited(*args, **kwargs):
+            child = self.launch(*args, **kwargs)
+            child.poll.return_value = 1
+            return child
+        self.ready = False
+        self.progress_output = b'SP-VPN/1 profile\nSP-VPN/1 firewall\n'
+        with patch.object(vpn.secrets, 'token_hex', return_value='a'*32), patch.object(vpn.subprocess, 'Popen', side_effect=exited):
+            with self.assertRaisesRegex(NetworkError, 'stage: firewall'):
+                with self.gateway(): self.fail('Child exited')
+        self.assertTrue(self.child.stdout.closed)
+
+    def test_refusal_before_bundle_intake_keeps_diagnostics_and_cleanup(self):
+        self.ready = False
+        self.progress_output = b'SP-VPN/1 profile\n'
+        for method in ('write', 'close'):
+            def exited(*args, **kwargs):
+                child = self.launch(*args, **kwargs)
+                child.poll.return_value = 1
+                getattr(child.stdin, method).side_effect = BrokenPipeError()
+                return child
+            with self.subTest(method=method), patch.object(vpn.secrets, 'token_hex', return_value='a'*32), \
+                 patch.object(vpn.subprocess, 'Popen', side_effect=exited):
+                with self.assertRaisesRegex(NetworkError, 'stage: profile'):
+                    with self.gateway(): self.fail('Bundle was refused')
+            self.child.stdin.close.assert_called_once()
+            self.assertTrue(self.child.stdout.closed)
+            self.assertFalse(self.container)
 
     def test_cleanup_refuses_replaced_resource_identity(self):
         with patch.object(vpn.secrets, 'token_hex', return_value='a'*32), patch.object(vpn.subprocess, 'Popen', side_effect=self.launch):

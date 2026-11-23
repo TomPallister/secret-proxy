@@ -41,7 +41,7 @@ BUILD_FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
                'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
                'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
                'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'capolicy.py', 'constrainedca.py',
-               'approvals.py', 'audit.py', 'networking.py', 'vpn_profiles.py', 'vpnc_runtime.py', 'vpnc_password_helper.py')
+               'approvals.py', 'audit.py', 'networking.py', 'vpn_profiles.py', 'vpn_status.py', 'vpnc_runtime.py', 'vpnc_password_helper.py')
 
 
 class HostError(Exception):
