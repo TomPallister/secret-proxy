@@ -51,7 +51,8 @@ AnyConnect/SAML/browser-MFA, WireGuard, arbitrary-command or split-tunnel driver
       "usernameSecret": "VPN_USERNAME",
       "passwordSecret": "VPN_PASSWORD",
       "groupSecret": "VPN_GROUP_SECRET",
-      "totpSecret": "VPN_TOTP_SEED"
+      "totpSecret": "VPN_TOTP_SEED",
+      "totpMode": "append"
     }
   }
 }
@@ -73,11 +74,21 @@ For example, this is the shape of the manifest's `secrets` entries:
 ```
 
 With `totpSecret`, the stored value is a base32 seed. A six-digit, 30-second
-SHA-1 TOTP is appended to the password for XAUTH. Other challenge-response flows
-are not supported. Values must be nonempty printable ASCII without newlines;
-there are no secret-value arguments or shell interpolation. Without TOTP, the
-password is sent as stored. Login is noninteractive and bounded; there is no
-automatic reconnect or repeated MFA loop.
+SHA-1 TOTP is appended to the password for XAUTH by default (`totpMode: "append"`).
+For gateways that first accept the password and then request a separate code,
+select `totpMode: "challenge"`. This uses a fixed helper that answers **one**
+Password/Passcode/Answer prompt matching the configured username and pinned peer,
+within 90 seconds. Unknown, expired or repeated challenges fail closed. The seed
+exists only in the gateway's private tmpfs until consumed or startup ends; it is
+never an argument, environment variable or log entry. No arbitrary helper command
+or other challenge-response/MFA flow is supported.
+
+Values must be nonempty printable ASCII without newlines; there are no secret-value
+arguments or shell interpolation. Without TOTP, the password is sent as stored.
+Login is automated and bounded, with stdin closed. Challenge mode omits vpnc's
+`--non-inter` (which prevents its helper from answering a second XAUTH challenge),
+not our timeout, one-shot limit or closed stdin. There is no automatic reconnect
+or repeated MFA loop.
 
 `dh14` is preferred where the server supports it. Legacy `dh2`/`dh5` are explicit
 compatibility options, not a recommendation: IKEv1/XAUTH and older DH groups have

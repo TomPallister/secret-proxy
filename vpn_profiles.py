@@ -49,7 +49,7 @@ def validate_networks(value):
             result[name] = {'type': 'external', **policy.to_dict()}
         elif kind == 'vpnc':
             required = {'type', 'gateway', 'group', 'dhGroup', 'dns', 'usernameSecret', 'passwordSecret', 'groupSecret'}
-            if not required <= set(profile) or set(profile) - required - {'totpSecret'}:
+            if not required <= set(profile) or set(profile) - required - {'totpSecret', 'totpMode'}:
                 raise NetworkError('Invalid vpnc profile; use secret names, never credentials or commands')
             gateway = profile['gateway']
             if not isinstance(gateway, str) or len(gateway) > 253 or not re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?', gateway):
@@ -80,6 +80,8 @@ def validate_networks(value):
             for key in ('usernameSecret', 'passwordSecret', 'groupSecret', 'totpSecret'):
                 if key in profile and (not isinstance(profile[key], str) or not SECRET_NAME.fullmatch(profile[key])):
                     raise NetworkError('VPN credentials must be canonical secret names')
+            if 'totpMode' in profile and ('totpSecret' not in profile or profile['totpMode'] not in ('append', 'challenge')):
+                raise NetworkError('totpMode requires totpSecret and must be append or challenge')
             result[name] = dict(profile)
         else:
             raise NetworkError('Network type must be external or vpnc')

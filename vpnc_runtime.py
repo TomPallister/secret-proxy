@@ -24,6 +24,7 @@ from vpn_profiles import checked_address, load_networks, validate_secrets
 
 READY = Path('/run/vpn/ready')
 ROOT = Path('/opt/secret-proxy')
+CHALLENGE = Path('/run/vpn/totp-challenge.json')
 
 
 def totp(seed, now):
@@ -36,19 +37,60 @@ def totp(seed, now):
     return '%06d' % ((struct.unpack('>I', digest[offset:offset+4])[0] & 0x7fffffff) % 1000000)
 
 
+def write_challenge(values, gateway, state=CHALLENGE):
+    # Validate before writing; seed is confined to the gateway's private tmpfs.
+    totp(values['totpSecret'], time.time())
+    peer = str(ipaddress.IPv4Address(gateway))
+    prompts = [kind + ' for VPN ' + values['usernameSecret'] + '@' + peer + ': '
+               for kind in ('Password', 'Passcode', 'Answer')]
+    data = {'seed': values['totpSecret'], 'prompts': prompts, 'deadline': time.monotonic() + 90}
+    fd = os.open(state, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        json.dump(data, stream)
+
+
+def answer_challenge(prompt, state=CHALLENGE):
+    # Claim before reading: even simultaneous/repeated helper calls cannot issue
+    # another OTP. Unexpected or expired challenges consume the single attempt.
+    used = state.with_suffix('.used')
+    fd = os.open(used, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(fd)
+    try:
+        data = json.loads(state.read_text())
+        if prompt not in data['prompts'] or time.monotonic() >= data['deadline']:
+            raise ValueError('Unexpected or expired VPN challenge')
+        return totp(data['seed'], time.time())
+    finally:
+        state.unlink(missing_ok=True)
+
+
+def clear_challenge(state=CHALLENGE):
+    state.unlink(missing_ok=True)
+    state.with_suffix('.used').unlink(missing_ok=True)
+
+
+def vpnc_command(profile, config):
+    # vpnc refuses a second XAUTH challenge with --non-inter, even when a
+    # Password helper is configured. Our helper is one-shot and stdin stays EOF.
+    flags = [] if profile.get('totpMode') == 'challenge' else ['--non-inter']
+    return ['/usr/sbin/vpnc', '--no-detach', *flags, '--pid-file', '/run/vpn/vpnc.pid', str(config)]
+
+
 def configuration(profile, values, gateway, now):
     for value in values.values():
         if not isinstance(value, str) or not value or len(value) > 4096 or any(not 32 <= ord(c) < 127 for c in value):
             raise ValueError('Invalid VPN credential field')
     gateway = str(ipaddress.IPv4Address(gateway))
     password = values['passwordSecret']
-    if 'totpSecret' in profile:
+    if 'totpSecret' in profile and profile.get('totpMode', 'append') == 'append':
         password += totp(values['totpSecret'], now)
     fields = [('IPSec gateway', gateway), ('IPSec ID', profile['group']),
               ('IPSec secret', values['groupSecret']), ('IKE DH Group', profile['dhGroup']),
               ('Xauth username', values['usernameSecret']), ('Xauth password', password),
               ('Interface name', 'tun0'), ('NAT Traversal Mode', 'natt'),
               ('Script', str(ROOT / '.venv/bin/python') + ' ' + str(ROOT / 'vpnc_runtime.py') + ' hook')]
+    if profile.get('totpMode') == 'challenge':
+        fields.append(('Password helper', str(ROOT / 'vpnc_password_helper.py')))
     return ''.join(key + ' ' + value + '\n' for key, value in fields)
 
 
@@ -134,14 +176,15 @@ def connect(profile_name):
     relay_cidr = str(ipaddress.IPv4Interface(str(local[0]['local']) + '/' + str(local[0]['prefixlen'])).network)
     subprocess.run(['/usr/sbin/nft', '-f', '-'], input=firewall(gateway, relay_cidr).encode(), check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-    if 'totpSecret' in profile and time.time() % 30 > 20:
+    if 'totpSecret' in profile and profile.get('totpMode', 'append') == 'append' and time.time() % 30 > 20:
         time.sleep(30 - time.time() % 30 + .1)
     config = READY.parent / 'vpnc.conf'
     config.write_text(configuration(profile, values, gateway, time.time()))
     config.chmod(0o600)
+    if profile.get('totpMode') == 'challenge':
+        write_challenge(values, gateway)
     values.clear()
-    child = subprocess.Popen(['/usr/sbin/vpnc', '--no-detach', '--non-inter',
-                              '--pid-file', '/run/vpn/vpnc.pid', str(config)],
+    child = subprocess.Popen(vpnc_command(profile, config),
                              env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': str(READY.parent)},
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     def stop(_signal, _frame):
@@ -156,10 +199,12 @@ def connect(profile_name):
                 raise ValueError('VPN did not become ready')
             time.sleep(.2)
         config.unlink()  # no password or OTP remains in the config after login
+        clear_challenge()
         return child.wait()
     finally:
         READY.unlink(missing_ok=True)
         config.unlink(missing_ok=True)
+        clear_challenge()
         # Never remove the firewall, even while vpnc restores routes.
         if child.poll() is None:
             child.terminate()

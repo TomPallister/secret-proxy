@@ -32,7 +32,7 @@ FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
          'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
          'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',
-         'manage.py', 'secret-proxy', 'vpn_profiles.py', 'vpn_gateway.py', 'vpnc_runtime.py', 'capolicy.py', 'constrainedca.py', 'approvals.py', 'audit.py')
+         'manage.py', 'secret-proxy', 'vpn_profiles.py', 'vpn_gateway.py', 'vpnc_runtime.py', 'vpnc_password_helper.py', 'capolicy.py', 'constrainedca.py', 'approvals.py', 'audit.py')
 # Private policy copied into the instance's read-only /config (bootstrap metadata
 # stays desktop-side). ca.json opts into a name-constrained CA.
 POLICY_FILES = ('manifest.json', 'aws-okta.json', 'aws-policy.json', 'upstream-ca.pem', 'ca.json', 'networks.json')

@@ -58,6 +58,8 @@ uv run --locked python tests/smoke_managed_vpn.py --connection devenv \
   --image localhost/secret-proxy-candidate:phase2
 uv run --locked python tests/smoke_managed_vpn.py --connection devenv \
   --image localhost/secret-proxy-candidate:phase2 --failure auth
+uv run --locked python tests/smoke_managed_vpn.py --connection devenv \
+  --image localhost/secret-proxy-candidate:phase2 --challenge
 uv run --locked python tests/smoke_vpn_firewall.py --connection devenv \
   --image localhost/secret-proxy-candidate:phase2
 ```

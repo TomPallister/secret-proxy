@@ -64,6 +64,18 @@ class SelectionTests(unittest.TestCase):
         with self.assertRaises(host.HostError):
             host.Deployment.from_dict({**registration(), 'defaultNetwork': 'corp-vpn'})
 
+    def test_totp_mode_requires_seed_and_supported_explicit_value(self):
+        for mode in ('append', 'challenge'):
+            profile = {**managed(), 'totpMode': mode}
+            selected = host.Deployment.from_dict({**registration(), 'networks': {'vpn': profile}}).select_network('vpn')
+            self.assertEqual(selected.vpn['totpMode'], mode)
+        for mode in ('automatic', None, True, [], 'challenge\nScript /bad'):
+            with self.subTest(mode=mode), self.assertRaises(NetworkError):
+                host.Deployment.from_dict({**registration(), 'networks': {'vpn': {**managed(), 'totpMode': mode}}})
+        profile = {**managed(), 'totpMode': 'challenge'}; del profile['totpSecret']
+        with self.assertRaises(NetworkError):
+            host.Deployment.from_dict({**registration(), 'networks': {'vpn': profile}})
+
     def test_external_gateway_cannot_alias_resources_that_stop_owns(self):
         for suffix in ('', '-relay', '-vpn'):
             profile = {**external(), 'container': 'sp-example' + suffix}

@@ -26,12 +26,12 @@ class InstanceLockTests(unittest.TestCase):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, patch.object(host, 'SA_HOME', Path(tmp)):
                 dep = host.Deployment('fixture', 'secagent', 10260)
                 dep.private.mkdir(parents=True)
-                target = Path(tmp) / 'victim'; target.touch(mode=0o600)
+                target = Path(tmp) / 'victim'; target.touch(); target.chmod(0o600)
                 lock = dep.private / 'serve.lock'
                 if kind == 'hardlink': os.link(target, lock)
                 elif kind == 'symlink': lock.symlink_to(target)
                 elif kind == 'nonempty': lock.write_text('must not become a lock'); lock.chmod(0o600)
-                else: lock.touch(mode=0o644)
+                else: lock.touch(); lock.chmod(0o644)  # Deliberately public, regardless of the test runner's umask.
                 with patch.object(host.os, 'fchown') as change:
                     with self.assertRaises((OSError, host.HostError)): host.open_instance_lock(dep, installer=True)
                     change.assert_not_called()

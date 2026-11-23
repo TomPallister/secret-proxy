@@ -28,6 +28,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--connection', required=True)
 parser.add_argument('--image', required=True)
 parser.add_argument('--failure', choices=['auth'])
+parser.add_argument('--challenge', action='store_true', help='Exercise separate XAUTH TOTP using the real one-shot helper')
 args = parser.parse_args()
 env = {'HOME': str(Path.home()), 'PATH': '/opt/podman/bin:/usr/bin:/bin:/usr/sbin:/sbin',
        'CONTAINERS_MACHINE_PROVIDER': 'libkrun'}
@@ -49,15 +50,17 @@ with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
 profile = {'type': 'vpnc', 'gateway': '192.0.2.8', 'group': 'Fixture', 'dhGroup': 'dh14',
     'dns': ['10.20.0.53'], 'usernameSecret': 'VPN_USER', 'passwordSecret': 'VPN_PASSWORD', 'groupSecret': 'VPN_GROUP'}
+if args.challenge:
+    profile.update(totpSecret='VPN_TOTP', totpMode='challenge')
 catalog = {'version': 1, 'networks': {'fixture': profile}}
 manifest = {'schemaVersion': 3, 'account': {'vault': 'Fixture'}, 'secrets':
-            {profile[key]: {'internalOnly': True} for key in ('usernameSecret', 'passwordSecret', 'groupSecret')}}
+            {profile[key]: {'internalOnly': True} for key in ('usernameSecret', 'passwordSecret', 'groupSecret', 'totpSecret') if key in profile}}
 registration = {'instance': name, 'machine': args.connection, 'port': port, 'networks': catalog['networks']}
 deployment = host.Deployment.from_dict(registration).select_network('fixture')
 fake_op = '''#!/opt/secret-proxy/.venv/bin/python
 import json,os,sys
 assert os.environ.get('OP_SERVICE_ACCOUNT_TOKEN')=='offline-fixture-only'
-values={'VPN_USER':'fixture-user','VPN_PASSWORD':'fixture-pass','VPN_GROUP':'fixture-group'}
+values={'VPN_USER':'fixture-user','VPN_PASSWORD':'fixture-pass','VPN_GROUP':'fixture-group','VPN_TOTP':'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
 if sys.argv[1:3]==['item','list']: print(json.dumps([{'id':n,'title':n} for n in values]))
 elif sys.argv[1:3]==['item','get']: print(json.dumps({'value':values[sys.argv[3]]}))
 else: sys.exit(1)
@@ -67,11 +70,23 @@ import os,pathlib,signal,socket,subprocess,sys,time
 sys.path.insert(0,'/opt/secret-proxy')
 from vpnc_runtime import hook
 assert 'OP_SERVICE_ACCOUNT_TOKEN' not in os.environ
-assert '--non-inter' in sys.argv and '--no-detach' in sys.argv
+assert '--no-detach' in sys.argv
 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as ike: ike.bind(('0.0.0.0',500))
 text=pathlib.Path(sys.argv[-1]).read_text()
 assert 'Xauth password fixture-pass\\n' in text
 assert 'IPSec secret fixture-group\\n' in text
+if 'Password helper ' in text:
+ assert '--non-inter' not in sys.argv
+ helper=text.split('Password helper ',1)[1].splitlines()[0]
+ state=pathlib.Path('/run/vpn/totp-challenge.json')
+ assert state.stat().st_mode & 0o777 == 0o600
+ first=subprocess.run([helper,'Password for VPN fixture-user@192.0.2.8: '],capture_output=True)
+ assert first.returncode == 0 and len(first.stdout.strip()) == 6 and first.stdout.strip().isdigit()
+ assert not state.exists()
+ second=subprocess.run([helper,'Password for VPN fixture-user@192.0.2.8: '],capture_output=True)
+ assert second.returncode != 0 and not second.stdout
+else:
+ assert '--non-inter' in sys.argv
 assert 'policy drop' in subprocess.check_output(['nft','list','ruleset']).decode()
 subprocess.run(['ip','link','add','tun0','type','dummy'],check=True)
 env={**os.environ,'reason':'pre-init','TUNDEV':'tun0','VPNGATEWAY':'192.0.2.8','VPNPID':str(os.getpid()),
@@ -153,6 +168,8 @@ try:
                     state = {f: hashlib.sha256((deployment.shared / f).read_bytes()).hexdigest() for f in ('ca.pem', 'proxy-token')}
                     if mode == 'fixture':
                         run('exec', deployment.network.container, 'test', '!', '-e', '/run/vpn/vpnc.conf')
+                        for path in ('totp-challenge.json', 'totp-challenge.used'):
+                            run('exec', deployment.network.container, 'test', '!', '-e', '/run/vpn/' + path)
                         assert run('exec', deployment.network.container, 'readlink', '/proc/self/ns/net') == run('exec', deployment.name, 'readlink', '/proc/self/ns/net')
                         run('exec', deployment.network.container, 'ip', 'link', 'set', 'tun0', 'down')
                     else:

@@ -39,6 +39,22 @@ CASES = [
      'test_install.InstallTests.test_network_update_requires_all_owned_resources_absent_and_engine_available'),
     ('lock-hardlink', 'host.py', 'or metadata.st_nlink != 1', 'or False',
      'test_instance_lock.InstanceLockTests.test_privileged_update_refuses_links_nonempty_and_public_lock'),
+    ('challenge-not-appended', 'vpnc_runtime.py',
+     "if 'totpSecret' in profile and profile.get('totpMode', 'append') == 'append':",
+     "if 'totpSecret' in profile:",
+     'test_vpnc_runtime.VpncTests.test_separate_challenge_keeps_password_and_uses_fixed_helper'),
+    ('challenge-cli', 'vpnc_runtime.py',
+     "flags = [] if profile.get('totpMode') == 'challenge' else ['--non-inter']",
+     "flags = ['--non-inter']",
+     'test_vpnc_runtime.VpncTests.test_challenge_cli_allows_helper_but_not_stdin_or_arbitrary_commands'),
+    ('challenge-prompt', 'vpnc_runtime.py', "prompt not in data['prompts'] or ", '',
+     'test_vpnc_runtime.VpncTests.test_challenge_rejects_unexpected_identity_prompt_and_expiry'),
+    ('challenge-expiry', 'vpnc_runtime.py', " or time.monotonic() >= data['deadline']", '',
+     'test_vpnc_runtime.VpncTests.test_challenge_rejects_unexpected_identity_prompt_and_expiry'),
+    ('challenge-single-use', 'vpnc_runtime.py',
+     'os.open(used, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)',
+     'os.open(used, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)',
+     'test_vpnc_runtime.VpncTests.test_concurrent_challenges_issue_only_one_code'),
 ]
 
 
@@ -63,6 +79,11 @@ def main():
             before = originals[name]
             if path.read_bytes() != before or before.count(old.encode()) != 1:
                 raise AssertionError('Mutation anchor/source mismatch: ' + key)
+            baseline = subprocess.run([sys.executable, '-B', '-m', 'unittest', test], cwd=ROOT,
+                                      env=env, capture_output=True, timeout=60)
+            (output / (key + '-baseline.log')).write_bytes(baseline.stdout + baseline.stderr)
+            if baseline.returncode:
+                raise AssertionError('Unmodified regression must pass before mutation: ' + key)
             changed = before.replace(old.encode(), new.encode())
             try:
                 path.write_bytes(changed)

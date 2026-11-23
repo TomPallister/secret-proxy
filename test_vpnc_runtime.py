@@ -23,6 +23,94 @@ class VpncTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 vpn.configuration(managed(), {**values, 'passwordSecret': bad}, '192.0.2.8', now=59)
 
+    def test_separate_challenge_keeps_password_and_uses_fixed_helper(self):
+        values = {'usernameSecret': 'fixture-user', 'passwordSecret': 'fixture-password',
+                  'groupSecret': 'fixture-group', 'totpSecret': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
+        text = vpn.configuration({**managed(), 'totpMode': 'challenge'}, values, '192.0.2.8', now=59)
+        self.assertIn('Xauth password fixture-password\n', text)
+        self.assertNotIn('fixture-password287082', text)
+        self.assertIn('Password helper /opt/secret-proxy/vpnc_password_helper.py\n', text)
+        self.assertNotIn(values['totpSecret'], text)
+
+    def test_challenge_cli_allows_helper_but_not_stdin_or_arbitrary_commands(self):
+        from pathlib import Path
+        config = Path('/run/vpn/vpnc.conf')
+        self.assertIn('--non-inter', vpn.vpnc_command(managed(), config))
+        argv = vpn.vpnc_command({**managed(), 'totpMode': 'challenge'}, config)
+        self.assertNotIn('--non-inter', argv)
+        self.assertEqual(argv, ['/usr/sbin/vpnc', '--no-detach', '--pid-file', '/run/vpn/vpnc.pid', str(config)])
+
+    def test_challenge_is_private_prompt_bound_and_single_use(self):
+        import tempfile
+        from pathlib import Path
+        values = {'usernameSecret': 'fixture-user', 'totpSecret': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
+        for kind in ('Password', 'Passcode', 'Answer'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp) / 'challenge.json'
+                with patch.object(vpn.time, 'monotonic', return_value=100), patch.object(vpn.time, 'time', return_value=59):
+                    vpn.write_challenge(values, '192.0.2.8', state)
+                    self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+                    result = vpn.answer_challenge(kind + ' for VPN fixture-user@192.0.2.8: ', state)
+                    self.assertEqual(result, '287082')
+                    self.assertFalse(state.exists())
+                    with self.assertRaises((OSError, ValueError)):
+                        vpn.answer_challenge(kind + ' for VPN fixture-user@192.0.2.8: ', state)
+
+    def test_challenge_rejects_unexpected_identity_prompt_and_expiry(self):
+        import tempfile
+        from pathlib import Path
+        values = {'usernameSecret': 'fixture-user', 'totpSecret': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
+        for prompt, clock in [('Password for VPN other@192.0.2.8: ', 101),
+                              ('Password for VPN fixture-user@192.0.2.9: ', 101),
+                              ('Unexpected challenge', 101),
+                              ('Password for VPN fixture-user@192.0.2.8: \n', 101),
+                              ('Password for VPN fixture-user@192.0.2.8: ', 190)]:
+            with self.subTest(prompt=prompt, clock=clock), tempfile.TemporaryDirectory() as tmp:
+                state = Path(tmp) / 'challenge.json'
+                with patch.object(vpn.time, 'monotonic', return_value=100):
+                    vpn.write_challenge(values, '192.0.2.8', state)
+                with patch.object(vpn.time, 'monotonic', return_value=clock), self.assertRaises(ValueError):
+                    vpn.answer_challenge(prompt, state)
+                self.assertFalse(state.exists())
+                vpn.clear_challenge(state)
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_concurrent_challenges_issue_only_one_code(self):
+        import concurrent.futures
+        import tempfile
+        import threading
+        from pathlib import Path
+        values = {'usernameSecret': 'fixture-user', 'totpSecret': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'challenge.json'
+            vpn.write_challenge(values, '192.0.2.8', state)
+            entered, release = threading.Event(), threading.Event()
+            def held_totp(*args):
+                if not entered.is_set():
+                    entered.set()
+                    if not release.wait(5): raise AssertionError('Test synchronization timed out')
+                return '287082'
+            with patch.object(vpn, 'totp', side_effect=held_totp), concurrent.futures.ThreadPoolExecutor(2) as pool:
+                first = pool.submit(vpn.answer_challenge, 'Password for VPN fixture-user@192.0.2.8: ', state)
+                self.assertTrue(entered.wait(2))
+                try:
+                    second = pool.submit(vpn.answer_challenge, 'Password for VPN fixture-user@192.0.2.8: ', state)
+                    with self.assertRaises(OSError): second.result(timeout=2)
+                finally:
+                    release.set()
+                self.assertEqual(first.result(timeout=2), '287082')
+            vpn.clear_challenge(state)
+
+    def test_challenge_state_cannot_overwrite_existing_file_or_symlink(self):
+        import tempfile
+        from pathlib import Path
+        values = {'usernameSecret': 'fixture-user', 'totpSecret': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'}
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / 'victim'; victim.write_text('unchanged')
+            state = Path(tmp) / 'challenge.json'; state.symlink_to(victim)
+            with self.assertRaises(OSError): vpn.write_challenge(values, '192.0.2.8', state)
+            self.assertEqual(victim.read_text(), 'unchanged')
+
     def test_kill_switch_allows_tunnel_and_ike_not_direct_tcp_or_ipv6(self):
         rules = vpn.firewall('192.0.2.8', '10.89.0.0/24')
         self.assertIn('policy drop', rules)
