@@ -22,7 +22,7 @@ import time
 
 from networking import NetworkError
 from vpn_profiles import checked_address, load_networks, validate_secrets
-from vpn_status import FAILURES, STAGES, encode_stage, publish
+from vpn_status import ClientErrors, FAILURES, STAGES, encode_stage, publish
 
 READY = Path('/run/vpn/ready')
 ROOT = Path('/opt/secret-proxy')
@@ -184,6 +184,29 @@ def hook(environment=None):
         raise
 
 
+def drain_client(child, errors=None):
+    # Bound work and memory even if an unexpected client floods stderr. Never
+    # log the bytes. After readiness, discard them without classification.
+    for _ in range(16):
+        try:
+            data = os.read(child.stderr.fileno(), 4096)
+        except BlockingIOError:
+            return
+        if not data:
+            return
+        if errors is not None:
+            errors.feed(data)
+
+
+def wait_client(child):
+    # A captured pipe must still drain after startup, or vpnc can deadlock
+    # before it reaches its disconnect hook. No retained runtime log.
+    while child.poll() is None:
+        drain_client(child)
+        time.sleep(.05)
+    return child.wait()
+
+
 def connect(profile_name):
     # Imports stay out of the vpnc hook, which runs several times per connection.
     from runtime import read_bootstrap
@@ -236,17 +259,20 @@ def connect(profile_name):
     values.clear()
     child = subprocess.Popen(vpnc_command(profile, config),
                              env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': str(READY.parent)},
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     def stop(_signal, _frame):
         if child.poll() is None:
             child.terminate()
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, stop)
     try:
+        os.set_blocking(child.stderr.fileno(), False)
+        errors = ClientErrors()
         deadline = time.monotonic() + 90
         last = 'negotiating'
         publish(last)
         while True:
+            drain_client(child, errors)
             stage = hook_stage()
             if stage and stage != last:
                 publish(stage)
@@ -256,7 +282,8 @@ def connect(profile_name):
             if READY.exists():
                 break
             if child.poll() is not None:
-                publish('client-exited')
+                drain_client(child, errors)  # Include the final stderr tail.
+                publish(errors.stage)
                 raise ValueError('VPN client exited before readiness')
             if time.monotonic() >= deadline:
                 publish('startup-timeout')
@@ -265,7 +292,8 @@ def connect(profile_name):
         config.unlink()  # no password or OTP remains in the config after login
         clear_challenge()
         publish('ready')
-        return child.wait()
+        errors.pending.clear()
+        return wait_client(child)
     finally:
         READY.unlink(missing_ok=True)
         config.unlink(missing_ok=True)
@@ -277,6 +305,7 @@ def connect(profile_name):
                 child.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 child.kill(); child.wait()
+        child.stderr.close()
 
 
 if __name__ == '__main__':

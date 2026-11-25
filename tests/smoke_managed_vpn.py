@@ -27,7 +27,7 @@ from networking import NetworkError
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--connection', required=True)
 parser.add_argument('--image', required=True)
-parser.add_argument('--failure', choices=['auth', 'challenge', 'route', 'client'])
+parser.add_argument('--failure', choices=['auth', 'challenge', 'route', 'client', 'client-auth', 'client-timeout'])
 parser.add_argument('--challenge', action='store_true', help='Exercise separate XAUTH TOTP using the real one-shot helper')
 args = parser.parse_args()
 env = {'HOME': str(Path.home()), 'PATH': '/opt/podman/bin:/usr/bin:/bin:/usr/sbin:/sbin',
@@ -107,6 +107,13 @@ elif args.failure == 'route':
 elif args.failure == 'client':
     fake_vpnc = fake_vpnc.replace("sys.path.insert(0,'/opt/secret-proxy')", "sys.exit(42)\nsys.path.insert(0,'/opt/secret-proxy')")
 
+elif args.failure in ('client-auth', 'client-timeout'):
+    message = 'authentication unsuccessful' if args.failure == 'client-auth' else 'no response from target'
+    # Private-looking unknown text must not escape; only the known fatal line
+    # becomes a fixed stage. This runs no real authentication or VPN transport.
+    refusal = "sys.stderr.write('private fixture diagnostic\\n/usr/sbin/vpnc: " + message + "\\n'); sys.exit(2)\n"
+    fake_vpnc = fake_vpnc.replace("sys.path.insert(0,'/opt/secret-proxy')", refusal + "sys.path.insert(0,'/opt/secret-proxy')")
+
 # All fixture bytes are synthetic and staged only in a new VM temporary dir.
 setup = '''import json,pathlib,shutil,sys
 value=json.load(sys.stdin); root=pathlib.Path('/fixture/.config/standalone-secret-proxy')/value['name']
@@ -153,7 +160,9 @@ try:
                     invoke(selected)
                 except NetworkError as error:
                     expected = {'auth': 'vault', 'challenge': 'challenge-refused',
-                                'route': 'full-tunnel-required', 'client': 'client-exited'}[args.failure]
+                                'route': 'full-tunnel-required', 'client': 'client-exited',
+                                'client-auth': 'client-auth-rejected',
+                                'client-timeout': 'client-peer-no-response'}[args.failure]
                     assert str(error) == 'Managed VPN failed readiness (stage: ' + expected + '); no direct fallback', str(error)
                 else:
                     raise AssertionError('Failed VPN login was accepted')

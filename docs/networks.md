@@ -207,11 +207,32 @@ not necessarily its underlying cause:
   configuration.
 - `negotiating`, `client-exited`, `startup-timeout`: the VPN client started but
   never completed readiness. These codes alone do not prove incorrect credentials.
+- `client-peer-no-response`: the client exhausted its peer-response retries;
+  this does not distinguish a dropped packet from a silently refusing gateway.
+- `client-auth-rejected`, `client-group-auth-failed`: the client reported XAUTH
+  rejection or failed group-authentication hash verification. Neither identifies
+  which stored value or server policy needs changing; do not guess or loop logins.
+- `client-bind-failed`, `client-tunnel-open-failed`, `client-send-failed`,
+  `client-socket-failed`: a local socket, tunnel or packet operation failed.
+- `client-helper-failed`, `client-interactive-required`: the client could not
+  obtain a challenge answer or required interactive handling.
+- `client-negotiation-rejected`, `client-weak-algorithm`: the client rejected
+  protocol negotiation or an offered weak algorithm. No algorithm downgrade or
+  peer/firewall expansion is performed automatically.
 - `challenge-refused`: the one-shot helper rejected a prompt, identity, deadline
   or repeated invocation. Do not retry authentication in a loop.
 - `route-script-failed`, `full-tunnel-required`, `hook-rejected`: the distro hook
   failed, full-tunnel routes were absent, or an unexpected event/interface was
   supplied. The proxy does not force routes or relax the interface requirement.
+
+Only recognised fatal stderr lines from the packaged client are translated into
+these fixed codes. Input is processed in bounded chunks/lines in the trusted
+gateway and discarded, never printed, written to a log, or passed to the host.
+Debug output remains disabled and client stdout is discarded. Unknown or
+oversized diagnostics still yield `client-exited`. A pipe continues draining
+after readiness to prevent output backpressure from blocking disconnect.
+A rejected hook/helper takes precedence over a client error. Diagnostics never
+authorise readiness, retries, a policy change or weaker transport.
 
 The packaged client calls `pre-init` before it defines `TUNDEV`; this event alone
 may omit it. Connect/disconnect events still require exactly `tun0`. A failed
@@ -236,6 +257,7 @@ established TCP and restored-route traffic are blocked, with positive controls.
 Off-tunnel UDP DNS is also blocked, with a permitted tunnel-path control.
 `tests/smoke_vpnc_binary.py` additionally runs the packaged VPN binary under
 `--network=none`, with synthetic credentials and an unreachable dummy peer. It
-checks real pre-init ordering, TUN creation and refusal of an unexpected helper
-prompt. Neither that test nor the synthetic lifecycle tests prove a real gateway
+checks real pre-init ordering, TUN creation, safe classification of a local
+socket collision and an unreachable synthetic peer, and refusal of an unexpected
+helper prompt. Neither that test nor the synthetic lifecycle tests prove a real gateway
 login, MFA policy, company DNS or API access.
