@@ -135,7 +135,7 @@ class VpncTests(unittest.TestCase):
                 self.assertEqual(args, ['/usr/share/vpnc-scripts/vpnc-script'])
                 self.assertNotIn('INTERNAL_IP4_DNS', kwargs['env'])
             with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run', side_effect=run):
-                vpn.hook({'reason': 'disconnect', 'TUNDEV': 'tun0', 'INTERNAL_IP4_DNS': '10.20.0.53'})
+                vpn.hook({'reason': 'disconnect', 'TUNDEV': 'tun0', 'VPNPID': '123', 'INTERNAL_IP4_DNS': '10.20.0.53'})
             self.assertFalse(ready.exists())
 
     def test_real_vpnc_pre_init_has_no_tundev_yet(self):
@@ -146,7 +146,7 @@ class VpncTests(unittest.TestCase):
             with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run') as run:
                 accepted = True
                 try:
-                    vpn.hook({'reason': 'pre-init'})
+                    vpn.hook({'reason': 'pre-init', 'VPNPID': '123'})
                 except ValueError:
                     accepted = False
                 self.assertTrue(accepted, 'Packaged vpnc pre-init must not require TUNDEV')
@@ -163,7 +163,7 @@ class VpncTests(unittest.TestCase):
             with self.subTest(env=env), tempfile.TemporaryDirectory() as tmp:
                 ready = Path(tmp) / 'ready'; ready.touch()
                 with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run') as run:
-                    with self.assertRaises(ValueError): vpn.hook(env)
+                    with self.assertRaises(ValueError): vpn.hook({**env, 'VPNPID': '123'})
                     run.assert_not_called()
                 self.assertFalse(ready.exists())
                 self.assertEqual((ready.parent / 'hook-status').read_text(), 'hook-rejected\n')
@@ -179,7 +179,7 @@ class VpncTests(unittest.TestCase):
                 self.assertEqual(vpn.hook_stage(), 'challenge-refused')
                 for reason in ('connect', 'disconnect'):
                     with self.assertRaises(ValueError):
-                        vpn.hook({'reason': reason, 'TUNDEV': 'tun0'})
+                        vpn.hook({'reason': reason, 'TUNDEV': 'tun0', 'VPNPID': '123'})
                     self.assertFalse(ready.exists())
                     self.assertEqual(vpn.hook_stage(), 'challenge-refused')
                 run.assert_not_called()
@@ -209,7 +209,7 @@ class VpncTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, json.dumps(data).encode(), b'')
                 with patch.object(vpn, 'READY', ready), patch.object(vpn.subprocess, 'run', side_effect=run):
                     if permitted:
-                        vpn.hook({'reason': 'connect', 'TUNDEV': 'tun0'})
+                        vpn.hook({'reason': 'connect', 'TUNDEV': 'tun0', 'VPNPID': '123'})
                     else:
-                        with self.assertRaises(ValueError): vpn.hook({'reason': 'connect', 'TUNDEV': 'tun0'})
+                        with self.assertRaises(ValueError): vpn.hook({'reason': 'connect', 'TUNDEV': 'tun0', 'VPNPID': '123'})
                 self.assertEqual(ready.exists(), permitted)

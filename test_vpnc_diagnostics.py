@@ -126,6 +126,7 @@ class ClientErrorTests(unittest.TestCase):
             self.assertIs(popen.call_args.kwargs['stdout'], subprocess.DEVNULL)
             self.assertIs(popen.call_args.kwargs['stdin'], subprocess.DEVNULL)
             self.assertNotIn('OP_SERVICE_ACCOUNT_TOKEN', popen.call_args.kwargs['env'])
+            self.assertEqual(popen.call_args.kwargs['env'].get('VPNPID'), str(os.getpid()))
             child.stderr.close.assert_called_once()
             vpn.clear_challenge.assert_called_once()
             self.assertFalse(ready.exists())

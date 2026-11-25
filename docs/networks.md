@@ -88,7 +88,9 @@ arguments or shell interpolation. Without TOTP, the password is sent as stored.
 Login is automated and bounded, with stdin closed. Challenge mode omits vpnc's
 `--non-inter` (which prevents its helper from answering a second XAUTH challenge),
 not our timeout, one-shot limit or closed stdin. There is no automatic reconnect
-or repeated MFA loop.
+or repeated MFA loop. The client uses `Local Port 0` (an ephemeral source port),
+not a fixed local UDP500/4500 bind. Peer destination ports remain IKE500/NAT-T4500.
+This matters behind container/VM NAT; it does not broaden the packet filter.
 
 `dh14` is preferred where the server supports it. Legacy `dh2`/`dh5` are explicit
 compatibility options, not a recommendation: IKEv1/XAUTH and older DH groups have
@@ -222,8 +224,8 @@ not necessarily its underlying cause:
 - `challenge-refused`: the one-shot helper rejected a prompt, identity, deadline
   or repeated invocation. Do not retry authentication in a loop.
 - `route-script-failed`, `full-tunnel-required`, `hook-rejected`: the distro hook
-  failed, full-tunnel routes were absent, or an unexpected event/interface was
-  supplied. The proxy does not force routes or relax the interface requirement.
+  failed, full-tunnel routes were absent, or the event/interface/connection identity
+  was missing or invalid. The proxy does not force routes or relax these checks.
 
 Only recognised fatal stderr lines from the packaged client are translated into
 these fixed codes. Input is processed in bounded chunks/lines in the trusted
@@ -235,8 +237,12 @@ A rejected hook/helper takes precedence over a client error. Diagnostics never
 authorise readiness, retries, a policy change or weaker transport.
 
 The packaged client calls `pre-init` before it defines `TUNDEV`; this event alone
-may omit it. Connect/disconnect events still require exactly `tun0`. A failed
-hook withdraws readiness and its first failure is retained through cleanup.
+may omit it. Connect/disconnect events still require exactly `tun0`. Every hook
+also requires the explicit positive `VPNPID` supplied by the controlling gateway
+runtime. This stable identity names the distro script's saved route files across
+fresh Python hook processes; it avoids its `ps`/parent-process fallback entirely.
+Missing or invalid identity fails closed rather than guessing a different file.
+A failed hook withdraws readiness and its first failure is retained through cleanup.
 The controller, rather than Podman's auto-removal, removes the exact owned
 container ID, so a fast startup failure cannot race away its final status.
 Status frames cannot establish readiness or authorize traffic.
@@ -256,8 +262,18 @@ endpoint/trust/capability. Separate packet tests prove direct IPv4, IPv6,
 established TCP and restored-route traffic are blocked, with positive controls.
 Off-tunnel UDP DNS is also blocked, with a permitted tunnel-path control.
 `tests/smoke_vpnc_binary.py` additionally runs the packaged VPN binary under
-`--network=none`, with synthetic credentials and an unreachable dummy peer. It
-checks real pre-init ordering, TUN creation, safe classification of a local
-socket collision and an unreachable synthetic peer, and refusal of an unexpected
-helper prompt. Neither that test nor the synthetic lifecycle tests prove a real gateway
-login, MFA policy, company DNS or API access.
+`--network=none`, with synthetic credentials and a local unanswered peer. It
+observes an actual ephemeral-source IKE packet while local UDP500 is occupied,
+using the production config without port overrides. It also checks real pre-init,
+TUN creation, classified bind/no-response errors and unexpected-helper refusal.
+
+`tests/smoke_vpnc_routes.py` runs the actual packaged route script through fresh
+production hook processes: pre-init, connect, reconnect and disconnect, twice.
+A real TUN and synthetic routes live only in a no-network container. It verifies
+one stable backup file, original-default restoration, backup cleanup and unchanged
+DNS/kill-switch rules. It does not run IKE authentication. Its `--mutation
+unstable-pid` variant must fail restoration; the binary smoke's `--mutation
+fixed-port` must fail negotiation with local UDP500 occupied.
+
+Neither these tests nor the synthetic lifecycle tests prove a real gateway login,
+MFA policy, company DNS or API access.

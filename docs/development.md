@@ -73,6 +73,23 @@ fixtures, but executes the real controller, route script, firewall, relay and
 cleanup. It is not live VPN acceptance. `tests/vpn_mutations.py` checks the unit
 regressions against temporary source mutations and restores every byte.
 
+Packaged client/config and route-script compatibility checks (no external network,
+vault or real authentication):
+
+```sh
+uv run --locked python tests/smoke_vpnc_binary.py --connection devenv \
+  --image localhost/secret-proxy-candidate:phase2
+uv run --locked python tests/smoke_vpnc_routes.py --connection devenv \
+  --image localhost/secret-proxy-candidate:phase2
+```
+
+The binary test observes ephemeral-source IKE with UDP500 occupied, without an
+argv override. The route test invokes fresh production hook processes and the
+actual distro script against a real TUN, checking saved-route identity and
+restoration while retaining the packet kill switch. `--mutation fixed-port` on
+the binary test and `--mutation unstable-pid` on the route test must fail their
+specific assertions. Run the unmodified positive controls first.
+
 Optional **live, billable** Pi prompt/compaction/recall acceptance uses an already
 logged-in candidate and temporary sealed-only auth/settings. It never changes the
 original agent directory, enables tools/extensions or saves a session:

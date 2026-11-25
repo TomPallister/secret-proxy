@@ -70,11 +70,13 @@ import os,pathlib,signal,socket,subprocess,sys,time
 sys.path.insert(0,'/opt/secret-proxy')
 from vpnc_runtime import hook
 assert 'OP_SERVICE_ACCOUNT_TOKEN' not in os.environ
+assert os.environ.get('VPNPID') == str(os.getppid())
 assert '--no-detach' in sys.argv
 with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as ike: ike.bind(('0.0.0.0',500))
 text=pathlib.Path(sys.argv[-1]).read_text()
 assert 'Xauth password fixture-pass\\n' in text
 assert 'IPSec secret fixture-group\\n' in text
+assert 'Local Port 0\\n' in text
 if 'Password helper ' in text:
  assert '--non-inter' not in sys.argv
  helper=text.split('Password helper ',1)[1].splitlines()[0]
@@ -86,7 +88,7 @@ if 'Password helper ' in text:
 else:
  assert '--non-inter' in sys.argv
 assert 'policy drop' in subprocess.check_output(['nft','list','ruleset']).decode()
-env={**os.environ,'reason':'pre-init','VPNGATEWAY':'192.0.2.8','VPNPID':str(os.getpid()),
+env={**os.environ,'reason':'pre-init','VPNGATEWAY':'192.0.2.8',
      'INTERNAL_IP4_ADDRESS':'10.222.0.2','INTERNAL_IP4_NETMASK':'255.255.255.255','INTERNAL_IP4_MTU':'1390'}
 hook(env)
 subprocess.run(['ip','link','add','tun0','type','dummy'],check=True)

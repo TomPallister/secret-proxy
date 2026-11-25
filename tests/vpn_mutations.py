@@ -10,6 +10,21 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = [
+    ('client-source-port', 'vpnc_runtime.py', "('Local Port', '0'), ", '',
+     'test_vpnc_compatibility.CompatibilityTests.test_client_uses_ephemeral_source_port_in_every_auth_mode'),
+    ('client-ambient-identity', 'vpnc_runtime.py', "'VPNPID': str(os.getpid())",
+     "'VPNPID': os.environ.get('VPNPID', str(os.getpid()))",
+     'test_vpnc_compatibility.CompatibilityTests.test_client_environment_uses_controller_identity_and_excludes_ambient_secrets'),
+    ('client-identity-not-passed', 'vpnc_runtime.py', 'env=client_environment(),',
+     "env={'PATH': '/usr/bin:/bin'},",
+     'test_vpnc_diagnostics.ClientErrorTests.test_connect_reads_exit_tail_without_logging_and_cleans_up'),
+    ('hook-unsafe-identity', 'vpnc_runtime.py',
+     "if (not isinstance(identity, str) or re.fullmatch(r'[1-9][0-9]{0,9}', identity) is None\n                or int(identity) > 2147483647):",
+     'if False:',
+     'test_vpnc_compatibility.CompatibilityTests.test_hook_rejects_missing_or_unsafe_identity_without_running_route_script'),
+    ('hook-fresh-identity', 'vpnc_runtime.py', "env['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'",
+     "env['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'\n        env['VPNPID'] = str(os.getpid())",
+     'test_vpnc_compatibility.CompatibilityTests.test_every_hook_forwards_same_identity_despite_different_python_parent'),
     ('direct-default', 'host.py', "return replace(self, network=None, vpn=None, network_name='direct')",
      'return self.select_network(next(iter(self.networks)))',
      'test_vpn_selection.SelectionTests.test_catalog_has_no_default_and_direct_never_uses_a_vpn'),

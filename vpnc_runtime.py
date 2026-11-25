@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import struct
@@ -71,6 +72,14 @@ def clear_challenge(state=CHALLENGE):
     state.with_suffix('.used').unlink(missing_ok=True)
 
 
+def client_environment():
+    # The standard route script uses VPNPID for per-connection backup names.
+    # Our controller lives across every hook; each Python hook process does not.
+    # Supplying this explicitly avoids its ps/PPID fallback (ps is not installed).
+    return {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': str(READY.parent),
+            'VPNPID': str(os.getpid())}
+
+
 def vpnc_command(profile, config):
     # vpnc refuses a second XAUTH challenge with --non-inter, even when a
     # Password helper is configured. Our helper is one-shot and stdin stays EOF.
@@ -89,7 +98,7 @@ def configuration(profile, values, gateway, now):
     fields = [('IPSec gateway', gateway), ('IPSec ID', profile['group']),
               ('IPSec secret', values['groupSecret']), ('IKE DH Group', profile['dhGroup']),
               ('Xauth username', values['usernameSecret']), ('Xauth password', password),
-              ('Interface name', 'tun0'), ('NAT Traversal Mode', 'natt'),
+              ('Local Port', '0'), ('Interface name', 'tun0'), ('NAT Traversal Mode', 'natt'),
               ('Script', str(ROOT / '.venv/bin/python') + ' ' + str(ROOT / 'vpnc_runtime.py') + ' hook')]
     if profile.get('totpMode') == 'challenge':
         fields.append(('Password helper', str(ROOT / 'vpnc_password_helper.py')))
@@ -151,6 +160,10 @@ def hook(environment=None):
         valid_interface = env.get('TUNDEV') in (None, 'tun0') if reason == 'pre-init' else env.get('TUNDEV') == 'tun0'
         if reason not in ('pre-init', 'connect', 'disconnect', 'reconnect', 'attempt-reconnect') or not valid_interface:
             raise ValueError('Unexpected VPN script event')
+        identity = env.get('VPNPID')
+        if (not isinstance(identity, str) or re.fullmatch(r'[1-9][0-9]{0,9}', identity) is None
+                or int(identity) > 2147483647):
+            raise ValueError('Missing or invalid VPN connection identity')
         if hook_stage() in FAILURES:
             raise ValueError('VPN hook previously failed')
         # Proxy DNS is explicit in the installed profile, not a rewritten guest file.
@@ -258,7 +271,7 @@ def connect(profile_name):
         write_challenge(values, gateway)
     values.clear()
     child = subprocess.Popen(vpnc_command(profile, config),
-                             env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': str(READY.parent)},
+                             env=client_environment(),
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     def stop(_signal, _frame):
         if child.poll() is None:
