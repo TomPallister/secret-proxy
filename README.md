@@ -73,7 +73,7 @@ See [client compatibility](docs/clients.md); never disable TLS verification.
 | Proxy-owned OAuth | Supported derived-token services, ChatGPT/Codex, GitHub Copilot and gh |
 | Login persistence | Optional separate [read/write login vault](docs/advanced-setup.md#login-store) |
 | AWS signing and filtering | Okta/SAML; [aws-policy.json](docs/operations.md#aws-operation-policy) starter blocks secret reads and client-side credential/token minting |
-| GitHub API guard | [Normal repo writes, no administration](docs/github-policy.md); parsed GraphQL, unknown writes refused |
+| GitHub API guard | [Developer writes and narrow management exceptions](docs/github-policy.md); parsed GraphQL, unknown writes refused |
 | Git signing | Commit/tag signatures without handing clients a private key |
 | Scoped clients | Separate tokens and [grants](docs/advanced-setup.md#scoped-clients) for secrets, AWS roles, signing and logins |
 | Egress checks | Metadata/private-address refusal; optional [host allow/deny lists](docs/advanced-setup.md#egress-controls) |

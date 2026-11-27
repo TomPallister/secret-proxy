@@ -67,7 +67,22 @@ _REST_WRITES = (
 _REST_WRITES = tuple((set(methods.split("|")), re.compile(_REPO + "(?:" + path + ")\\Z"))
                      for methods, path in _REST_WRITES)
 
+# Deliberate narrow administrative exceptions. Variables are NOT secrets or
+# runner registration; assigning a variable to a repo does not grant repo access.
+_ORG = r"/orgs/[^/]+"
+_VARIABLES = rf"(?:{_REPO}/actions|{_ORG}/actions|(?:{_REPO}|/repositories/{_ID})/environments/[^/]+)/variables"
+_REST_EXCEPTIONS = (
+    ("POST", rf"/user/repos|{_ORG}/repos|{_REPO}/(?:generate|forks|hooks)|{_ORG}/hooks"),
+    ("POST", _VARIABLES),
+    ("PATCH|DELETE", _VARIABLES + r"/[^/]+"),
+    ("PUT", _ORG + r"/actions/variables/[^/]+/repositories"),
+    ("PUT|DELETE", _ORG + rf"/actions/variables/[^/]+/repositories/{_ID}"),
+)
+_REST_WRITES += tuple((set(methods.split("|")), re.compile("(?:" + path + ")\\Z"))
+                      for methods, path in _REST_EXCEPTIONS)
+
 _MUTATIONS = frozenset("""
+createRepository cloneTemplateRepository archiveRepository
 addComment updateIssueComment deleteIssueComment
 createIssue updateIssue closeIssue reopenIssue deleteIssue
 addAssigneesToAssignable removeAssigneesFromAssignable
@@ -114,6 +129,26 @@ def _unique(pairs):
             raise ValueError()
         out[key] = value
     return out
+
+
+def _archive_only(query_string, headers, body):
+    """PATCH /repos/{owner}/{repo} is shared with settings: allow only archiving.
+
+    No query parameters (GitHub may read them as operation arguments), no extra
+    settings, no unarchive, no type coercion, and no ambiguous/encoded JSON.
+    """
+    types = [v.split(";", 1)[0].strip().lower() for k, v in headers if k.lower() == "content-type"]
+    encodings = [v for k, v in headers if k.lower() == "content-encoding"]
+    if (query_string or types != ["application/json"] or encodings not in ([], ["identity"])
+            or body is None or len(body) > BODY_LIMIT):
+        return "archive-only"
+    try:
+        data = json.loads(body.decode("utf-8"), object_pairs_hook=_unique)
+        if isinstance(data, dict) and set(data) == {"archived"} and data["archived"] is True:
+            return None
+    except (ValueError, UnicodeError, RecursionError):
+        pass
+    return "archive-only"
 
 
 def _graphql(method, query_string, headers, body):
@@ -229,6 +264,8 @@ def check(*, method, host, path, headers=(), body=None, enterprise_domains=()):
         if method == "POST" and re.fullmatch(_REPO + r"/releases/[0-9]+/assets", path):
             return None
     elif api:
+        if method == "PATCH" and re.fullmatch(_REPO, path):
+            return _archive_only(query, headers, body)
         if any(method in methods and pattern.fullmatch(path) for methods, pattern in _REST_WRITES):
             return None
     elif method == "POST" and re.fullmatch(r"/[^/]+/[^/]+/(?:git-upload-pack|git-receive-pack)", path):

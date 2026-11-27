@@ -338,10 +338,10 @@ developer-access policy, including uploads and Git over HTTPS, looks like this:
 }
 ```
 
-- The [GitHub operation guard](github-policy.md) still refuses administration,
-  credential changes, new repos/gists and unknown writes, including GraphQL
-  mutations. Broad placements do not bypass it; normal repo writes need no new
-  prompts. Only inspectable POST JSON GraphQL documents are supported.
+- The [GitHub operation guard](github-policy.md) permits normal repo writes plus
+  creation/fork/archive, webhook creation and Actions variables, but refuses other
+  administration, credential changes, gists and unknown writes. Broad placements
+  do not bypass it; no new prompts. Only inspectable POST JSON GraphQL is supported.
 - `scopes` defaults to gh's own minimum (`repo`, `read:org`, `gist`). Fewer
   scopes limit what the token can do on GitHub, whatever the placements allow.
 - Path rules can't tell a Git fetch from a push, so Git placements grant both.

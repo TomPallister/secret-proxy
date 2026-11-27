@@ -14,13 +14,14 @@ ADMIN = (
     ("POST", "/user/keys"), ("POST", "/user/gpg_keys"), ("POST", "/user/ssh_signing_keys"),
     ("PATCH", "/user"), ("DELETE", "/repos/acme/app"), ("PATCH", "/repos/acme/app"),
     ("POST", "/repos/acme/app/transfer"), ("PUT", "/repos/acme/app/collaborators/someone"),
-    ("POST", "/repos/acme/app/hooks"), ("POST", "/repos/acme/app/keys"),
+    ("PATCH", "/repos/acme/app/hooks/1"), ("DELETE", "/repos/acme/app/hooks/1"), ("POST", "/repos/acme/app/keys"),
     ("PUT", "/repos/acme/app/actions/secrets/KEY"), ("POST", "/repos/acme/app/actions/runners/registration-token"),
     ("PUT", "/repos/acme/app/branches/main/protection"), ("POST", "/repos/acme/app/rulesets"),
     ("PUT", "/repos/acme/app/environments/prod"), ("POST", "/orgs/acme/invitations"),
-    ("PATCH", "/orgs/acme"), ("POST", "/orgs/acme/hooks"), ("PUT", "/teams/1/memberships/someone"),
+    ("PATCH", "/orgs/acme"), ("PATCH", "/orgs/acme/hooks/1"), ("DELETE", "/orgs/acme/hooks/1"),
+    ("PUT", "/teams/1/memberships/someone"),
     ("POST", "/app/installations/1/access_tokens"), ("POST", "/applications/client/token"),
-    ("POST", "/authorizations"), ("POST", "/gists"), ("POST", "/user/repos"),
+    ("POST", "/authorizations"), ("POST", "/gists"), ("DELETE", "/repos/acme/app/forks"),
     ("POST", "/repos/acme/app/future-admin-api"),
 )
 NORMAL = (
@@ -105,6 +106,106 @@ class GithubAddonTests(AddonTestCase):
                              ("/acme/app.git/git-receive-pack", "POST"),
                              ("/acme/app/git-upload-pack", "POST")):
             self.allowed(self.flow(method, path, host="github.com", sink="basic"))
+
+    def test_repo_creation_forking_and_webhook_creation(self):
+        cases = [
+            ("/user/repos", {"name": "fixture-repo", "private": True}),
+            ("/orgs/acme/repos", {"name": "fixture-repo", "visibility": "private"}),
+            ("/repos/acme/template/generate", {"owner": "acme", "name": "fixture-repo"}),
+            ("/repos/acme/app/forks", {"organization": "example", "default_branch_only": True}),
+            ("/repos/acme/app/hooks", {"name": "web", "config": {"url": "https://hooks.example.com/events"}, "events": ["push"]}),
+            ("/orgs/acme/hooks", {"name": "web", "config": {"url": "https://hooks.example.com/events"}, "events": ["repository"]}),
+        ]
+        for http2 in (False, True):
+            for path, body in cases:
+                with self.subTest(http2=http2, path=path):
+                    flow = self.flow("POST", path, json.dumps(body).encode())
+                    if http2:
+                        flow.request.http_version = "HTTP/2.0"
+                        del flow.request.headers["Host"]
+                    self.allowed(flow)
+
+    def test_archive_only_not_general_repository_settings(self):
+        for host, prefix in (("api.github.com", ""), ("git.example.com", "/api/v3")):
+            with patch.object(self.addon._manifest, "github_login", create=True,
+                              return_value={"domain": "git.example.com"}):
+                path = prefix + "/repos/acme/app"
+                for http2 in (False, True):
+                    flow = self.flow("PATCH", path, b'{"archived":true}', host)
+                    if http2:
+                        flow.request.http_version = "HTTP/2.0"
+                        del flow.request.headers["Host"]
+                    self.allowed(flow)
+                for body in (b'{"archived":false}', b'{"archived":1}', b'{"archived":"true"}',
+                             b'{"archived":null}', b'{}', b'[]', b'not-json',
+                             b'{"archived":false,"archived":true}',
+                             b'{"archived":true,"visibility":"public"}',
+                             b'{"archived":true,"name":"renamed"}',
+                             b'{"archived":true,"security_and_analysis":{}}',
+                             b'{"archived":true}' + b' ' * (2 * 1024 * 1024)):
+                    with self.subTest(host=host, body=body[:80]):
+                        self.denied(self.flow("PATCH", path, body, host))
+                self.denied(self.flow("PATCH", path + "?visibility=public", b'{"archived":true}', host))
+                flow = self.flow("PATCH", path, b'{"archived":true}', host)
+                flow.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
+                self.denied(flow)
+                flow = self.flow("PATCH", path, b'{"archived":true}', host)
+                flow.request.headers["Content-Encoding"] = "gzip"
+                flow.request.raw_content = gzip.compress(b'{"archived":true}')
+                self.denied(flow)
+
+    def test_lifecycle_graphql_and_team_reads(self):
+        for query in (
+            'mutation { createRepository(input:{name:"fixture",visibility:PRIVATE}) { clientMutationId } }',
+            'mutation { cloneTemplateRepository(input:{repositoryId:"x",ownerId:"y",name:"fixture",visibility:PRIVATE}) { clientMutationId } }',
+            'mutation { alias: archiveRepository(input:{repositoryId:"x"}) { clientMutationId } }',
+            'mutation($input:ArchiveRepositoryInput!){ ...Archive } fragment Archive on Mutation { archiveRepository(input:$input){clientMutationId} }',
+            'query { organization(login:"acme") { teams(first:10) { nodes { name members(first:10) { nodes {login} } } } } }',
+        ):
+            self.allowed(self.flow("POST", "/graphql", gql(query, variables={"input": {"repositoryId": "x"}})))
+        for path in ("/user/teams", "/orgs/acme/teams", "/orgs/acme/teams/platform", "/orgs/acme/teams/platform/members",
+                     "/orgs/acme/teams/platform/repos", "/teams/123", "/teams/123/members"):
+            self.allowed(self.flow("GET", path))
+        for mutation in ("unarchiveRepository", "updateRepository", "deleteRepository", "transferRepository",
+                         "createTeam", "updateTeam", "addTeamMember", "updateTeamsRepository"):
+            self.denied(self.flow("POST", "/graphql", gql('mutation { archiveRepository: ' + mutation + '(input:{repositoryId:"x"}){clientMutationId} }')))
+        self.denied(self.flow("POST", "/graphql", gql('mutation { archiveRepository(input:{repositoryId:"x"}){clientMutationId} updateRepository(input:{repositoryId:"x",visibility:PUBLIC}){clientMutationId} }')))
+
+    def test_manage_actions_variables_in_all_scopes(self):
+        bases = ("/repos/acme/app/actions/variables", "/orgs/acme/actions/variables",
+                 "/repos/acme/app/environments/production/variables",
+                 "/repositories/123/environments/production/variables")
+        for base in bases:
+            for method, suffix, body in (("GET", "", None), ("GET", "/CONFIG", None),
+                                         ("POST", "", {"name": "CONFIG", "value": "fixture", "visibility": "all"}),
+                                         ("PATCH", "/CONFIG", {"value": "updated"}), ("DELETE", "/CONFIG", None)):
+                with self.subTest(base=base, method=method):
+                    self.allowed(self.flow(method, base + suffix, json.dumps(body).encode() if body is not None else None))
+        for method, path, body in (
+            ("GET", "/orgs/acme/actions/variables/CONFIG/repositories", None),
+            ("PUT", "/orgs/acme/actions/variables/CONFIG/repositories", {"selected_repository_ids": [123, 456]}),
+            ("PUT", "/orgs/acme/actions/variables/CONFIG/repositories/123", None),
+            ("DELETE", "/orgs/acme/actions/variables/CONFIG/repositories/123", None),
+        ):
+            self.allowed(self.flow(method, path, json.dumps(body).encode() if body is not None else None))
+
+    def test_requested_exceptions_do_not_open_adjacent_administration(self):
+        denied = (
+            ("PUT", "/orgs/acme/teams/platform/memberships/someone"), ("POST", "/orgs/acme/teams"),
+            ("PUT", "/orgs/acme/teams/platform/repos/acme/app"),
+            ("PUT", "/repos/acme/app/actions/secrets/CONFIG"), ("PUT", "/orgs/acme/actions/secrets/CONFIG"),
+            ("DELETE", "/repos/acme/app/actions/secrets/CONFIG"), ("DELETE", "/orgs/acme/actions/secrets/CONFIG"),
+            ("PUT", "/repos/acme/app/environments/production/secrets/CONFIG"),
+            ("PUT", "/orgs/acme/actions/secrets/CONFIG/repositories/123"),
+            ("POST", "/orgs/acme/actions/runners/registration-token"),
+            ("DELETE", "/repos/acme/app/actions/runners/123"),
+            ("DELETE", "/orgs/acme/actions/variables"),
+            ("PATCH", "/orgs/acme/actions/variables/CONFIG/repositories"),
+            ("POST", "/repos/acme/app/hooks/123/deliveries/456/attempts"),
+            ("PUT", "/repos/acme/app/environments/production"),
+        )
+        for method, path in denied:
+            self.denied(self.flow(method, path, b'{"archived":true}'))
 
     def test_normal_graphql_operations(self):
         for query in ('query { viewer { login } }',

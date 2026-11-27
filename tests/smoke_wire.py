@@ -75,6 +75,9 @@ def main():
             protocol_version = 'HTTP/1.1'
 
             def do_GET(self):
+                if self.path.startswith(('/repos/', '/orgs/', '/user/', '/repositories/')):
+                    observed.append(self.headers['Authorization'] == 'Bearer ' + values['API_KEY'])
+                    return self.answer()
                 if self.path.startswith('/gh/'):
                     observed.append(self.headers['Authorization'] == 'token ' + copilot['github'])
                     return self.answer()
@@ -85,7 +88,7 @@ def main():
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers['Content-Length']))
-                if self.path == '/graphql' or self.path.startswith('/repos/'):
+                if self.path == '/graphql' or self.path.startswith(('/repos/', '/orgs/', '/user/', '/repositories/')):
                     observed.append(self.headers['Authorization'] == 'Bearer ' + values['API_KEY'])
                     return self.answer()
                 if self.path.startswith('/copilot/'):
@@ -95,6 +98,10 @@ def main():
                 observed.append(parse_qs(body.decode()).get('key') == [values['API_KEY']] and
                                 auth == 'fixture:' + values['API_KEY'])
                 self.answer()
+
+            do_PATCH = do_POST
+            do_PUT = do_POST
+            do_DELETE = do_POST
 
             def answer(self):
                 self.send_response(200 if observed[-1] else 400)
@@ -379,7 +386,7 @@ def aws_headers(service, extra):
             'x-amz-security-token': 'secretrole:123456789012/ReadOnly', **extra}
 
 
-def h2_request(port, proxy_auth, context, host, headers, body, path='/'):
+def h2_request(port, proxy_auth, context, host, headers, body, path='/', method='POST'):
     tunnel = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
     tunnel.set_tunnel(host, 443, {'Proxy-Authorization': proxy_auth})
     tunnel.connect()
@@ -389,7 +396,7 @@ def h2_request(port, proxy_auth, context, host, headers, body, path='/'):
             assert stream.selected_alpn_protocol() == 'h2'
             protocol = h2.connection.H2Connection(config=h2.config.H2Configuration(header_encoding='utf-8'))
             protocol.initiate_connection()
-            protocol.send_headers(1, [(':method', 'POST'), (':scheme', 'https'), (':authority', host),
+            protocol.send_headers(1, [(':method', method), (':scheme', 'https'), (':authority', host),
                                       (':path', path)] + [(k.lower(), v) for k, v in headers.items()]
                                   + [('content-length', str(len(body)))])
             protocol.send_data(1, body, end_stream=True)
@@ -416,23 +423,47 @@ def h2_request(port, proxy_auth, context, host, headers, body, path='/'):
 
 def github_checks(request, port, proxy_auth, context, observed):
     auth = {'Authorization': 'Bearer ' + REF + 'API_KEY', 'Content-Type': 'application/json'}
-    denied = [('/user/keys', b'{}'), ('/repos/example/repo/keys', b'{}'),
-              ('/graphql', json.dumps({'query': 'mutation { addComment: addSshKey(input:{key:"BODY-MARKER"}) { clientMutationId } }'}).encode()),
-              ('/graphql', json.dumps({'query': 'mutation {...F} fragment F on Mutation {deleteRepository(input:{repositoryId:"x"}){clientMutationId}}'}).encode())]
+    denied = [
+        ('POST', '/user/keys', b'{}'), ('POST', '/repos/example/repo/keys', b'{}'),
+        ('POST', '/graphql', json.dumps({'query': 'mutation { addComment: addSshKey(input:{key:"BODY-MARKER"}) { clientMutationId } }'}).encode()),
+        ('POST', '/graphql', json.dumps({'query': 'mutation {...F} fragment F on Mutation {deleteRepository(input:{repositoryId:"x"}){clientMutationId}}'}).encode()),
+        ('PATCH', '/repos/example/repo', b'{"archived":true,"visibility":"public"}'),
+        ('PATCH', '/repos/example/repo', b'{"archived":false}'),
+        ('PATCH', '/repos/example/repo/hooks/1', b'{}'),
+        ('DELETE', '/orgs/example/actions/secrets/CONFIG', b''),
+        ('PUT', '/orgs/example/teams/platform/memberships/someone', b'{}'),
+    ]
     before = len(observed)
-    for path, payload in denied:
-        status, body = request('POST', path, auth, payload, host='api.github.com', target_port=443)
+    for method, path, payload in denied:
+        status, body = request(method, path, auth, payload, host='api.github.com', target_port=443)
         assert status == 403 and json.loads(body)['error'] == 'secret_proxy_github_denied', (status, body)
-        status, headers, body = h2_request(port, proxy_auth, context, 'api.github.com', auth, payload, path)
+        status, headers, body = h2_request(port, proxy_auth, context, 'api.github.com', auth, payload, path, method)
         assert status == '403' and json.loads(body)['error'] == 'secret_proxy_github_denied', (status, body)
     assert len(observed) == before, 'denied GitHub call reached upstream'
-    for path, payload in [('/repos/example/repo/issues/1/comments', b'{"body":"ok"}'),
-                          ('/graphql', json.dumps({'query': 'mutation {addComment(input:{subjectId:"x",body:"ok"}){clientMutationId}}'}).encode())]:
-        status, body = request('POST', path, auth, payload, host='api.github.com', target_port=443)
+    allowed = [
+        ('POST', '/repos/example/repo/issues/1/comments', b'{"body":"ok"}'),
+        ('POST', '/graphql', json.dumps({'query': 'mutation {addComment(input:{subjectId:"x",body:"ok"}){clientMutationId}}'}).encode()),
+        ('POST', '/user/repos', b'{"name":"fixture"}'), ('POST', '/orgs/example/repos', b'{"name":"fixture"}'),
+        ('POST', '/repos/example/template/generate', b'{"name":"fixture"}'),
+        ('POST', '/repos/example/repo/forks', b'{}'),
+        ('PATCH', '/repos/example/repo', b'{"archived":true}'),
+        ('POST', '/graphql', json.dumps({'query': 'mutation {archiveRepository(input:{repositoryId:"x"}){clientMutationId}}'}).encode()),
+        ('GET', '/orgs/example/teams', b''),
+        ('POST', '/repos/example/repo/hooks', b'{"config":{"url":"https://hooks.example.com/events"}}'),
+        ('POST', '/orgs/example/hooks', b'{"config":{"url":"https://hooks.example.com/events"}}'),
+        ('POST', '/repos/example/repo/actions/variables', b'{"name":"CONFIG","value":"fixture"}'),
+        ('PATCH', '/orgs/example/actions/variables/CONFIG', b'{"value":"updated"}'),
+        ('POST', '/repos/example/repo/environments/prod/variables', b'{"name":"CONFIG","value":"fixture"}'),
+        ('DELETE', '/repositories/123/environments/prod/variables/CONFIG', b''),
+        ('PUT', '/orgs/example/actions/variables/CONFIG/repositories', b'{"selected_repository_ids":[123]}'),
+        ('DELETE', '/orgs/example/actions/variables/CONFIG/repositories/123', b''),
+    ]
+    for method, path, payload in allowed:
+        status, body = request(method, path, auth, payload, host='api.github.com', target_port=443)
         assert status == 200 and body == b'ok', (status, body)
-        status, headers, body = h2_request(port, proxy_auth, context, 'api.github.com', auth, payload, path)
+        status, headers, body = h2_request(port, proxy_auth, context, 'api.github.com', auth, payload, path, method)
         assert status == '200' and body == b'ok', (status, body)
-    assert observed[before:] == [True] * 4
+    assert observed[before:] == [True] * (2 * len(allowed))
 
 
 def aws_checks(request, port, proxy_auth, context):
