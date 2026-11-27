@@ -4,7 +4,7 @@ version = "0.1.0"
 license = "Apache-2.0"
 requires-python = ">=3.13,<3.14"
 dependencies = [
-  "graphql-core==3.2.7",
+  "graphql-core==3.2.12",
   "mitmproxy==12.3.1",
 ]
 

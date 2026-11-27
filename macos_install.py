@@ -180,13 +180,18 @@ def require_stopped_resources(deployment):
 
 
 def install(args):
-    if not getattr(args, 'update_networks', False):
+    networks = getattr(args, 'update_networks', False)
+    aws_policy = getattr(args, 'update_aws_policy', False)
+    if networks and aws_policy:
+        raise HostError('Update only one policy family at a time')
+    if not networks and not aws_policy:
         return install_snapshot(args)
+    what = 'networks' if networks else 'AWS policy'
     if sys.platform != 'darwin' or os.getuid() != 0 or os.environ.get('SUDO_USER') in (None, '', 'root'):
         raise HostError('Run with sudo from your own macOS account')
     deployment = Deployment.from_dict({'instance': args.instance, 'machine': args.machine, 'port': args.port})
     if deployment.private.is_symlink() or not deployment.private.is_dir():
-        raise HostError('Network updates require an existing installation')
+        raise HostError('Policy updates require an existing installation')
     # Metadata-only change, but require an explicitly stopped instance and hold
     # the same lock as serve throughout validation/staging/publication.
     import fcntl
@@ -196,9 +201,9 @@ def install(args):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise HostError('Stop the instance before updating networks') from None
+            raise HostError('Stop the instance before updating ' + what) from None
         if (deployment.shared / 'ready.json').exists():
-            raise HostError('Stop the instance before updating networks')
+            raise HostError('Stop the instance before updating ' + what)
         require_stopped_resources(deployment)
         return install_snapshot(args)
     finally:
@@ -213,6 +218,8 @@ def install_snapshot(args):
         raise HostError('Unsupported local account name')
     source = args.config.resolve(strict=True)
     contents = validate_source_config(source)
+    if getattr(args, 'update_aws_policy', False) and 'aws-policy.json' not in contents:
+        raise HostError('An explicit AWS policy update requires aws-policy.json')
     policy = {'instance': args.instance, 'machine': args.machine, 'port': args.port}
     if 'network.json' in contents:
         policy['network'] = json.loads(contents['network.json'])
@@ -253,6 +260,9 @@ def install_snapshot(args):
         if getattr(args, 'update_networks', False):
             actual.pop('networks.json', None)
             expected.pop('networks.json', None)
+        if getattr(args, 'update_aws_policy', False):
+            actual.pop('aws-policy.json', None)
+            expected.pop('aws-policy.json', None)
         if actual != expected:
             raise HostError('Existing private policy differs; no implicit overwrite')
     release = ROOT / 'releases' / args.commit
@@ -280,6 +290,10 @@ def install_snapshot(args):
                 path.unlink(missing_ok=True)
             atomic(registration, json.dumps(deployment.to_dict()).encode() + b'\n', 0o644)
             print('Explicit network catalog update applied to stopped instance; other policy and client settings retained.')
+        if getattr(args, 'update_aws_policy', False):
+            from host import atomic
+            atomic(deployment.private / 'config/aws-policy.json', contents['aws-policy.json'], 0o644)
+            print('Explicit AWS operation policy update applied to stopped instance; other policy and client settings retained.')
         activate(release)
         print('Committed release staged. No running service changed.')
         return
@@ -328,8 +342,11 @@ def main():
     parser.add_argument('--machine', default='secagent')
     parser.add_argument('--port', type=int, default=10260)
     parser.add_argument('--agent-dir', type=Path)
-    parser.add_argument('--update-networks', action='store_true',
-                        help='Explicitly update only network profiles on a stopped existing instance')
+    updates = parser.add_mutually_exclusive_group()
+    updates.add_argument('--update-networks', action='store_true',
+                         help='Explicitly update only network profiles on a stopped existing instance')
+    updates.add_argument('--update-aws-policy', action='store_true',
+                         help='Explicitly update only aws-policy.json on a stopped existing instance')
     install(parser.parse_args())
 
 

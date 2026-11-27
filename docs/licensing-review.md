@@ -22,7 +22,7 @@ not exempt the project from provenance review or users from upstream terms.
 | Component | Observed licence | Consequence |
 | --- | --- | --- |
 | mitmproxy 12.3.1 | MIT | Preserve its notice when redistributing it. |
-| graphql-core 3.2.7 | MIT | Pinned parser for the GitHub operation guard; retain its notice when redistributing it. |
+| graphql-core 3.2.12 | MIT | Pinned parser for the GitHub operation guard; retain its notice when redistributing it. |
 | Most Python dependencies | MIT, BSD, Apache-2.0 or PSF | Preserve their respective notices; check bundled native-library notices too. |
 | ldap3 2.9.1 | LGPL v3 | Library-specific source, notice and replacement/relinking requirements need a distribution review. |
 | urwid 4.0.13 | LGPL-2.1-only | Same: do not call the whole Python dependency tree permissive. |

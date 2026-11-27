@@ -4,6 +4,18 @@ Checked 2026-11-18. These are version/advisory matches, not counts of independen
 demonstrated exploits. No live proxy was upgraded or restarted. The release
 candidate is tested locally; earlier live acceptance used the previous build.
 
+## GraphQL guard update — 2026-11-27
+
+The GitHub guard uses **graphql-core 3.2.12**. Its initial 3.2.7 pin was flagged
+for GHSA-r77w-qph3-7vf8 / CVE-2026-75508 (comment tokens escaped the parser's
+`max_tokens` limit) and GHSA-vj8h-fx38-h3vc / CVE-2026-75507 (quadratic field
+validation). The guard only parses and performs its own bounded AST walk, so it
+does not call the affected field validator. It does rely on `max_tokens`:
+a leading/trailing comment regression reproduces the problem on 3.2.7 and is
+rejected on 3.2.12. The independent 2 MiB uncompressed-body cap remains in place.
+The patched dependency resolves both advisories; this does not waive the native
+image findings below or authorize an installation/restart.
+
 ## Python runtime: remediated
 
 The old mitmproxy 11.1.3 lock had 45 advisory records across 13 packages. The new

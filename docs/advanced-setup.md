@@ -532,6 +532,10 @@ working tree. It registers root-owned instance policy, private secagent config
 and an explicit read-only client ACL under `/private/etc/secret-proxy/candidate`.
 Repeat installation is idempotent for identical configuration; policy changes
 require a new candidate name rather than implicitly changing a running service.
+The narrowly scoped exceptions are `--update-networks` for a network catalogue
+and `--update-aws-policy` for the AWS operation policy. Each requires an existing,
+fully stopped instance, holds its lifecycle lock and refuses any other policy
+or client change; only one option can be used at a time.
 It does not install a global CA, fetch credentials or start any service.
 
 Start the candidate (sudo and desktop Touch ID may prompt):

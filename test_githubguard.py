@@ -325,6 +325,14 @@ class GithubAddonTests(AddonTestCase):
         for query in queries:
             self.denied(self.flow("POST", "/graphql", gql(query)))
 
+    def test_comments_count_toward_graphql_parser_budget(self):
+        # CVE-2026-75508: both leading and trailing comments must consume the
+        # parser budget, even when the actual query has only a few tokens.
+        padding = "# fixture comment\n" * 10001
+        for query in (padding + "{viewer{login}}", "{viewer{login}}\n" + padding):
+            self.denied(self.flow("POST", "/graphql", gql(query)))
+        self.allowed(self.flow("POST", "/graphql", gql("# short comment\n{viewer{login}}")))
+
     def test_streamed_get_and_signing_spoof_cannot_skip_guard(self):
         for method, path in (("GET", "/graphql"), ("POST", "/user/keys")):
             flow = self.flow(method, path)

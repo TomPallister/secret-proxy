@@ -241,6 +241,25 @@ non-S3 query authentication is refused before credentials are fetched. S3 URLs
 retain their existing policy exemption; scoped clients still need an unrestricted
 AWS-operation grant for presigned use.
 
+### Explicitly replacing an installed AWS policy
+
+An existing instance's policy is never overwritten by a normal code upgrade.
+After reviewing the complete replacement `aws-policy.json`, stop the instance
+and add `--update-aws-policy` to the explicit `macos_install.py` invocation in
+[the installation guide](advanced-setup.md#candidate-installation-on-macos).
+Use the same instance, machine, port, agent directory and other configuration.
+
+This option holds the serve/installer lock, requires the proxy/relay/VPN resources
+to be absent and accepts **only** the AWS-policy file difference. The replacement
+must be present and valid; the manifest, network catalogue, CA, Okta settings,
+registration and client bindings must match. It cannot be combined with
+`--update-networks`, and does not start or stop anything. Keep the private source
+copy consistent with the installed file before the next ordinary upgrade.
+
+Build the new code before an outage where practical. Preserve the CA, capability
+and login state; explicitly select direct or a named network on the subsequent
+start. This command is not permission to retire rollback data or restart others.
+
 ### Overrides for one role
 
 To exempt **one exact account and role** from a deny rule or a Parameter Store
