@@ -110,7 +110,7 @@ RUN apt-get purge -y --auto-remove curl xz-utils unzip jq \
       /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.13
 
 # Explicit source allowlist: never copy private configuration or certificates.
-COPY addon.py entry.py sigv4.py awscreds.py awsops.py googlecreds.py auth0creds.py oauthcreds.py chatgptcreds.py githubdevice.py copilotcreds.py ghclicreds.py loginstore.py sealedjwt.py gitsign.py egress.py secretstore.py clientgrants.py runtime.py capolicy.py constrainedca.py approvals.py audit.py networking.py vpn_profiles.py vpn_status.py vpnc_runtime.py vpnc_password_helper.py /opt/secret-proxy/
+COPY addon.py entry.py sigv4.py awscreds.py awsops.py githubguard.py googlecreds.py auth0creds.py oauthcreds.py chatgptcreds.py githubdevice.py copilotcreds.py ghclicreds.py loginstore.py sealedjwt.py gitsign.py egress.py secretstore.py clientgrants.py runtime.py capolicy.py constrainedca.py approvals.py audit.py networking.py vpn_profiles.py vpn_status.py vpnc_runtime.py vpnc_password_helper.py /opt/secret-proxy/
 RUN chmod 0755 /opt/secret-proxy/vpnc_password_helper.py
 RUN useradd --uid 1000 --create-home --shell /bin/bash secretproxy \
     && mkdir -p /data/mitmproxy /run/secret-proxy \

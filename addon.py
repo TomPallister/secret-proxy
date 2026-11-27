@@ -43,6 +43,7 @@ import approvals
 import audit
 import awsops
 import clientgrants
+import githubguard
 import sigv4
 from awscreds import AwsCredsProvider
 from googlecreds import GoogleTokenProvider
@@ -261,6 +262,14 @@ class PolicyViolation(Exception):
         super().__init__(
             f"secret reference '{name}' not allowed in placement for host '{host}'"
         )
+
+
+class GitHubPolicyViolation(PolicyViolation):
+    """A credential use refused by the GitHub operation guard."""
+
+    def __init__(self, name: str, host: str, reason: str):
+        super().__init__(name, host)
+        self.reason = reason
 
 
 # --- Approval rules (issue #3) ---------------------------------------------
@@ -621,7 +630,7 @@ def _audit_injection_failure(flow: http.HTTPFlow, injected, error: Exception) ->
         reason = "injection-failed"
     # A policy decision is "refused"; a lookup or internal error is "failed".
     decision = "refused" if reason in (
-        "approval-refused", "placement-not-allowed", "client-not-granted", "invalid-reference") else "failed"
+        "approval-refused", "placement-not-allowed", "client-not-granted", "invalid-reference", "github-api-denied") else "failed"
     uses = [] if secret else [_use_fields(entry) for entry in dict.fromkeys(list(injected) + list(attempted))]
     for fields in uses or [{"secret": secret}]:
         _audit(flow, "inject", decision, reason=reason, rule=rule, error=type(error).__name__, **fields)
@@ -674,6 +683,18 @@ def _placement_allowed(
     if manifest is None:
         return False
     target = host if host is not None else (flow.request.host or "")
+    domains = tuple(settings["domain"] for login in _GITHUB_LOGINS
+                    if (settings := _github_settings(login, manifest)) is not None)
+    reason = githubguard.check(
+        method=flow.request.method, host=target,
+        path=path if path is not None else flow.request.path,
+        headers=tuple(flow.request.headers.items(multi=True)),
+        body=None if flow.request.stream else flow.request.raw_content,
+        enterprise_domains=domains,
+    )
+    if reason is not None:
+        flow.metadata[_AUDIT_REASON] = "github-api-denied"
+        raise GitHubPolicyViolation(canonical, target, reason)
     context = dict(
         kind=kind,
         host=target,
@@ -779,7 +800,7 @@ def _sentinel_resolve(ref: str, flow: http.HTTPFlow) -> tuple[str, str, int, str
         flow,
         kind="url-rewrite",
         host=resolved_host,
-        path=target_path,
+        path=target_path + ("?" + target.query if target.query else ""),
         approval=False,  # already approved above, before resolution
     ):
         raise PolicyViolation(canonical, resolved_host)
@@ -1428,6 +1449,13 @@ def _set_injection_error(flow: http.HTTPFlow, injected: list[str], error: Except
         log.warning("secret_proxy: BLOCKED %s %s - %s", flow.request.method, host, error.rule)
         flow.response = http.Response.make(
             403, _approval_refused_body(error.rule),
+            {"content-type": "application/json", "cache-control": "no-store"},
+        )
+        return
+    if isinstance(error, GitHubPolicyViolation):
+        log.warning("secret_proxy: GitHub API denied (%s)", error.reason)
+        flow.response = http.Response.make(
+            403, json.dumps({"error": "secret_proxy_github_denied", "reason": error.reason}).encode(),
             {"content-type": "application/json", "cache-control": "no-store"},
         )
         return
@@ -2261,6 +2289,20 @@ def _resign_presigned(flow: http.HTTPFlow) -> None:
     creds so an in-container fetch of a self-generated presigned URL works."""
     if not _require_https(flow):
         return
+    # Query signing is an S3 object-URL facility, not an alternate route around
+    # aws-policy.json for STS/IAM (whose GET Action calls can mint credentials).
+    pairs = list(flow.request.query.items(multi=True))
+    keys = [key.lower() for key, _value in pairs]
+    credential = flow.request.query.get("X-Amz-Credential", "").split("/")
+    if (len(credential) != 5 or credential[3] != "s3"
+            or not awsops.service_matches_host("s3", flow.request.host)
+            or len(keys) != len(set(keys))
+            or "action" in keys or "x-amz-target" in flow.request.headers
+            or "smithy-protocol" in flow.request.headers):
+        op = awsops.AwsOperation(awsops.UNKNOWN, awsops.UNKNOWN, awsops.PROTOCOL_REST)
+        raise AwsOperationDenied(op, awsops.Decision(
+            awsops.DENY, "presigned re-signing supports only unambiguous S3 object URLs", "presigned-s3-only"),
+            None, None)
     checked = None
     if _client_grant(flow) is not None:
         # Before the provider is touched: a scoped client needs an AWS grant

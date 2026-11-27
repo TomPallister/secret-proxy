@@ -23,6 +23,63 @@
       ],
       "when": "secureStringReturned",
       "comment": "Parameter Store: the call goes through; a response holding a decrypted SecureString is refused. Plain String parameters are unaffected."
+    },
+    {
+      "action": "deny",
+      "service": "sts",
+      "operations": [
+        "AssumeRole*",
+        "GetSessionToken",
+        "GetFederationToken",
+        "GetServiceBearerToken",
+        "Unknown"
+      ],
+      "comment": "Clients must not mint portable sessions; proxy-owned Okta/STS login is separate."
+    },
+    {
+      "action": "deny",
+      "service": "iam",
+      "operations": [
+        "CreateAccessKey",
+        "CreateServiceSpecificCredential",
+        "ResetServiceSpecificCredential",
+        "Unknown"
+      ],
+      "comment": "Do not return new reusable access keys or service passwords to clients."
+    },
+    {
+      "action": "deny",
+      "service": "ecr",
+      "operations": [
+        "GetAuthorizationToken",
+        "Unknown"
+      ]
+    },
+    {
+      "action": "deny",
+      "service": "ecr-public",
+      "operations": [
+        "GetAuthorizationToken",
+        "Unknown"
+      ]
+    },
+    {
+      "action": "deny",
+      "service": "codeartifact",
+      "operations": [
+        "GetAuthorizationToken",
+        "Unknown"
+      ]
+    },
+    {
+      "action": "deny",
+      "service": "cognito-identity",
+      "operations": [
+        "GetCredentialsForIdentity",
+        "GetOpenIdToken",
+        "GetOpenIdTokenForDeveloperIdentity",
+        "Unknown"
+      ]
     }
   ]
 }

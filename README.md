@@ -72,7 +72,8 @@ See [client compatibility](docs/clients.md); never disable TLS verification.
 | API-key injection | Headers, queries, forms, Basic auth and URL rewrites; exact placement rules |
 | Proxy-owned OAuth | Supported derived-token services, ChatGPT/Codex, GitHub Copilot and gh |
 | Login persistence | Optional separate [read/write login vault](docs/advanced-setup.md#login-store) |
-| AWS signing and filtering | Okta/SAML; [aws-policy.json](docs/operations.md#aws-operation-policy) starter blocks Secrets Manager reads and decrypted SSM SecureString responses |
+| AWS signing and filtering | Okta/SAML; [aws-policy.json](docs/operations.md#aws-operation-policy) starter blocks secret reads and client-side credential/token minting |
+| GitHub API guard | [Normal repo writes, no administration](docs/github-policy.md); parsed GraphQL, unknown writes refused |
 | Git signing | Commit/tag signatures without handing clients a private key |
 | Scoped clients | Separate tokens and [grants](docs/advanced-setup.md#scoped-clients) for secrets, AWS roles, signing and logins |
 | Egress checks | Metadata/private-address refusal; optional [host allow/deny lists](docs/advanced-setup.md#egress-controls) |
@@ -86,9 +87,9 @@ editing a source manifest is not deployment. No automatic lifecycle changes.
 
 ## Security boundaries
 
-A client can still **use the access you grant it**. Apart from the AWS policy,
-allowed APIs may return or create other credentials. This is not a sandbox for
-arbitrary malicious software, and the audit log is not a complete traffic log.
+A client can still **use the access you grant it**. The AWS and GitHub guards
+reduce dangerous API paths; other APIs may still return credentials. This is not
+a malicious-software sandbox, and the audit log is not a complete traffic log.
 
 The Mac installer uses a separate non-admin account and VM. Root/admin access
 and private policy remain trusted. Applications must honour proxy/trust settings;

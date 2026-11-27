@@ -7,6 +7,7 @@
 !sigv4.py
 !awscreds.py
 !awsops.py
+!githubguard.py
 !googlecreds.py
 !auth0creds.py
 !oauthcreds.py

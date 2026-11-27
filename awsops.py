@@ -75,7 +75,7 @@ _HOST_ALIASES = {
 # Services whose dangerous operations are named by an RPC protocol. A request to
 # them without an identifiable operation is Unknown, never Unclassified REST.
 _OPERATION_REQUIRED = frozenset({
-    "sts", "iam", "secretsmanager", "ssm", "kms", "ecr", "ecr-public",
+    "sts", "iam", "secretsmanager", "ssm", "kms", "ecr", "ecr-public", "cognito-identity",
 })
 
 _SSM_DECRYPTING = frozenset({
@@ -539,6 +539,17 @@ STARTER_POLICY = {
         {"action": "deny", "service": "ssm", "operations": _SSM_READS, "when": WHEN_SECURE_STRING,
          "comment": "Parameter Store: the call goes through; a response holding a decrypted "
                     "SecureString is refused. Plain String parameters are unaffected."},
+        {"action": "deny", "service": "sts",
+         "operations": ["AssumeRole*", "GetSessionToken", "GetFederationToken", "GetServiceBearerToken", UNKNOWN],
+         "comment": "Clients must not mint portable sessions; proxy-owned Okta/STS login is separate."},
+        {"action": "deny", "service": "iam",
+         "operations": ["CreateAccessKey", "CreateServiceSpecificCredential", "ResetServiceSpecificCredential", UNKNOWN],
+         "comment": "Do not return new reusable access keys or service passwords to clients."},
+        {"action": "deny", "service": "ecr", "operations": ["GetAuthorizationToken", UNKNOWN]},
+        {"action": "deny", "service": "ecr-public", "operations": ["GetAuthorizationToken", UNKNOWN]},
+        {"action": "deny", "service": "codeartifact", "operations": ["GetAuthorizationToken", UNKNOWN]},
+        {"action": "deny", "service": "cognito-identity",
+         "operations": ["GetCredentialsForIdentity", "GetOpenIdToken", "GetOpenIdTokenForDeveloperIdentity", UNKNOWN]},
     ],
 }
 

@@ -192,7 +192,9 @@ class GhCliAddonTests(unittest.TestCase):
     def test_documented_full_access_example_covers_writes_and_git(self):
         self.use(full_access_manifest())
         self.login()
-        write = self.send(self.flow("api.github.com", "POST", "/graphql", "token " + REFERENCE, b"{}"))
+        query = 'mutation { addComment(input:{subjectId:"x",body:"ok"}) { clientMutationId } }'
+        write = self.send(self.flow("api.github.com", "POST", "/graphql", "token " + REFERENCE,
+                                    json.dumps({"query": query}).encode(), headers={"content-type": "application/json"}))
         self.assertIsNone(write.response)
         self.assertEqual(write.request.headers["authorization"], "token " + GH_TOKEN)
         basic = "Basic " + base64.b64encode(("x-access-token:" + REFERENCE).encode()).decode()
@@ -206,6 +208,18 @@ class GhCliAddonTests(unittest.TestCase):
         vault = self.send(self.flow("api.github.com", "GET", "/user", "Bearer " + REF + "GITHUB_TOKEN"))
         self.assertIsNone(vault.response)
         self.assertEqual(vault.request.headers["authorization"], "Bearer vault-github-token")
+
+    def test_admin_refused_before_proxy_owned_login_or_vault_restore(self):
+        self.use(full_access_manifest())
+        provider = self.generation.providers.github["cli"]
+        with patch.object(provider, "get_token", side_effect=AssertionError("must not restore login")):
+            for method, path, body in (("POST", "/user/keys", b"{}"),
+                                       ("POST", "/graphql", b'{"query":"mutation{deleteRepository(input:{repositoryId:\\"x\\"}){clientMutationId}}"}')):
+                flow = self.send(self.flow("api.github.com", method, path, "token " + REFERENCE, body,
+                                          headers={"content-type": "application/json"}))
+                self.assertEqual(flow.response.status_code, 403)
+                self.assertEqual(json.loads(flow.response.content)["error"], "secret_proxy_github_denied")
+        self.assertEqual(self.fake.calls, [])
 
     def test_gh_own_login_is_refused(self):
         bodies = (b"client_id=" + ghclicreds.CLIENT_ID.encode() + b"&scope=repo+read%3Aorg+gist",

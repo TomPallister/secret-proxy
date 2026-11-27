@@ -135,7 +135,8 @@ class UnknownTests(unittest.TestCase):
         if service:
             self.assertEqual(op.service, service)
         self.assertEqual(STRICT.evaluate(op, ACCOUNT, ROLE).action, "deny")
-        expected = "deny" if op.service == "secretsmanager" or "unverified-service" in op.conditions else "allow"
+        guarded = {"secretsmanager", "sts", "iam", "ecr", "ecr-public", "codeartifact", "cognito-identity"}
+        expected = "deny" if op.service in guarded or "unverified-service" in op.conditions else "allow"
         self.assertEqual(POLICY.evaluate(op, ACCOUNT, ROLE).action, expected, op)
         return op
 
@@ -251,7 +252,7 @@ class UnknownTests(unittest.TestCase):
 
 
 class DefaultDenyListTests(unittest.TestCase):
-    """Only Secrets Manager reads of stored values are denied by default."""
+    """The starter refuses secret reads and portable credential minting."""
 
     def test_secrets_manager_reads_are_denied(self):
         cases = [
@@ -296,17 +297,12 @@ class DefaultDenyListTests(unittest.TestCase):
         cases = [
             query_req("sts", b"Action=GetCallerIdentity&Version=2011-06-15"),
             query_req("sts", b"Action=GetAccessKeyInfo&AccessKeyId=x"),
-            query_req("sts", b"Action=AssumeRole&RoleArn=x&RoleSessionName=y"),
-            query_req("sts", b"Action=GetSessionToken"),
             req("GET", "bucket.s3.eu-west-1.amazonaws.com", "/", query="list-type=2", service="s3"),
             req("PUT", "bucket.s3.eu-west-1.amazonaws.com", "/key", body=None, service="s3"),
             json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x"}'),
             json_req("ssm", "AmazonSSM.GetParameter", b'{"Name":"x","WithDecryption":true}'),
             json_req("secretsmanager", "secretsmanager.ListSecrets"),
             json_req("secretsmanager", "secretsmanager.DescribeSecret"),
-            query_req("iam", b"Action=CreateAccessKey&Version=2010-05-08"),
-            json_req("ecr", "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken",
-                     host="api.ecr.eu-west-1.amazonaws.com"),
             req("GET", "ec2.eu-west-1.amazonaws.com", query="Action=DescribeInstances"),
             json_req("dynamodb", "DynamoDB_20120810.DescribeTable", version="1.0"),
             json_req("kms", "TrentService.Decrypt"),

@@ -28,7 +28,7 @@ import vpn_profiles
 
 GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
 FILES = ('Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock',
-         'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'googlecreds.py',
+         'addon.py', 'entry.py', 'sigv4.py', 'awscreds.py', 'awsops.py', 'githubguard.py', 'googlecreds.py',
          'auth0creds.py', 'oauthcreds.py', 'chatgptcreds.py', 'githubdevice.py',
          'copilotcreds.py', 'ghclicreds.py', 'loginstore.py', 'sealedjwt.py',
          'gitsign.py', 'egress.py', 'secretstore.py', 'clientgrants.py', 'runtime.py', 'client.py', 'host.py', 'networking.py',

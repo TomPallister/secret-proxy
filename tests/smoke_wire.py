@@ -85,6 +85,9 @@ def main():
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers['Content-Length']))
+                if self.path == '/graphql' or self.path.startswith('/repos/'):
+                    observed.append(self.headers['Authorization'] == 'Bearer ' + values['API_KEY'])
+                    return self.answer()
                 if self.path.startswith('/copilot/'):
                     observed.append(self.headers['Authorization'] == 'Bearer ' + copilot['copilot'])
                     return self.answer()
@@ -113,6 +116,8 @@ def main():
             ('query', {'name': 'key', 'template': '{secret}'}),
             ('form', {'name': 'key', 'template': '{secret}'}),
             ('basic-password', {'username': 'fixture'})]]
+        placements.append(dict(kind='header', hosts=['api.github.com'], name='authorization', template='Bearer {secret}'))
+        (root / 'upstream-port').write_text(str(server.server_port))
         (root / 'manifest.json').write_text(json.dumps({'schemaVersion': 3, 'account': {'vault': 'Fixture'},
             'secrets': {'API_KEY': {'placements': placements},
                         'CHATGPT_ACCESS_TOKEN': {'runtimeOnly': True, 'placements': [
@@ -184,10 +189,18 @@ _system_resolver = entry._resolver
 def fixture_resolver(host, port):
     # Synthetic GitHub login domains and AWS endpoints are answered or refused
     # by the proxy itself; resolve them locally so the test needs no DNS.
-    if host in ('github.example.com', 'api.github.example.com') or host.endswith('.amazonaws.com'):
+    if host in ('github.example.com', 'api.github.example.com', 'api.github.com') or host.endswith('.amazonaws.com'):
         return ['127.0.0.1']
     return _system_resolver(host, port)
 entry._resolver = fixture_resolver
+_real_request = request
+async def request(flow):
+    await _real_request(flow)
+    # Only AFTER production injection/guard checks: route permitted API calls
+    # to our generated local TLS upstream. Refusals must never arrive there.
+    if flow.request.host == 'api.github.com' and flow.response is None:
+        flow.request.host = '127.0.0.1'
+        flow.request.port = int((Path(__file__).parent / 'upstream-port').read_text())
 ''')
         capability = secrets.token_hex(24)
         auth = root / 'auth'
@@ -286,6 +299,8 @@ entry._resolver = fixture_resolver
                 assert status == 200 and signature.decode() == gitsign.sign(values['GIT_SIGNING_SSH_KEY'], payload)
                 assert b'PRIVATE KEY' not in signature
                 assert observed == [True, True, True]
+                github_checks(request, port, proxy_auth, context, observed)
+                after_github = len(observed)
 
                 # Proxy-owned GitHub Copilot login against the fixture GitHub.
                 code, body = request('GET', '/github-copilot/start', host=sentinel, target_port=443)
@@ -307,7 +322,7 @@ entry._resolver = fixture_resolver
                                      urlencode({'client_id': 'Iv1.b507a08c87ecfe98', 'scope': 'read:user'}),
                                      host='github.example.com', target_port=443)
                 assert code == 403 and json.loads(body) == {'error': 'use_github_copilot_login'}
-                assert observed == [True, True, True, True]
+                assert observed == [True] * (after_github + 1)
 
                 # Proxy-owned gh login: gh holds only a reference in GH_TOKEN.
                 assert request('GET', '/gh/user', {'Authorization': 'token ' + REF + 'GH_CLI_OAUTH_TOKEN'})[0] == 502
@@ -320,7 +335,7 @@ entry._resolver = fixture_resolver
                                      urlencode({'client_id': '178c6fc778ccc68e1d6a', 'scope': 'repo'}),
                                      host='github.example.com', target_port=443)
                 assert code == 403 and json.loads(body) == {'error': 'use_gh_login'}
-                assert observed == [True] * 5
+                assert observed == [True] * (after_github + 2)
                 # Equivalent form/query/JSON encodings must not bypass the
                 # refusal of client-side logins for either owned OAuth app.
                 for client_id, error in (('178c6fc778ccc68e1d6a', 'use_gh_login'),
@@ -335,7 +350,7 @@ entry._resolver = fixture_resolver
                         code, body = request('POST', path, {'Content-Type': content_type}, payload,
                                              host='github.example.com', target_port=443)
                         assert code == 403 and json.loads(body) == {'error': error}
-                assert observed == [True] * 5
+                assert observed == [True] * (after_github + 2)
             finally:
                 child.terminate()
                 try:
@@ -351,7 +366,7 @@ entry._resolver = fixture_resolver
         assert 'AWS DENY 123456789012/ReadOnly secretsmanager:BatchGetSecretValue' in output
         assert 'BODY-MARKER' not in output
         assert copilot['github'] not in output and copilot['copilot'] not in output
-        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS operation denial before minting (H1+H2); metadata/loopback egress refusal; generated-key signing; proxy-owned Copilot and gh logins, sealed exchange and pinned injection; no vault or external network')
+        print('PASS: real TLS/H1/H2; authenticated credential-free status; header/query/form/basic injection; path refusal before upstream; AWS credential-mint denial and GitHub REST/GraphQL guard before upstream (H1+H2); metadata/loopback egress refusal; generated-key signing; proxy-owned Copilot and gh logins, sealed exchange and pinned injection; no vault or external network')
 
 
 def aws_auth(service):
@@ -364,7 +379,7 @@ def aws_headers(service, extra):
             'x-amz-security-token': 'secretrole:123456789012/ReadOnly', **extra}
 
 
-def h2_request(port, proxy_auth, context, host, headers, body):
+def h2_request(port, proxy_auth, context, host, headers, body, path='/'):
     tunnel = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
     tunnel.set_tunnel(host, 443, {'Proxy-Authorization': proxy_auth})
     tunnel.connect()
@@ -375,7 +390,7 @@ def h2_request(port, proxy_auth, context, host, headers, body):
             protocol = h2.connection.H2Connection(config=h2.config.H2Configuration(header_encoding='utf-8'))
             protocol.initiate_connection()
             protocol.send_headers(1, [(':method', 'POST'), (':scheme', 'https'), (':authority', host),
-                                      (':path', '/')] + [(k.lower(), v) for k, v in headers.items()]
+                                      (':path', path)] + [(k.lower(), v) for k, v in headers.items()]
                                   + [('content-length', str(len(body)))])
             protocol.send_data(1, body, end_stream=True)
             stream.sendall(protocol.data_to_send())
@@ -397,6 +412,27 @@ def h2_request(port, proxy_auth, context, host, headers, body):
             return status, response_headers, data
     finally:
         context.set_alpn_protocols(['http/1.1'])
+
+
+def github_checks(request, port, proxy_auth, context, observed):
+    auth = {'Authorization': 'Bearer ' + REF + 'API_KEY', 'Content-Type': 'application/json'}
+    denied = [('/user/keys', b'{}'), ('/repos/example/repo/keys', b'{}'),
+              ('/graphql', json.dumps({'query': 'mutation { addComment: addSshKey(input:{key:"BODY-MARKER"}) { clientMutationId } }'}).encode()),
+              ('/graphql', json.dumps({'query': 'mutation {...F} fragment F on Mutation {deleteRepository(input:{repositoryId:"x"}){clientMutationId}}'}).encode())]
+    before = len(observed)
+    for path, payload in denied:
+        status, body = request('POST', path, auth, payload, host='api.github.com', target_port=443)
+        assert status == 403 and json.loads(body)['error'] == 'secret_proxy_github_denied', (status, body)
+        status, headers, body = h2_request(port, proxy_auth, context, 'api.github.com', auth, payload, path)
+        assert status == '403' and json.loads(body)['error'] == 'secret_proxy_github_denied', (status, body)
+    assert len(observed) == before, 'denied GitHub call reached upstream'
+    for path, payload in [('/repos/example/repo/issues/1/comments', b'{"body":"ok"}'),
+                          ('/graphql', json.dumps({'query': 'mutation {addComment(input:{subjectId:"x",body:"ok"}){clientMutationId}}'}).encode())]:
+        status, body = request('POST', path, auth, payload, host='api.github.com', target_port=443)
+        assert status == 200 and body == b'ok', (status, body)
+        status, headers, body = h2_request(port, proxy_auth, context, 'api.github.com', auth, payload, path)
+        assert status == '200' and body == b'ok', (status, body)
+    assert observed[before:] == [True] * 4
 
 
 def aws_checks(request, port, proxy_auth, context):
@@ -421,6 +457,17 @@ def aws_checks(request, port, proxy_auth, context):
     status, headers, body = h2_request(port, proxy_auth, context, 'secretsmanager.eu-west-1.amazonaws.com',
                                        mismatch, b'{}')
     assert status == '403' and b's3:Unknown' in body, (status, body)
+    for service, operation in [('sts', 'AssumeRole'), ('iam', 'CreateAccessKey'),
+                               ('ecr', 'GetAuthorizationToken'), ('cognito-identity', 'GetCredentialsForIdentity')]:
+        if service in ('sts', 'iam'):
+            fields, payload = {'Content-Type': 'application/x-www-form-urlencoded'}, ('Action=' + operation).encode()
+        else:
+            fields, payload = {'Content-Type': 'application/x-amz-json-1.1', 'X-Amz-Target': 'Fixture.' + operation}, b'{}'
+        host = service + '.eu-west-1.amazonaws.com'
+        status, body = request('POST', '/', aws_headers(service, fields), payload, host=host, target_port=443)
+        assert status == 403 and (service + ':' + operation).encode() in body, (status, body)
+        status, headers, body = h2_request(port, proxy_auth, context, host, aws_headers(service, fields), payload)
+        assert status == '403' and (service + ':' + operation).encode() in body, (status, body)
     # An allowed operation passes the policy and only then reaches credential
     # vending, which fails here because no Okta values exist.
     status, headers, body = h2_request(port, proxy_auth, context, 'sts.amazonaws.com', aws_headers('sts', {

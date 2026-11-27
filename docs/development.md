@@ -98,6 +98,19 @@ original agent directory, enables tools/extensions or saves a session:
 uv run --locked python tests/smoke_pi.py --help
 ```
 
+Credential/API guards have focused regressions and baseline-checked mutation
+controls (the latter run in disposable source copies, never installed files):
+
+```sh
+uv run --locked python -m unittest test_credential_guards test_githubguard test_ghclicreds
+uv run --locked python tests/credential_guard_mutations.py
+```
+
+`tests/smoke_wire.py` also sends allowed and refused GitHub REST/GraphQL requests
+and AWS credential-minting requests through real TLS over HTTP/1.1 and HTTP/2,
+using only a local upstream and fake provider. It verifies denied requests never
+reach that upstream. No real GitHub/AWS writes are part of these tests.
+
 The audit-log tests (`test_audit.py`, `test_audit_wire.py`) create throwaway
 Ed25519 keys with `ssh-keygen` and verify seals with `ssh-keygen -Y verify`;
 they skip those cases when `ssh-keygen` is not installed. `test_audit_wire.py`

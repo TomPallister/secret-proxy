@@ -155,7 +155,16 @@ file (also `examples/aws-policy.json`):
      "operations": ["GetSecretValue", "BatchGetSecretValue", "Unknown"]},
     {"action": "deny", "service": "ssm",
      "operations": ["GetParameter", "GetParameters", "GetParametersByPath", "GetParameterHistory", "Unknown"],
-     "when": "secureStringReturned"}
+     "when": "secureStringReturned"},
+    {"action": "deny", "service": "sts",
+     "operations": ["AssumeRole*", "GetSessionToken", "GetFederationToken", "GetServiceBearerToken", "Unknown"]},
+    {"action": "deny", "service": "iam",
+     "operations": ["CreateAccessKey", "CreateServiceSpecificCredential", "ResetServiceSpecificCredential", "Unknown"]},
+    {"action": "deny", "service": "ecr", "operations": ["GetAuthorizationToken", "Unknown"]},
+    {"action": "deny", "service": "ecr-public", "operations": ["GetAuthorizationToken", "Unknown"]},
+    {"action": "deny", "service": "codeartifact", "operations": ["GetAuthorizationToken", "Unknown"]},
+    {"action": "deny", "service": "cognito-identity",
+     "operations": ["GetCredentialsForIdentity", "GetOpenIdToken", "GetOpenIdTokenForDeveloperIdentity", "Unknown"]}
   ]
 }
 ```
@@ -168,9 +177,29 @@ file (also `examples/aws-policy.json`):
   Terraform's default decrypting reads of them. A read without decryption is not
   checked: a `SecureString` then comes back still encrypted.
 
-Edit or delete the rules as you like. **With no file, nothing is blocked.** The
-only built-in rule is a safety check: a request whose signature's service doesn't
-match its host is refused, so the proxy never signs for a service it didn't check.
+- **Credential minting:** client-side STS sessions, IAM access keys/service
+  passwords, ECR/CodeArtifact login tokens and Cognito identity tokens are refused
+  before provider lookup. `GetCallerIdentity`, normal IAM/ECR reads and S3 object
+  operations still work. The proxy's own Okta-to-STS login is separate and unaffected.
+
+**Compatibility:** Terraform/SDK `assume_role`, `aws ecr get-login-password`,
+CodeArtifact login and client-side Cognito exchanges no longer work with this
+starter. Select the account/role through the proxy instead of chaining STS in the
+client. Registry/token use needs a proxy-owned integration; do not paste real
+credentials into the container as a workaround. An explicit narrow role override
+can re-enable a call but then permits a real credential in the response.
+
+These are configurable starter rules, not a complete AWS capability firewall:
+allowed actions such as changing IAM policies or invoking code may indirectly
+grant access, and allowed responses can contain sensitive data.
+
+Existing installations keep their current rules: upgrading source does **not**
+rewrite private policy. Review/stage the extra rules separately; the installer's
+policy-preservation refusal must not be bypassed to deploy them casually.
+
+Edit or delete the rules as you like. **With no file, nothing is blocked** apart
+from built-in safety constraints: signature service/host agreement and the S3-only
+presigned facility. The proxy never signs for a service it didn't check.
 
 ### Writing rules
 
@@ -206,7 +235,11 @@ as `secret-proxy blocked secretsmanager:GetSecretValue: …`, in the protocol's 
 JSON, XML or CBOR shape. A checked Parameter Store response that can't be read
 or is over 4 MiB is refused too. The proxy terminal shows one line
 with the account, role, service, operation and decision. Values, bodies and
-responses are never logged. Presigned URLs are not checked.
+responses are never logged. Presigned re-signing is restricted to unambiguous
+S3 object URLs with an S3 signing scope/host and no RPC operation selectors;
+non-S3 query authentication is refused before credentials are fetched. S3 URLs
+retain their existing policy exemption; scoped clients still need an unrestricted
+AWS-operation grant for presigned use.
 
 ### Overrides for one role
 

@@ -24,12 +24,15 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(project['tool']['uv']['override-dependencies'], ['tornado==6.6.1'])
         versions = {pkg['name']: pkg['version'] for pkg in lock['package']}
         self.assertEqual(versions['mitmproxy'], '12.3.1')
+        self.assertIn('graphql-core==3.2.7', project['project']['dependencies'])
+        self.assertEqual(versions['graphql-core'], '3.2.7')
         self.assertEqual(versions['tornado'], '6.6.1')
         self.assertEqual(lock['manifest']['overrides'], [{'name': 'tornado', 'specifier': '==6.6.1'}])
 
     def test_installed_runtime_matches_reviewed_pair(self):
         self.assertEqual(importlib.metadata.version('mitmproxy'), '12.3.1')
         self.assertEqual(importlib.metadata.version('tornado'), '6.6.1')
+        self.assertEqual(importlib.metadata.version('graphql-core'), '3.2.7')
 
     def test_headless_entrypoint_does_not_import_tornado(self):
         # This is the real installed entrypoint, not a fake DumpMaster. Running

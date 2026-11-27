@@ -307,9 +307,9 @@ class BufferedPathTests(AwsPolicyAddonTestCase):
                 self.run_hooks(flow)
                 self.assertDenied(flow, label)
 
-    def test_former_defaults_are_now_allowed(self):
+    def test_unrelated_operations_remain_allowed(self):
         for flow, label in (
-            (self.query_flow("sts", b"Action=AssumeRole&RoleArn=x&RoleSessionName=y"), "sts:AssumeRole"),
+            (self.query_flow("sts", b"Action=GetCallerIdentity"), "sts:GetCallerIdentity"),
             (self.aws_flow("lambda.eu-west-1.amazonaws.com", "lambda", method="GET",
                            path="/2015-03-31/functions/fn/configuration"), "lambda:GetFunctionConfiguration"),
             (self.json_flow("ssm", "AmazonSSM.GetParameter", b'{"Name":"p","WithDecryption":true}'),
